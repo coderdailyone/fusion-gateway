@@ -11,13 +11,14 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+eval = ["litellm>=1.40", "datasets>=2.19", "sympy>=1.12"]
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["gateway"]
+packages = ["gateway", "evaluator", "evaluator.suite", "evaluator.scorers"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
