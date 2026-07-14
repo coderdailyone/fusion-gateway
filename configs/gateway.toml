@@ -1,0 +1,31 @@
+[budget]
+active = "M1"
+
+[budgets.M1]
+cap_usd = 5.0
+
+[providers.deepseek]
+base_url = "https://api.deepseek.com"
+api_key_env = "DEEPSEEK_API_KEY"
+
+[providers.glm]
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key_env = "GLM_API_KEY"
+
+[models."deepseek-chat"]
+provider = "deepseek"
+upstream_model = "deepseek-chat"
+in_usd_per_mtok = 0.14   # VERIFY against official pricing page at deploy; config is versioned
+out_usd_per_mtok = 0.28
+fallback = ["glm-4.7"]
+
+[models."glm-4.7"]
+provider = "glm"
+upstream_model = "glm-4.7"
+in_usd_per_mtok = 0.60   # VERIFY at deploy
+out_usd_per_mtok = 2.20
+fallback = []
+
+[policy]
+version = "static-v0"
+default_model = "deepseek-chat"
