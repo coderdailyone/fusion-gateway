@@ -111,9 +111,28 @@ def validate(gateway_model_name: str, completion_fn, n_per_source: int = 5,
     return rows, agg, run_dir
 
 
+# Model registry: gateway name -> factory building its LiteLLM completion_fn.
+# GLM currently has no account balance; kept here for when it is recharged.
+MODELS = {
+    "deepseek-chat": lambda: make_completion_fn(
+        "deepseek/deepseek-chat", api_key=os.environ["DEEPSEEK_API_KEY"]),
+    "kimi-k2": lambda: make_completion_fn(
+        "openai/kimi-k2-0711-preview",
+        api_base="https://api.kimi.com/coding/v1",
+        api_key=os.environ["MOONSHOT_API_KEY"]),
+    "glm-4.6": lambda: make_completion_fn(
+        "openai/glm-4.6",
+        api_base="https://open.bigmodel.cn/api/paas/v4",
+        api_key=os.environ["GLM_API_KEY"]),
+}
+
+
 def main() -> None:
-    fn = make_completion_fn("deepseek/deepseek-chat", api_key=os.environ.get("DEEPSEEK_API_KEY"))
-    validate("deepseek-chat", fn, n_per_source=5)
+    import sys
+    name = sys.argv[1] if len(sys.argv) > 1 else "deepseek-chat"
+    if name not in MODELS:
+        raise SystemExit(f"unknown model {name!r}; choices: {list(MODELS)}")
+    validate(name, MODELS[name](), n_per_source=5)
 
 
 if __name__ == "__main__":

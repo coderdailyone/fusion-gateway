@@ -1,47 +1,64 @@
 # M2a Validation Run
 
-The M2a acceptance check: a few tasks per source, run on a real model through
+The M2a acceptance check: a few tasks per source, run on real models through
 the full harness (loader → runner → scorer → sandbox → store → report), proving
 the pipeline produces scorable frozen outputs and cost accounting end-to-end.
 
-## Run: 2026-07-14 · DeepSeek · 5 tasks/source
+## Runs: 2026-07-14 · 5 tasks/source
 
-- **Model:** `deepseek/deepseek-chat` (via LiteLLM)
-- **Suite:** `configs/suite.manifest.json` (1063 tasks locked; this run sampled
+- **Suite:** `configs/suite.manifest.json` (1063 tasks locked; each run sampled
   the first 5 per source by id)
-- **Command:** `.venv/bin/python -m evaluator.validate`
+- **Command:** `.venv/bin/python -m evaluator.validate <model>`
+- **Models via LiteLLM:** `deepseek/deepseek-chat`; `kimi-k2-0711-preview`
+  (`https://api.kimi.com/coding/v1`, a reasoning model — content lands after a
+  `reasoning_content` field, so it needs a generous `max_tokens`).
 
-### Results
+### Results (after the MCQ scorer fix below)
 
-| Source | Accuracy | Notes |
+| Source | DeepSeek | Kimi K2 |
 |---|---|---|
-| mmlu_pro | 3/5 | MCQ scorer (letter extraction) |
-| math | 4/5 | sympy equivalence scorer |
-| humaneval | 3/5 | **code executed in the sandbox** against the test harness |
-| **total** | **10/15 (0.67)** | |
+| mmlu_pro | 3/5 | 3/5 |
+| math | 4/5 | 4/5 |
+| humaneval | 3/5 | 4/5 |
+| **total** | **10/15** | **11/15** |
 
-- **Total cost:** **$0.0015** (15 calls).
-- **Frozen outputs:** 15 records written to a run dir and reloaded — the run is
-  re-scorable with zero new API calls.
-- All 15 candidate calls returned `status=ok`.
+- **DeepSeek cost:** $0.0015 (15 calls). **Kimi cost:** LiteLLM has no price entry
+  for the `api.kimi.com/coding` endpoint, so `completion_cost` returned $0 — a
+  cost-accounting gap to close before M3 (supply the price like the gateway config does).
+- All 30 candidate calls returned `status=ok`. Frozen outputs written and
+  reloaded — every run is re-scorable offline with zero new API calls.
+
+### A scorer bug the validation caught (and the frozen store fixed offline)
+
+Kimi's first mmlu_pro score was **0/5** — a red flag for a strong model. Inspecting
+the frozen outputs showed Kimi answering correctly in the form
+`**Answer: A. 30 m**`, which the original MCQ scorer's patterns
+(`answer is X`, `X)`, `\boxed{X}`, trailing letter) did not match. The scorer was
+measuring *format compliance*, not correctness — exactly the failure the
+disciplines warn about, and one that would have poisoned M3 routing labels.
+
+Fix: the MCQ extractor now recognizes explicit answer cues
+(`Answer: A`, `correct answer = A`, `option A`, markdown-wrapped). **Re-scoring
+the already-frozen outputs with zero new API calls** moved Kimi mmlu_pro from
+**0/5 → 3/5** (DeepSeek unchanged at 3/5) — demonstrating the frozen-output design:
+scorers can be fixed and re-applied without re-spending.
 
 ### What this validates
 
-- The runner calls a real provider via LiteLLM and captures text/tokens/cost/latency.
-- All three objective scorers work on real model output: MCQ letter extraction,
-  math symbolic equivalence, and — importantly — the **code scorer running
-  DeepSeek-generated Python inside the resource-limited sandbox** against the
-  HumanEval `check(entry_point)` harness.
-- Frozen-output storage round-trips; scoring is reproducible offline.
+- The runner calls real providers via LiteLLM and captures text/tokens/cost/latency.
+- All three objective scorers work on real output: MCQ cue extraction, math
+  symbolic equivalence, and the **code scorer running model-generated Python in
+  the resource-limited sandbox** against the HumanEval `check(entry_point)` harness.
+- Frozen-output storage round-trips; scoring is reproducible and revisable offline.
 - Answers never enter prompts (structural, via `build_prompt`).
 
-### Caveats / follow-ups
+### Caveats / follow-ups (for M3)
 
-- **Only DeepSeek** was exercised: the GLM key had no account balance
-  (`余额不足`), and the Kimi key failed authentication. A two-model panel needs
-  those fixed — relevant at M3 (routing), not M2a.
-- The code sandbox ran on the local dev machine here. At M3 scale (full
-  1063-task × multi-model sampling), run the sandbox on the isolated cookie box
-  per the disciplines, never a production host.
-- Accuracy figures are from a tiny 5/source sample and are **not** a benchmark
-  result — they only prove the pipeline works. The real scored run is M3.
+- **GLM** had no account balance (`余额不足`); recharge before multi-model sampling.
+- **Kimi cost** needs a price entry supplied to LiteLLM (currently $0).
+- **Reasoning models** (Kimi) need a generous `max_tokens`; a too-small cap is
+  spent on hidden reasoning and returns empty content (seen once as an empty output).
+- The code sandbox ran on the local dev machine here; at M3 scale run it on the
+  isolated cookie box per the disciplines, never a production host.
+- Accuracy figures are from a tiny 5/source sample — they prove the pipeline
+  works, they are **not** a benchmark result. The real scored run is M3.

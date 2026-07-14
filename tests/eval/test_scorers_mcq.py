@@ -7,6 +7,21 @@ def test_correct_various_formats():
     for out in ["The answer is B.", "Final: (B)", "\\boxed{B}", "... so B"]:
         assert score(T, out).correct
 
+def test_answer_cue_formats():
+    # Regression: real reasoning-model outputs (observed from Kimi) that the
+    # old scorer missed — "Answer: B. <option text>", markdown-wrapped, etc.
+    for out in [
+        "reasoning...\n\n**Answer: B. South pole, 2000 poles**",
+        "Answer: B",
+        "The correct answer is B.",
+        "Final answer: (B)",
+        "So the correct answer = B.",
+        "Therefore option B is correct.",
+    ]:
+        assert score(T, out).correct, out
+    # and it still rejects a different letter in the same shape
+    assert not score(T, "**Answer: A. 30 m**").correct
+
 def test_incorrect():
     assert not score(T, "The answer is A.").correct
 

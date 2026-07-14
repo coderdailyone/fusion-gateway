@@ -3,28 +3,33 @@ import re
 from evaluator.suite.types import Task
 from evaluator.scorers.base import Score
 
-_LETTER = "[A-J]"
+_L = "[A-J]"
 
-# Ordered by nothing in particular; extraction picks whichever match occurs
-# LAST in the text (by end position), since models often restate options
-# before concluding with a final answer.
-_PATTERNS = [
-    re.compile(rf"answer is\s*({_LETTER})", re.IGNORECASE),
-    re.compile(rf"\b({_LETTER})\)", re.IGNORECASE),
-    re.compile(rf"\\boxed\{{\s*({_LETTER})\s*\}}", re.IGNORECASE),
-    re.compile(rf"\b({_LETTER})\b[.,!?]?\s*$", re.IGNORECASE),
-]
+# Priority 1: an explicit answer cue. Handles "answer is A", "Answer: A",
+# "correct answer = A", "**Answer: A. 30 m**", "option A", "choice (A)".
+# The letter may be wrapped in markdown/parens and followed by . ) : or text.
+_CUE = re.compile(
+    rf"(?:the\s+)?(?:correct\s+|final\s+)?answer\s*(?:is|:|=|-|–)?\s*\(?\*{{0,2}}({_L})\b"
+    rf"|(?:option|choice)\s*\(?\*{{0,2}}({_L})\b",
+    re.IGNORECASE,
+)
+# Fallbacks, each taking its LAST occurrence, tried in order.
+_BOXED = re.compile(rf"\\boxed\{{\s*({_L})\s*\}}", re.IGNORECASE)
+_PAREN = re.compile(rf"\(({_L})\)", re.IGNORECASE)
+_FINAL = re.compile(rf"\b({_L})\b[.,!?*\s]*$", re.IGNORECASE)
 
 
 def _extract_letter(text: str) -> str | None:
-    best_letter = None
-    best_end = -1
-    for pattern in _PATTERNS:
-        for m in pattern.finditer(text):
-            if m.end() >= best_end:
-                best_end = m.end()
-                best_letter = m.group(1)
-    return best_letter.upper() if best_letter else None
+    cues = list(_CUE.finditer(text))
+    if cues:
+        m = cues[-1]
+        return (m.group(1) or m.group(2)).upper()
+    for pat in (_BOXED, _PAREN):
+        hits = list(pat.finditer(text))
+        if hits:
+            return hits[-1].group(1).upper()
+    m = _FINAL.search(text)
+    return m.group(1).upper() if m else None
 
 
 def score(task: Task, output_text: str) -> Score:
