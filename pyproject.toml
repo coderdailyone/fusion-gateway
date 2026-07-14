@@ -21,3 +21,8 @@ packages = ["gateway"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+filterwarnings = [
+  # Third-party: Starlette's TestClient warns about the bundled httpx version.
+  # Not our code; silence so our own test output stays pristine.
+  "ignore:Using .httpx. with .starlette.testclient. is deprecated",
+]

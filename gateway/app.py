@@ -94,6 +94,17 @@ def _recover_orphans(store: Store, clock: Clock) -> None:
         store.conn.commit()
 
 
+def create_app_from_env() -> FastAPI:
+    """uvicorn --factory entrypoint: gateway.app:create_app_from_env.
+
+    Reads GATEWAY_CONFIG (config toml path, default configs/gateway.toml)
+    and GATEWAY_DB (sqlite path, default data/gateway.sqlite).
+    """
+    config_path = os.environ.get("GATEWAY_CONFIG", "configs/gateway.toml")
+    db_path = os.environ.get("GATEWAY_DB", "data/gateway.sqlite")
+    return create_app(config_path, db_path)
+
+
 def create_app(
     config_path: str | Path,
     db_path: str | Path,

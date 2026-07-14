@@ -1,5 +1,6 @@
 import httpx, json, pytest
 from fastapi.testclient import TestClient
+import gateway.app as app_module
 from gateway.app import create_app
 from tests.helpers import FakeClock
 
@@ -47,3 +48,24 @@ def test_admin_endpoints_gated(tmp_path, monkeypatch):
     c = make_client(tmp_path, monkeypatch)
     assert c.get("/admin/status", headers=H("tokA")).status_code == 403
     assert c.post("/admin/killswitch/release", headers=H("tokB")).status_code == 200
+
+def test_create_app_from_env_reads_defaults(monkeypatch):
+    captured = {}
+    def fake_create_app(config_path, db_path):
+        captured["config_path"] = config_path
+        captured["db_path"] = db_path
+        return "app-sentinel"
+    monkeypatch.delenv("GATEWAY_CONFIG", raising=False)
+    monkeypatch.delenv("GATEWAY_DB", raising=False)
+    monkeypatch.setattr(app_module, "create_app", fake_create_app)
+    result = app_module.create_app_from_env()
+    assert result == "app-sentinel"
+    assert captured == {"config_path": "configs/gateway.toml", "db_path": "data/gateway.sqlite"}
+
+def test_create_app_from_env_reads_overrides(tmp_path, monkeypatch):
+    monkeypatch.setenv("GATEWAY_TOKENS", "prism:tokA,admin:tokB")
+    monkeypatch.setenv("GATEWAY_CONFIG", "configs/gateway.toml")
+    monkeypatch.setenv("GATEWAY_DB", str(tmp_path / "g.sqlite"))
+    app = app_module.create_app_from_env()
+    client = TestClient(app)
+    assert client.get("/healthz").json() == {"ok": True}
