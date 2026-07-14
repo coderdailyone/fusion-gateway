@@ -46,9 +46,12 @@ def run_one(task: Task, model: str, completion_fn: Callable[[str, str], dict]) -
     the exception message captured in `error`.
     """
     prompt = build_prompt(task)
-    # Defensive leakage guard: the answer must never appear in the prompt we send.
-    if task.answer is not None:
-        assert task.answer not in prompt, "answer leaked into prompt"
+    # Leakage protection is STRUCTURAL: build_prompt() consumes only
+    # task.problem, never task.answer or task.tests. We deliberately do NOT
+    # assert `answer not in prompt` at runtime — a correct answer string (a
+    # short number, or an MCQ option letter) can legitimately appear inside
+    # the problem text, so such a check would false-positive and crash valid
+    # runs. The guarantee lives in build_prompt's inputs, verified by test.
 
     start = time.monotonic()
     try:
