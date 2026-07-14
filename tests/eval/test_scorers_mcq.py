@@ -22,6 +22,13 @@ def test_answer_cue_formats():
     # and it still rejects a different letter in the same shape
     assert not score(T, "**Answer: A. 30 m**").correct
 
+def test_markdown_and_newline_between_cue_and_letter():
+    # Regression from GLM-5.2: "**Final Answer:**\nB. South pole" — stars and a
+    # newline sit between the cue and the letter.
+    assert score(T, "reasoning...\n\n**Final Answer:**\nB. South pole, 2000 poles").correct
+    assert score(T, "the correct option is B.").correct
+    assert not score(T, "**Final Answer:**\nA. 30 m").correct
+
 def test_incorrect():
     assert not score(T, "The answer is A.").correct
 

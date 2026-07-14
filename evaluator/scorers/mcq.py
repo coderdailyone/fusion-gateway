@@ -9,8 +9,8 @@ _L = "[A-J]"
 # "correct answer = A", "**Answer: A. 30 m**", "option A", "choice (A)".
 # The letter may be wrapped in markdown/parens and followed by . ) : or text.
 _CUE = re.compile(
-    rf"(?:the\s+)?(?:correct\s+|final\s+)?answer\s*(?:is|:|=|-|–)?\s*\(?\*{{0,2}}({_L})\b"
-    rf"|(?:option|choice)\s*\(?\*{{0,2}}({_L})\b",
+    rf"(?:the\s+)?(?:correct\s+|final\s+)?answer\s*(?:is|:|=|-|–)?\s*\**\s*\(?\**\s*({_L})\b"
+    rf"|(?:option|choice)\s*\(?\**\s*({_L})\b",
     re.IGNORECASE,
 )
 # Fallbacks, each taking its LAST occurrence, tried in order.

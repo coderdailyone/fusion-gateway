@@ -120,8 +120,15 @@ MODELS = {
         "openai/kimi-k2-0711-preview",
         api_base="https://api.kimi.com/coding/v1",
         api_key=os.environ["MOONSHOT_API_KEY"]),
-    "glm-4.6": lambda: make_completion_fn(
-        "openai/glm-4.6",
+    # glm-5.2 (paid) is reachable on the Anthropic-compatible endpoint; the
+    # paid glm-5.2/glm-4.6 on the OpenAI /paas/v4 endpoint return 余额不足,
+    # while glm-4.5-flash is free there (a cheaper fallback if needed).
+    "glm-5.2": lambda: make_completion_fn(
+        "anthropic/glm-5.2",
+        api_base="https://open.bigmodel.cn/api/anthropic",
+        api_key=os.environ["GLM_API_KEY"]),
+    "glm-4.5-flash": lambda: make_completion_fn(
+        "openai/glm-4.5-flash",
         api_base="https://open.bigmodel.cn/api/paas/v4",
         api_key=os.environ["GLM_API_KEY"]),
 }
