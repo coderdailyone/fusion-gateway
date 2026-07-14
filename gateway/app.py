@@ -10,7 +10,7 @@ from pathlib import Path
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from gateway.clock import Clock, SystemClock
 from gateway.config import load_config
@@ -18,7 +18,7 @@ from gateway.db import Store, connect
 from gateway.events import EventLog
 from gateway.ledger import BudgetTripped, Ledger, estimate_tokens
 from gateway.policy import UnknownModel, plan_route
-from gateway.providers import ProviderAdapter, ProviderError
+from gateway.providers import ProviderAdapter, ProviderError, parse_stream_usage
 
 logger = logging.getLogger("gateway.app")
 
@@ -170,11 +170,7 @@ def create_app(
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request, principal: str = Depends(get_principal)):
         body = await request.json()
-        if body.get("stream"):
-            return JSONResponse(
-                status_code=400,
-                content={"error": {"type": "streaming_not_supported"}},
-            )
+        streaming = bool(body.get("stream"))
 
         request_id = uuid.uuid4().hex
         requested_model = body.get("model") or ""
@@ -201,6 +197,103 @@ def create_app(
 
         messages = body.get("messages", [])
         max_tokens = body.get("max_tokens")
+
+        if streaming:
+            async def gen():
+                for model_name in plan.chain:
+                    model_cfg = cfg.models[model_name]
+                    adapter = adapters[model_cfg.provider]
+                    est_in, est_out = estimate_tokens(messages, max_tokens)
+
+                    try:
+                        entry_id = ledger.preflight(
+                            request_id, model_cfg.provider, model_name,
+                            est_in, est_out, model_cfg.in_usd_per_mtok, model_cfg.out_usd_per_mtok,
+                        )
+                    except BudgetTripped:
+                        events.append(request_id, "budget.tripped", {"model": model_name})
+                        _finish_request(store, request_id, "failed", clock)
+                        yield b'data: {"error": {"type": "budget_exhausted"}}\n\n'
+                        return
+
+                    events.append(request_id, "call.attempt", {"model": model_name})
+                    start = clock.now()
+                    accumulated = bytearray()
+                    first_byte = False
+                    try:
+                        async for chunk in adapter.chat_stream(model_cfg.upstream_model, body):
+                            first_byte = True
+                            accumulated.extend(chunk)
+                            yield chunk
+                    except ProviderError as exc:
+                        # Adapter contract: ProviderError is only raised before
+                        # the first byte reaches the client, so it's always
+                        # safe to fall back to the next model in the chain.
+                        ledger.fail(entry_id)
+                        events.append(
+                            request_id, "call.failed",
+                            {"model": model_name, "kind": exc.kind, "status": exc.status},
+                        )
+                        continue
+                    except Exception:
+                        if not first_byte:
+                            # Defensive: treat any pre-first-byte failure like
+                            # a ProviderError and fall back.
+                            ledger.fail(entry_id)
+                            events.append(
+                                request_id, "call.failed",
+                                {"model": model_name, "kind": "unknown"},
+                            )
+                            continue
+                        latency_ms = int((clock.now() - start).total_seconds() * 1000)
+                        in_tokens = est_in
+                        out_tokens = max(len(accumulated) // 4, 0)
+                        ledger.settle(
+                            entry_id, in_tokens, out_tokens, "estimated", latency_ms,
+                            model_cfg.in_usd_per_mtok, model_cfg.out_usd_per_mtok,
+                        )
+                        events.append(request_id, "call.failed",
+                                       {"model": model_name, "kind": "stream_error"})
+                        _finish_request(store, request_id, "failed", clock)
+                        yield b'data: {"error": {"type": "stream_failed"}}\n\n'
+                        return
+
+                    if not first_byte:
+                        # Upstream returned a 2xx with an empty body: no bytes
+                        # reached the client, so it's still safe to fall back.
+                        ledger.fail(entry_id)
+                        events.append(request_id, "call.failed",
+                                       {"model": model_name, "kind": "empty_stream"})
+                        continue
+
+                    latency_ms = int((clock.now() - start).total_seconds() * 1000)
+                    raw = bytes(accumulated)
+                    usage = parse_stream_usage(raw)
+                    if usage and "prompt_tokens" in usage and "completion_tokens" in usage:
+                        in_tokens = usage["prompt_tokens"]
+                        out_tokens = usage["completion_tokens"]
+                        usage_source = "reported"
+                    else:
+                        in_tokens = est_in
+                        out_tokens = max(len(raw) // 4, 0)
+                        usage_source = "estimated"
+
+                    ledger.settle(
+                        entry_id, in_tokens, out_tokens, usage_source, latency_ms,
+                        model_cfg.in_usd_per_mtok, model_cfg.out_usd_per_mtok,
+                    )
+                    events.append(request_id, "call.succeeded", {"model": model_name})
+                    _finish_request(store, request_id, "succeeded", clock)
+                    return
+
+                _finish_request(store, request_id, "failed", clock)
+                yield b'data: {"error": {"type": "upstream_exhausted"}}\n\n'
+
+            return StreamingResponse(
+                gen(),
+                media_type="text/event-stream",
+                headers={"x-fusion-trace-id": request_id},
+            )
 
         for model_name in plan.chain:
             model_cfg = cfg.models[model_name]
