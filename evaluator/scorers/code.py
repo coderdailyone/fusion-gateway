@@ -31,6 +31,39 @@ def extract_code(output_text: str) -> str:
 # --- scoring -----------------------------------------------------------
 
 
+def _run_case(code: str, tc: dict, runner) -> tuple[bool, dict]:
+    """Run one test case. Two shapes are supported:
+
+    - "pyfunc" (e.g. HumanEval): the case has `test` (defines check(candidate))
+      and `entry_point`. We build `code + test + check(entry_point)` and run it;
+      pass = the process exits cleanly (no AssertionError -> status "ok").
+    - "stdin" (competitive style): the case has `stdin` / `expected_stdout`.
+      We feed stdin and compare trimmed stdout.
+    """
+    if "entry_point" in tc:
+        script = f"{code}\n\n{tc['test']}\n\ncheck({tc['entry_point']})\n"
+        result = runner(script)
+        passed = result.status == "ok"
+        return passed, {
+            "kind": "pyfunc",
+            "entry_point": tc["entry_point"],
+            "status": result.status,
+            "stderr": result.stderr[:500],
+            "passed": passed,
+        }
+
+    result = runner(code, stdin=tc["stdin"])
+    passed = result.status == "ok" and result.stdout.strip() == tc["expected_stdout"].strip()
+    return passed, {
+        "kind": "stdin",
+        "stdin": tc["stdin"],
+        "expected_stdout": tc["expected_stdout"],
+        "status": result.status,
+        "stdout": result.stdout,
+        "passed": passed,
+    }
+
+
 def score(task: Task, output_text: str, runner=run_code) -> Score:
     if not task.tests:
         return Score(False, {"reason": "no_tests"})
@@ -42,15 +75,7 @@ def score(task: Task, output_text: str, runner=run_code) -> Score:
     all_pass = True
 
     for tc in task.tests:
-        result = runner(code, stdin=tc["stdin"])
-        passed = result.status == "ok" and result.stdout.strip() == tc["expected_stdout"].strip()
-        case_detail = {
-            "stdin": tc["stdin"],
-            "expected_stdout": tc["expected_stdout"],
-            "status": result.status,
-            "stdout": result.stdout,
-            "passed": passed,
-        }
+        passed, case_detail = _run_case(code, tc, runner)
         cases.append(case_detail)
         if not passed:
             all_pass = False

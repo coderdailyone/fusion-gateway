@@ -39,6 +39,14 @@ def parse_task(source: str, record: dict) -> Task:
         return Task(id=task_id, source=source, problem=problem, answer=answer,
                     tests=(), meta=rec)
 
+    if source == "humaneval":
+        problem = rec.pop("prompt")
+        test = rec.pop("test")
+        entry_point = rec.pop("entry_point")
+        return Task(id=task_id, source=source, problem=problem, answer=None,
+                    tests=({"kind": "pyfunc", "test": test, "entry_point": entry_point},),
+                    meta=rec)
+
     if source == "livecodebench":
         problem = rec.pop("question", None)
         if problem is None:

@@ -9,6 +9,15 @@ def test_parse_mmlu_pro():
     assert t.source == "mmlu_pro" and t.answer == "B"
     assert "4" in t.problem and "B" in t.problem  # options rendered into the problem
 
+def test_parse_humaneval():
+    rec = {"id": "HumanEval/0", "prompt": "def f(x):\n    ...",
+           "test": "def check(candidate):\n    assert candidate(1) == 2",
+           "entry_point": "f"}
+    t = parse_task("humaneval", rec)
+    assert t.source == "humaneval" and t.answer is None
+    assert t.problem.startswith("def f(x)")
+    assert t.tests[0]["entry_point"] == "f" and t.tests[0]["kind"] == "pyfunc"
+
 def test_load_suite_verifies_hash():
     recs = [MMLU_REC]
     good = content_sha(recs)
