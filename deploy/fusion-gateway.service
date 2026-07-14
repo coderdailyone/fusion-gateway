@@ -1,0 +1,15 @@
+[Unit]
+Description=Fusion Gateway (OpenAI-compatible LLM fusion gateway)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/fusion-gateway
+EnvironmentFile=/opt/fusion-gateway/.env
+ExecStart=/opt/fusion-gateway/.venv/bin/uvicorn --host 127.0.0.1 --port 8800 --factory gateway.app:create_app_from_env
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

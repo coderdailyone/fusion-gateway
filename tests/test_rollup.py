@@ -43,7 +43,7 @@ def _seed(db_path):
         "INSERT INTO ledger "
         "(request_id, provider, model, state, est_cost_usd, actual_cost_usd, "
         "usage_source, in_tokens, out_tokens, latency_ms, created_at, settled_at) "
-        "VALUES ('r2','glm','glm-4.7','settled',0.002,0.0021,'reported',"
+        "VALUES ('r2','glm','glm-4.6','settled',0.002,0.0021,'reported',"
         "150,30,1200,'2026-07-14T00:05:01+00:00','2026-07-14T00:05:02+00:00')"
     )
     conn.execute(

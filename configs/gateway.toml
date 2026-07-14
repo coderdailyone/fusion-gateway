@@ -14,15 +14,15 @@ api_key_env = "GLM_API_KEY"
 
 [models."deepseek-chat"]
 provider = "deepseek"
-upstream_model = "deepseek-chat"
-in_usd_per_mtok = 0.14   # VERIFY against official pricing page at deploy; config is versioned
+upstream_model = "deepseek-v4-flash"
+in_usd_per_mtok = 0.14   # verified 2026-07-14 (deepseek-v4-flash non-thinking); deepseek-chat alias deprecates 2026-07-24
 out_usd_per_mtok = 0.28
-fallback = ["glm-4.7"]
+fallback = ["glm-4.6"]
 
-[models."glm-4.7"]
+[models."glm-4.6"]
 provider = "glm"
-upstream_model = "glm-4.7"
-in_usd_per_mtok = 0.60   # VERIFY at deploy
+upstream_model = "glm-4.6"
+in_usd_per_mtok = 0.60   # glm-4.6 flagship; price approximate, confirm at smoke
 out_usd_per_mtok = 2.20
 fallback = []
 

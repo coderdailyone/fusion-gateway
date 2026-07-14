@@ -37,7 +37,7 @@ def test_happy_path_settles_ledger(tmp_path, monkeypatch):
 def test_fallback_chain_on_provider_error(tmp_path, monkeypatch):
     c = make_client(tmp_path, monkeypatch, deepseek=boom_handler)
     r = c.post("/v1/chat/completions", json=BODY, headers=H())
-    assert r.status_code == 200 and r.json()["model"] == "glm-4.7"
+    assert r.status_code == 200 and r.json()["model"] == "glm-4.6"
 
 def test_all_providers_down_502(tmp_path, monkeypatch):
     c = make_client(tmp_path, monkeypatch, deepseek=boom_handler, glm=boom_handler)
