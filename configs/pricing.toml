@@ -1,0 +1,11 @@
+["deepseek-chat"]
+in_usd_per_mtok = 0.14
+out_usd_per_mtok = 0.28
+
+["kimi-k2"]
+in_usd_per_mtok = 0.60    # VERIFY vs Moonshot published pricing at run time
+out_usd_per_mtok = 2.50   # VERIFY
+
+["glm-5.2"]
+in_usd_per_mtok = 0.60    # VERIFY vs Zhipu published pricing at run time
+out_usd_per_mtok = 2.20   # VERIFY
