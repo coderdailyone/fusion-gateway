@@ -62,6 +62,9 @@ def _extract_answer(text: str) -> str | None:
 
 _TRAILING_PUNCT = re.compile(r"[.,;:!?]+$")
 _FRAC = re.compile(r"\\d?frac\{([^{}]*)\}\{([^{}]*)\}")
+# LaTeX shorthand with single-digit numerator/denominator and no braces,
+# e.g. \frac13  or  \dfrac12  (models emit this; the braced form above misses it).
+_FRAC_SHORT = re.compile(r"\\d?frac(\d)(\d)")
 
 
 def _normalize(s: str) -> str:
@@ -78,6 +81,7 @@ def _to_sympy(s: str):
     t = t.replace("\\left", "").replace("\\right", "")
     t = t.replace("\\cdot", "*").replace("\\times", "*")
     t = t.replace("\\!", "").replace("\\,", "")
+    t = _FRAC_SHORT.sub(r"(\1)/(\2)", t)
     t = _FRAC.sub(r"(\1)/(\2)", t)
     t = t.replace("^", "**")
     try:

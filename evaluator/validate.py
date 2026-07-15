@@ -34,9 +34,13 @@ def load_secrets(path: str = "runs/secrets/.env") -> None:
                 os.environ.setdefault(k, v)
 
 
-def make_completion_fn(litellm_model: str, **overrides):
+def make_completion_fn(litellm_model: str, max_tokens: int = 2048, **overrides):
     """Return completion_fn(model, prompt) -> {text,in_tokens,out_tokens,cost_usd}
-    that calls the given litellm model. `overrides` (api_base/api_key) are passed through."""
+    that calls the given litellm model. `overrides` (api_base/api_key) are passed through.
+
+    Reasoning models (Kimi/GLM) need a generous max_tokens: a small cap gets spent
+    on hidden reasoning and returns EMPTY content (seen in the M3a pilot — Kimi
+    produced 86 empty answers at 2048)."""
     import litellm
     litellm.suppress_debug_info = True
 
@@ -44,7 +48,7 @@ def make_completion_fn(litellm_model: str, **overrides):
         resp = litellm.completion(
             model=litellm_model,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=2048,
+            max_tokens=max_tokens,
             **overrides,
         )
         try:
@@ -116,8 +120,9 @@ def validate(gateway_model_name: str, completion_fn, n_per_source: int = 5,
 MODELS = {
     "deepseek-chat": lambda: make_completion_fn(
         "deepseek/deepseek-chat", api_key=os.environ["DEEPSEEK_API_KEY"]),
-    "kimi-k2": lambda: make_completion_fn(
+    "kimi-k2": lambda: make_completion_fn(  # reasoning model -> generous cap
         "openai/kimi-k2-0711-preview",
+        max_tokens=8192,
         api_base="https://api.kimi.com/coding/v1",
         api_key=os.environ["MOONSHOT_API_KEY"]),
     # glm-5.2 (paid) is reachable on the Anthropic-compatible endpoint; the
@@ -125,6 +130,7 @@ MODELS = {
     # while glm-4.5-flash is free there (a cheaper fallback if needed).
     "glm-5.2": lambda: make_completion_fn(
         "anthropic/glm-5.2",
+        max_tokens=8192,
         api_base="https://open.bigmodel.cn/api/anthropic",
         api_key=os.environ["GLM_API_KEY"]),
     "glm-4.5-flash": lambda: make_completion_fn(

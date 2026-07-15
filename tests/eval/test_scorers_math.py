@@ -13,3 +13,8 @@ def test_symbolic_equivalence():
 
 def test_wrong():
     assert not score(T("42"), "\\boxed{41}").correct
+
+def test_frac_shorthand():
+    # Regression from the pilot: models write \frac13 (no braces).
+    assert score(T("\\frac{1}{3}"), "so \\boxed{\\frac13}").correct
+    assert score(T("1/2"), "\\boxed{\\dfrac12}").correct
