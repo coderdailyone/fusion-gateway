@@ -137,6 +137,13 @@ MODELS = {
         "openai/glm-4.5-flash",
         api_base="https://open.bigmodel.cn/api/paas/v4",
         api_key=os.environ["GLM_API_KEY"]),
+    # strong+expensive frontier model (via OpenAI-compatible mirror); reasoning
+    # model -> generous max_tokens. The "expensive" leg for the routing crux.
+    "gpt-5.5": lambda: make_completion_fn(
+        "openai/gpt-5.5",
+        max_tokens=8192,
+        api_base="https://mirror.xinshu.ai/v1",
+        api_key=os.environ["OPENAI_MIRROR_KEY"]),
 }
 
 

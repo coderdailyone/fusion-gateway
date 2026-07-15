@@ -174,10 +174,16 @@ PILOT_MODELS = ["deepseek-chat", "kimi-k2", "glm-5.2"]
 
 
 def run_pilot(n: int = 150, seed: int = 1234,
-              manifest_path: str = "configs/suite.manifest.json") -> dict:
+              manifest_path: str = "configs/suite.manifest.json",
+              run_dir=None, model_names=None) -> dict:
     """Real pilot: sample PILOT_MODELS over a stratified n-task subset of the
-    locked suite, then analyze the routing signal. Makes real API calls."""
+    locked suite, then analyze the routing signal. Makes real API calls.
+
+    Pass an existing `run_dir` to RESUME a partial run (the sampler skips
+    already-frozen (task, model) pairs); omit it to start a fresh run.
+    """
     from datetime import datetime, timezone
+    from pathlib import Path
     from evaluator import validate
     from evaluator.sampler import sample
     from evaluator.store import new_run_dir
@@ -189,10 +195,14 @@ def run_pilot(n: int = 150, seed: int = 1234,
     manifest = load(manifest_path)
     tasks = load_suite(manifest, {s.name: make_fetcher(s.name) for s in manifest.sources})
     subset = stratified_subset(tasks, n, seed)
-    models = {name: validate.MODELS[name]() for name in PILOT_MODELS}
+    names = model_names or PILOT_MODELS
+    models = {name: validate.MODELS[name]() for name in names}
 
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    run_dir = new_run_dir("evaluator", "pilot", ts)
+    if run_dir is None:
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        run_dir = new_run_dir("evaluator", "pilot", ts)
+    else:
+        run_dir = Path(run_dir)
     rows = sample(models, subset, run_dir)
     result = analyze(rows)
 
