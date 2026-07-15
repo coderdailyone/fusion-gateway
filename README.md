@@ -2,91 +2,163 @@
 
 # ⚡ Fusion Gateway
 
-**An OpenRouter-style, industrial-grade LLM fusion gateway.**
-One OpenAI-compatible endpoint that routes, cascades, and *fuses* models —
-and only pays for fusion when it actually buys quality.
+**An OpenRouter-style, self-hosted LLM gateway.**
+One OpenAI-compatible endpoint in front of many models — with per-call cost
+accounting, budget kill-switch, replayable traces, and automatic fallback.
+Its research goal is **cost-quality Pareto-SOTA** routing and fusion.
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
-![Status](https://img.shields.io/badge/status-M1%20in%20progress-orange)
+![API](https://img.shields.io/badge/API-OpenAI--compatible-412991?logo=openai&logoColor=white)
 ![Truth store](https://img.shields.io/badge/state-SQLite%20event--sourced-003B57?logo=sqlite&logoColor=white)
-![Goal](https://img.shields.io/badge/goal-cost%E2%80%93quality%20Pareto%20SOTA-6f42c1)
+![Status](https://img.shields.io/badge/status-active%20development-orange)
 ![License](https://img.shields.io/badge/license-TBD-lightgrey)
 
 </div>
 
 ---
 
-## The one-paragraph version
+## What you get today
 
-Dynamic routing reliably saves **cost and latency** — but naive multi-model
-**fusion usually fails to beat the single best model on quality**. Fusion
-Gateway treats that gap as the whole problem. It reads only *public* task
-features, decides between a single model, a cheap→strong **cascade**, or a
-multi-model **panel**, and fuses panel outputs **only when a learned
-disagreement gate says the extra spend pays off**. Every fusion or cascade
-point must **expand the cost–quality Pareto frontier or get cut**.
+A single async gateway that speaks the **OpenAI Chat Completions API** (streaming
+and non-streaming) and, per request:
 
-## How a request flows
+- **routes** a model name to a primary + **fallback** chain (a provider outage
+  falls through to the next model instead of erroring);
+- **meters cost** on every call with a `preflight → settle` ledger, and **trips a
+  kill-switch** when a budget cap is hit;
+- writes an **append-only, replayable trace** of every decision, call, cost, and
+  latency to a single SQLite file.
+
+The learned cost-aware **routing / cascade / fusion** (the namesake) is under
+active development — see [Status](#status--roadmap).
+
+## Quick start
+
+```bash
+git clone https://github.com/coderdailyone/fusion-gateway.git
+cd fusion-gateway
+python3 -m venv .venv
+.venv/bin/pip install -e .
+```
+
+Set your provider key(s) and an auth token, then run the gateway:
+
+```bash
+export DEEPSEEK_API_KEY=sk-...            # a key for each provider in your config
+export GATEWAY_TOKENS="me:secret-token"   # client-token:principal pairs
+.venv/bin/uvicorn --factory gateway.app:create_app_from_env --host 127.0.0.1 --port 8800
+```
+
+Call it exactly like the OpenAI API (`model: "auto"` uses the configured default):
+
+```bash
+curl http://127.0.0.1:8800/v1/chat/completions \
+  -H "Authorization: Bearer secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "auto", "messages": [{"role": "user", "content": "hello"}]}'
+```
+
+The response carries an `x-fusion-trace-id` header; pass `"stream": true` for SSE.
+Point any OpenAI SDK at `http://127.0.0.1:8800/v1` with your gateway token.
+
+> The gateway binds to `127.0.0.1` by default — expose it via your own reverse
+> proxy or an SSH tunnel, never straight to the internet.
+
+## Configuration
+
+Runtime is driven by environment variables:
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `GATEWAY_TOKENS` | `token:principal` pairs (comma-separated); `admin` principal unlocks `/admin/*` | — (required) |
+| `GATEWAY_CONFIG` | path to the TOML model/budget config | `configs/gateway.toml` |
+| `GATEWAY_DB` | SQLite truth-store path | `data/gateway.sqlite` |
+| `<PROVIDER>_API_KEY` | one per provider, named by its `api_key_env` | — |
+
+Models, providers, prices, budget, and the default route live in
+[`configs/gateway.toml`](configs/gateway.toml):
+
+```toml
+[budget]
+active = "M1"
+[budgets.M1]
+cap_usd = 5.0                 # kill-switch trips at 100%, alerts at 80%
+
+[providers.deepseek]
+base_url = "https://api.deepseek.com"
+api_key_env = "DEEPSEEK_API_KEY"
+
+[models."deepseek-chat"]
+provider = "deepseek"
+upstream_model = "deepseek-v4-flash"
+in_usd_per_mtok = 0.14
+out_usd_per_mtok = 0.28
+fallback = ["glm-4.6"]        # tried in order if the primary fails
+
+[policy]
+version = "static-v0"
+default_model = "deepseek-chat"
+```
+
+## API
+
+| Method & path | Auth | What it does |
+|---|---|---|
+| `POST /v1/chat/completions` | token | OpenAI-compatible completion; streaming supported; falls back down the chain |
+| `GET /v1/models` | token | configured model names |
+| `GET /healthz` | none | liveness `{"ok": true}` |
+| `GET /admin/status` | admin | budget/ledger status + request counts |
+| `POST /admin/killswitch/release` | admin | reset a tripped budget |
+
+Error shapes: `401` bad token · `403` non-admin · `502 upstream_exhausted`
+(whole chain failed) · `503 budget_exhausted` (budget tripped).
+
+Inspect a running gateway's SQLite with the daily rollup:
+
+```bash
+.venv/bin/python scripts/rollup.py data/gateway.sqlite
+```
+
+## How it works
 
 ```mermaid
 flowchart LR
     C["Client<br/>(OpenAI-compatible)"] --> A{{Gateway}}
-    A --> F["Feature extraction<br/><i>public features only</i>"]
-    F --> R{"Router<br/>utility = quality − λ·cost"}
-    R -->|simple| S["Single model"]
-    R -->|verifiable| K["Cascade<br/>cheap → strong"]
-    R -->|hard / ambiguous| P["Panel<br/>N models in parallel"]
-    P --> G{"Disagreement<br/>gate"}
-    G -->|worth it| U["Fuse / synthesize"]
-    G -->|not worth it| B["Best single output"]
-    S --> O["Response"]
-    K --> O
-    U --> O
-    B --> O
+    A --> R{"Route: model + fallback chain"}
+    R --> P["Provider adapter(s)"]
+    P --> O["Response<br/>(x-fusion-trace-id)"]
     A -.->|preflight → settle| L[("SQLite<br/>ledger · events · traces")]
 ```
 
-Judges and reference answers **never** enter routing inputs. Every decision,
-provider call, cost, and latency is written to an append-only, **replayable**
-event log.
+Today the router is static (a model name → primary + fallbacks). The research
+line adds a **learned cost-aware router** that reads only public task features
+and decides between a single model, a cheap→strong **cascade**, or a multi-model
+**panel** that is **fused only when a learned gate says it pays off** — with
+every fusion/cascade point held to "expand the cost–quality Pareto frontier or
+be cut." Judges and reference answers never enter routing inputs.
 
-## Why it's built this way
+Deeper docs: **[docs/DESIGN.md](docs/DESIGN.md)** (architecture + milestones) ·
+**[docs/DISCIPLINES.md](docs/DISCIPLINES.md)** (engineering rules and why) ·
+**[docs/adr/](docs/adr/)** (decision records).
 
-| Principle | What it means here |
+## Status & roadmap
+
+Active, test-driven development.
+
+| Milestone | State |
 |---|---|
-| 🎯 **Pareto-SOTA, or it doesn't ship** | The dynamic policy's cost/quality curve must *envelope* every static single-model baseline — the bar a router has to clear to earn its complexity. |
-| 🧾 **SQLite is the only truth** | Append-only, parent-linked, deterministically replayable traces; a cost **ledger** does `preflight → settle` on every real call. |
-| 🛑 **Budgets that actually stop** | Per-milestone caps, alert at 80%, **kill switch trips at 100%** — cleared only by explicit admin action. |
-| 🔒 **Leakage is a test failure** | Group-by-task validation; benchmark IDs are never routing features; a judge must clear a repeat-scoring stability floor before its labels are trusted. |
-| 💸 **Fusion must earn its cost** | A learned gate decides *whether* to fuse; a fusion point that doesn't push the frontier out is removed, not kept "just in case." |
-
-## Design & decisions
-
-- 📐 **[docs/DESIGN.md](docs/DESIGN.md)** — architecture, milestones (M0→M6), and the falsifiable acceptance criteria.
-- 🧭 **[docs/DISCIPLINES.md](docs/DISCIPLINES.md)** — the engineering rules the code is held to, and *why* each one exists.
-- 🗂️ **[docs/adr/](docs/adr/)** — architecture decision records.
-
-## Roadmap
-
-| Milestone | Focus | Exit criterion |
-|:--:|---|---|
-| **M0** ✅ | Governance, disciplines, decision records | Repo + disciplines in place |
-| **M1** 🚧 | Minimal production gateway | Real traffic, 1 week, no gateway-caused incidents |
-| **M2** | Stable evaluation harness (≥1000 objective tasks) | Judges pass a repeatability floor |
-| **M3** | Cost-aware router training | Learned curve envelopes every static policy |
-| **M4** | Cascade + learned fusion gate | Fusion/cascade expands the Pareto frontier |
-| **M5** | Reproducible SOTA benchmark report | Beats a public router baseline on the same suite |
-| **M6** | Productionization (shadow → rollout) | Trained policy carries real traffic |
+| **M0** governance & disciplines | ✅ done |
+| **M1** minimal gateway (this README) | ✅ code complete; deploy pending |
+| **M2a** objective benchmark harness (1063 tasks, 3-model validated) | ✅ done |
+| **M3** cost-aware router (signal pilot → full sampling + training) | 🚧 in progress |
+| **M4** cascade + learned fusion gate | ⬜ |
+| **M5** reproducible SOTA benchmark report | ⬜ |
 
 ## Tech
 
-Python 3.10+ · FastAPI · httpx · SQLite (WAL) · no ORM, no queue, no Docker —
-the gateway is a single async process whose truth lives in one SQLite file.
-
-## Status
-
-Early and moving. **M0** (governance, disciplines) is done; **M1** (the minimal
-production gateway) is under active, test-driven development.
+Python 3.10+ · FastAPI · httpx · SQLite (WAL) — a single async process, no ORM,
+no queue, no Docker. The evaluator adds LiteLLM / datasets / sympy (an `[eval]`
+extra) and stays fully decoupled from the gateway core.
 
 ## License
 
