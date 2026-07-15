@@ -167,3 +167,52 @@ def analyze(rows: list[ResultRow]) -> dict:
         "verdict": verdict,
         "signals": signals,
     }
+
+
+# Pilot model pool (must exist in evaluator.validate.MODELS and configs/pricing.toml).
+PILOT_MODELS = ["deepseek-chat", "kimi-k2", "glm-5.2"]
+
+
+def run_pilot(n: int = 150, seed: int = 1234,
+              manifest_path: str = "configs/suite.manifest.json") -> dict:
+    """Real pilot: sample PILOT_MODELS over a stratified n-task subset of the
+    locked suite, then analyze the routing signal. Makes real API calls."""
+    from datetime import datetime, timezone
+    from evaluator import validate
+    from evaluator.sampler import sample
+    from evaluator.store import new_run_dir
+    from evaluator.suite.manifest import load
+    from evaluator.suite.loader import load_suite
+    from evaluator.hf_fetchers import make_fetcher
+
+    validate.load_secrets()
+    manifest = load(manifest_path)
+    tasks = load_suite(manifest, {s.name: make_fetcher(s.name) for s in manifest.sources})
+    subset = stratified_subset(tasks, n, seed)
+    models = {name: validate.MODELS[name]() for name in PILOT_MODELS}
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_dir = new_run_dir("evaluator", "pilot", ts)
+    rows = sample(models, subset, run_dir)
+    result = analyze(rows)
+
+    print(f"\npilot: {len(subset)} tasks x {len(models)} models (run_dir={run_dir})")
+    for model, pm in sorted(result["per_model"].items()):
+        print(f"  {model:16} acc={pm['accuracy']:.3f}  cost=${pm['total_cost_usd']:.4f}  n={pm['n']}")
+    bs = result["best_static"]
+    print(f"best_static: {bs['model']}  acc={bs['accuracy']:.3f}  cost=${bs['total_cost_usd']:.4f}")
+    print(f"oracle_acc={result['oracle_accuracy']:.3f}  quality_headroom={result['quality_headroom']:.3f}")
+    print(f"disagreement_rate={result['disagreement_rate']:.3f}")
+    print(f"iso_quality_cost=${result['iso_quality_cost']:.4f}  cost_savings={result['cost_savings']:.3f}")
+    print(f"VERDICT: {result['verdict']}  signals={result['signals']}")
+    return result
+
+
+def main() -> None:
+    import sys
+    n = int(sys.argv[1]) if len(sys.argv) > 1 else 150
+    run_pilot(n=n)
+
+
+if __name__ == "__main__":
+    main()
