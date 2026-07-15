@@ -13,3 +13,11 @@ out_usd_per_mtok = 2.20   # VERIFY
 ["gpt-5.5"]
 in_usd_per_mtok = 1.75    # GPT-5.x frontier tier (proxy); VERIFY
 out_usd_per_mtok = 14.0   # VERIFY
+
+["claude-sonnet-5"]
+in_usd_per_mtok = 3.0     # Claude Sonnet tier (proxy); VERIFY
+out_usd_per_mtok = 15.0   # VERIFY
+
+["claude-opus-4-8"]
+in_usd_per_mtok = 5.0     # Claude Opus tier (proxy); VERIFY
+out_usd_per_mtok = 25.0   # VERIFY

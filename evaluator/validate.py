@@ -144,6 +144,18 @@ MODELS = {
         max_tokens=8192,
         api_base="https://mirror.xinshu.ai/v1",
         api_key=os.environ["OPENAI_MIRROR_KEY"]),
+    # Claude frontier models via an Anthropic-compatible mirror — the strongest
+    # "strong leg" options for the routing crux.
+    "claude-sonnet-5": lambda: make_completion_fn(
+        "anthropic/claude-sonnet-5",
+        max_tokens=8192,
+        api_base="https://api.aicodemirror.com/api/claudecode",
+        api_key=os.environ["CLAUDE_MIRROR_KEY"]),
+    "claude-opus-4-8": lambda: make_completion_fn(
+        "anthropic/claude-opus-4-8",
+        max_tokens=8192,
+        api_base="https://api.aicodemirror.com/api/claudecode",
+        api_key=os.environ["CLAUDE_MIRROR_KEY"]),
 }
 
 
