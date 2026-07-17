@@ -46,9 +46,10 @@ DeepSeek **0.68**, Sonnet 0.58. Split: 899 math/MCQ routed by the learned policy
   over always-Sonnet (0.892 vs 0.867) at ~2.6× lower cost** ($0.00077 vs $0.00204).
   → the dynamic policy **Pareto-dominates Sonnet** (envelope check: `dominated =
   [claude-sonnet-5]`).
-- It also **beats always-DeepSeek on accuracy** (0.892 vs 0.849) at ~7× DeepSeek's
-  (tiny) cost. The router does **not** "dominate" DeepSeek only because DeepSeek is
-  the absolute cost floor ($0.0001 — nothing is cheaper than always-cheapest). So
+- It also **beats always-DeepSeek on accuracy** (0.892 vs 0.849) but costs **~7×
+  MORE** than DeepSeek ($0.00077 vs $0.00010) — a genuine quality/cost trade-off,
+  NOT a free win. The router is **never** cheaper than always-DeepSeek: DeepSeek is
+  the absolute cost floor ($0.0001 — nothing beats always-using-the-cheapest). So
   the real Pareto frontier is **{DeepSeek endpoint} + {router curve}**, and
   always-Sonnet is off it.
 - vs the historical DRACO-20 result ("dynamic routing never beat the best static
