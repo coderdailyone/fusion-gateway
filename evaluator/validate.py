@@ -144,6 +144,13 @@ MODELS = {
         max_tokens=8192,
         api_base="https://mirror.xinshu.ai/v1",
         api_key=os.environ["OPENAI_MIRROR_KEY"]),
+    # gpt-5.6-sol: fast GPT-5.x variant on the mirror (gpt-5.5 was too slow) —
+    # the M3b pool's 4th (strong) leg.
+    "gpt-5.6-sol": lambda: make_completion_fn(
+        "openai/gpt-5.6-sol",
+        max_tokens=8192,
+        api_base="https://mirror.xinshu.ai/v1",
+        api_key=os.environ["OPENAI_MIRROR_KEY"]),
     # Claude frontier models via an Anthropic-compatible mirror — the strongest
     # "strong leg" options for the routing crux.
     "claude-sonnet-5": lambda: make_completion_fn(
