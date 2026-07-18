@@ -142,10 +142,14 @@ labels**. Produce:
 ### 6. `evaluator/audit/disagreements.py` — lightweight human-eyeball audit
 
 Surface the most informative cases for a human spot-check without an LLM judge:
-tasks scored wrong for a model where another model scored correct, and tasks
-where the scorer's method was `none` (unparseable). Emits a small ranked report;
-no automated re-judging. Guards against a residual systematic extraction bias
-that the reference self-test (which only tests gold answers) cannot see.
+tasks scored wrong for a model where another model scored correct
+(`wrong_but_others_right`), ranked by how many other models were right. This
+subsumes the "unparseable-yet-others-right" case, so a separate `method="none"`
+kind is intentionally not built — `ResultRow` carries no scorer-method field,
+and adding one would be over-engineering for a human-eyeball tool. Emits a small
+ranked report; no automated re-judging. Guards against a residual systematic
+extraction bias that the reference self-test (which only tests gold answers)
+cannot see.
 
 ## Data flow
 
