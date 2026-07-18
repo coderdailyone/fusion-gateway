@@ -1,9 +1,9 @@
 from evaluator.suite.types import Task
 from evaluator.audit.references import Reference
-from evaluator.audit.reference_selftest import selftest_one
+from evaluator.audit.reference_selftest import selftest_one, selftest, SelfTestFailure
 
-def _t(source, answer=None, tests=()):
-    return Task(id="q", source=source, problem="P", answer=answer, tests=tests, meta={})
+def _t(source, answer=None, tests=(), id="q"):
+    return Task(id=id, source=source, problem="P", answer=answer, tests=tests, meta={})
 
 def test_mmlu_gold_recognized():
     t = _t("mmlu_pro", answer="C")
@@ -34,3 +34,19 @@ def test_detects_broken_gold():
     t = _t("mmlu_pro", answer="C")
     ref = Reference("q", "mmlu_pro", gold="Z")  # not A-J -> unparseable/incorrect
     assert selftest_one(t, ref) is not None
+
+def test_batch_selftest_flags_missing_reference():
+    # batch driver: recognized references yield no failure; a task whose id
+    # is absent from `refs` must surface as a missing_reference failure.
+    tasks = [
+        _t("mmlu_pro", answer="C", id="t1"),
+        _t("math", answer="42", id="t2"),
+        _t("mmlu_pro", answer="C", id="t3"),  # no matching entry in refs
+    ]
+    refs = {
+        "t1": Reference("t1", "mmlu_pro", gold="C"),
+        "t2": Reference("t2", "math", gold="42", solution="\\boxed{42}"),
+        # "t3" intentionally missing
+    }
+    failures = selftest(tasks, refs)
+    assert failures == [SelfTestFailure("t3", "mmlu_pro", "missing_reference", {})]
