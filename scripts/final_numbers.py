@@ -36,7 +36,7 @@ def main() -> None:
     run_dir = sys.argv[1]
     manifest = load("configs/suite.manifest.json")
     tasks = load_suite(manifest, {s.name: make_fetcher(s.name) for s in manifest.sources})
-    models = {name: (lambda: None) for name in []}  # scoring only; no calls
+    models = {}  # scoring only over frozen outputs; no models -> no API calls
     # score frozen outputs offline (sample() skips already-frozen pairs; with an
     # empty models dict it does no sampling and only scores what's frozen)
     rows = sample(models, tasks, run_dir)
