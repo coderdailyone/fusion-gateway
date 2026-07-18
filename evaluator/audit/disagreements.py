@@ -1,8 +1,10 @@
 """Human-eyeball disagreement audit (no LLM judge).
 
 Surfaces candidate scorer false-negatives for manual spot-check: tasks a model
-got 'wrong' while others got them right, and outputs the scorer could not parse.
-Ranks by how many other models were right (higher = more suspicious).
+got 'wrong' while at least one other model got them right (the
+``wrong_but_others_right`` kind). Ranks by how many other models were right
+(higher = more suspicious). Works purely off ``ResultRow`` aggregation plus the
+frozen output text — no model calls, no re-scoring.
 """
 from __future__ import annotations
 
@@ -21,8 +23,8 @@ class DisagreementCase:
     detail: dict
 
 
-def find_cases(rows: list[ResultRow], frozen_by_key: dict[tuple, str],
-               scorers=None) -> list[DisagreementCase]:
+def find_cases(rows: list[ResultRow],
+               frozen_by_key: dict[tuple, str]) -> list[DisagreementCase]:
     by_task: dict[str, list[ResultRow]] = defaultdict(list)
     for r in rows:
         by_task[r.task_id].append(r)
