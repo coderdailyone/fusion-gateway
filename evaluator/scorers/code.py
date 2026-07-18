@@ -3,6 +3,7 @@ import re
 from evaluator.suite.types import Task
 from evaluator.scorers.base import Score
 from evaluator.sandbox import run_code
+from evaluator.official.humaneval_exec import build_check_program
 
 # --- extraction -------------------------------------------------------
 
@@ -41,7 +42,7 @@ def _run_case(code: str, tc: dict, runner) -> tuple[bool, dict]:
       We feed stdin and compare trimmed stdout.
     """
     if "entry_point" in tc:
-        script = f"{code}\n\n{tc['test']}\n\ncheck({tc['entry_point']})\n"
+        script = build_check_program(code, tc["test"], tc["entry_point"])
         result = runner(script)
         passed = result.status == "ok"
         return passed, {
