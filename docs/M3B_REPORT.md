@@ -1,5 +1,9 @@
 # M3b — Cost-Aware Router Report
 
+> **⚠️ Retraction note:** Numbers regenerated under M2c official scoring (see
+> `BENCHMARK_REPORT.md`); the earlier cost-savings figures were inflated by a
+> math-scorer bug and are retracted pending recompute.
+
 **Headline: the learned dynamic policy Pareto-dominates the best single model.**
 On the full 1063-task objective suite, routing DeepSeek (cheap) ↔ Claude Sonnet 5
 (strong) — with a deterministic verify-cascade for code and a learned classifier
