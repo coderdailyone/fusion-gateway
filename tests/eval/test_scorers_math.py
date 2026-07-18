@@ -14,16 +14,18 @@ def test_symbolic_equivalence():
 def test_wrong():
     assert not score(T("42"), "\\boxed{41}").correct
 
-def test_interval_and_set_answers():
-    # Regression from gpt-5.6-sol: correct interval boxed without the "x \in" prefix.
-    assert score(T("x \\in [-2,7]"), "so \\boxed{[-2,7]}").correct
-    assert score(T("[-2,7]"), "\\boxed{x \\in [-2,7]}").correct
-    assert not score(T("x \\in [-2,7]"), "\\boxed{[0,5]}").correct
+def test_interval_exact_boxed():
+    # interval answers still match when both sides agree (official is_equiv)
+    assert score(T("[-2,7]"), "so \\boxed{[-2,7]}").correct
+    assert not score(T("[-2,7]"), "\\boxed{[0,5]}").correct
 
 def test_unit_labelled_number():
-    # correct value boxed with a \text{...} unit label.
+    # official _remove_right_units strips the \text{...} unit label
     assert score(T("3"), "\\boxed{3\\text{ treeks}}").correct
-    assert score(T("5"), "so x = 5").correct
+
+def test_var_in_prefix_now_strict():
+    # documents the intentional alignment change: "x \in" prefix is not stripped
+    assert not score(T("x \\in [-2,7]"), "so \\boxed{[-2,7]}").correct
 
 def test_frac_shorthand():
     # Regression from the pilot: models write \frac13 (no braces).
