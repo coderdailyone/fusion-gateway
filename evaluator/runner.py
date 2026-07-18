@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
+from evaluator.official.prompts import build as _build_official_prompt
 from evaluator.suite.types import Task
 
 
@@ -24,28 +25,14 @@ class FrozenOutput:
     error: str | None
 
 
-# Source-aware instructions constrain the OUTPUT FORMAT so objective scorers can
-# extract the answer reliably (regex over free-form model prose is fragile —
-# models box the option *value* instead of its letter, wrap answers in markdown,
-# etc.). None of these leak the answer; they only shape formatting.
-_INSTRUCTIONS = {
-    "mmlu_pro": ("Choose the single best option. End your response with a line "
-                 "'Answer: X' where X is the letter (A, B, C, ...) of the correct option."),
-    "math": ("Solve the problem. Put your final answer inside \\boxed{...} at the very end."),
-    "humaneval": ("Complete the function. Respond with a single Python code block "
-                  "containing the full function definition."),
-}
-_DEFAULT_INSTRUCTION = "Solve the following problem. Put your final answer clearly at the end."
-
-
 def build_prompt(task: Task) -> str:
     """Build the prompt sent to the model.
 
-    Uses ONLY task.problem plus a fixed, source-aware instruction. Must never
-    include task.answer or task.tests content, to avoid leaking the answer.
+    Delegates to the official 0-shot-CoT templates. Consumes ONLY task.problem
+    (never task.answer/task.tests); the leakage guarantee is structural and
+    verified by test_runner's leakage test.
     """
-    instruction = _INSTRUCTIONS.get(task.source, _DEFAULT_INSTRUCTION)
-    return f"{instruction}\n\n{task.problem}"
+    return _build_official_prompt(task)
 
 
 def run_one(task: Task, model: str, completion_fn: Callable[[str, str], dict]) -> FrozenOutput:
