@@ -65,10 +65,17 @@ _FRAC = re.compile(r"\\d?frac\{([^{}]*)\}\{([^{}]*)\}")
 # LaTeX shorthand with single-digit numerator/denominator and no braces,
 # e.g. \frac13  or  \dfrac12  (models emit this; the braced form above misses it).
 _FRAC_SHORT = re.compile(r"\\d?frac(\d)(\d)")
+# \text{...} units/labels — models box "3\text{ treeks}" when the answer is "3".
+_TEXT = re.compile(r"\\(?:text|mbox|mathrm)\s*\{[^{}]*\}")
+# Leading "variable relation" — MATH-500 answers like "x \in [-2,7]" or "x = 5";
+# models box just the value ("[-2,7]" / "5"), so strip the prefix from both sides.
+_VAR_PREFIX = re.compile(r"^[a-zA-Z]\s*(?:\\in|\\le|\\ge|\\leq|\\geq|=|<|>)\s*")
 
 
 def _normalize(s: str) -> str:
     s = s.strip().strip("$").strip()
+    s = _TEXT.sub("", s)
+    s = _VAR_PREFIX.sub("", s.strip())
     s = _TRAILING_PUNCT.sub("", s)
     return s.strip()
 
@@ -102,9 +109,20 @@ def score(task: Task, output_text: str) -> Score:
         return Score(False, {"reason": "unparseable"})
 
     expected_raw = task.answer if task.answer is not None else ""
+
+    # 1) normalized exact string match first — reliably catches intervals/sets,
+    #    unit-labelled numbers, and "x \in ..." answers where sympy can't compare.
+    norm_extracted = _normalize(extracted).replace(" ", "")
+    norm_expected = _normalize(expected_raw).replace(" ", "")
+    if norm_extracted and norm_extracted == norm_expected:
+        return Score(
+            True,
+            {"extracted": extracted, "expected": expected_raw, "method": "string"},
+        )
+
+    # 2) symbolic / numeric equivalence (1/2 == 0.5, 1+1 == 2, \frac shorthand).
     a = _to_sympy(extracted)
     b = _to_sympy(expected_raw)
-
     if a is not None and b is not None:
         try:
             if sympy.simplify(a - b) == 0:
@@ -122,15 +140,8 @@ def score(task: Task, output_text: str) -> Score:
                 )
         except Exception:
             pass
-        return Score(
-            False,
-            {"extracted": extracted, "expected": expected_raw, "method": "symbolic"},
-        )
 
-    norm_extracted = _normalize(extracted).replace(" ", "")
-    norm_expected = _normalize(expected_raw).replace(" ", "")
-    correct = bool(norm_extracted) and norm_extracted == norm_expected
     return Score(
-        correct,
-        {"extracted": extracted, "expected": expected_raw, "method": "string"},
+        False,
+        {"extracted": extracted, "expected": expected_raw, "method": "none"},
     )
