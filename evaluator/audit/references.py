@@ -44,8 +44,9 @@ def build_reference_index(rows_by_source: dict[str, list[dict]]) -> dict[str, Re
 
 
 def _fetch_rows(manifest, fetch) -> dict[str, list[dict]]:
-    from datasets import load_dataset  # lazy: only the real path needs it
-    fetch = fetch or (lambda ds, split, revision: list(load_dataset(ds, split=split, revision=revision)))
+    if fetch is None:
+        from datasets import load_dataset  # lazy: only the real path needs it
+        fetch = lambda ds, split, revision: list(load_dataset(ds, split=split, revision=revision))
     rows_by_source: dict[str, list[dict]] = {}
     for s in manifest.sources:
         rows_by_source[s.name] = fetch(s.hf_dataset, s.split, s.hf_revision)
