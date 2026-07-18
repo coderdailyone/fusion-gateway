@@ -32,6 +32,16 @@ def _synth_output(task: Task, ref: Reference) -> str:
             return ref.solution
         return f"Therefore the answer is \\boxed{{{ref.gold}}}."
     if task.source == "humaneval":
+        # KNOWN LIMITATION: we synthesize prompt + canonical_solution here,
+        # but the real scoring path (evaluator/scorers/code.py) grades the
+        # extracted completion ALONE — it never prepends the prompt. A real
+        # completion that omits an import/setup line the prompt already
+        # provided would fail real scoring while this self-test, which
+        # always includes the prompt, cannot detect that class of bug. This
+        # self-test proves the scorer recognizes a correct-and-complete
+        # program; it is structurally blind to prompt-context leakage into
+        # "correctness". See docs/BENCHMARK_REPORT.md's disagreement-audit
+        # note for humaneval false-negatives.
         body = (ref.prompt or "") + (ref.canonical_solution or "")
         return f"```python\n{body}\n```"
     return ref.gold or ""

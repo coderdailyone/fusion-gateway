@@ -4,10 +4,12 @@
 > `BENCHMARK_REPORT.md`); the earlier cost-savings figures were inflated by a
 > math-scorer bug and are retracted pending recompute.
 
-**Headline: the learned dynamic policy Pareto-dominates the best single model.**
+**⚠️ RETRACTED (bug-inflated; pending M2c official recompute): Headline: the
+learned dynamic policy Pareto-dominates the best single model.**
 On the full 1063-task objective suite, routing DeepSeek (cheap) ↔ Claude Sonnet 5
 (strong) — with a deterministic verify-cascade for code and a learned classifier
-for math/MCQ — reaches **higher accuracy than always-Sonnet at ~2.6× lower cost**,
+for math/MCQ — reaches **⚠️ RETRACTED (bug-inflated; pending M2c official
+recompute): higher accuracy than always-Sonnet at ~2.6× lower cost**,
 and beats always-DeepSeek on accuracy. `always-Sonnet` is pushed off the Pareto
 frontier.
 
@@ -33,7 +35,7 @@ Pool: DeepSeek (cheap) + Claude Sonnet 5 (strong). Router CV AUC on the full dat
 DeepSeek **0.68**, Sonnet 0.58. Split: 899 math/MCQ routed by the learned policy +
 164 code by the deterministic verify-cascade.
 
-### Cost–quality points
+### ⚠️ RETRACTED (bug-inflated; pending M2c official recompute): Cost–quality points
 
 | strategy | accuracy | cost / task |
 |---|---|---|
@@ -46,7 +48,8 @@ DeepSeek **0.68**, Sonnet 0.58. Split: 899 math/MCQ routed by the learned policy
 
 ### Result
 
-- **Router beats the best single model on BOTH axes:** at λ=3, **+2.4pt accuracy
+- **Router beats the best single model on BOTH axes:** at λ=3, **⚠️ RETRACTED
+  (bug-inflated; pending M2c official recompute): +2.4pt accuracy
   over always-Sonnet (0.892 vs 0.867) at ~2.6× lower cost** ($0.00077 vs $0.00204).
   → the dynamic policy **Pareto-dominates Sonnet** (envelope check: `dominated =
   [claude-sonnet-5]`).

@@ -2,7 +2,7 @@
 
 **Scoring:** official-benchmark judging, vendored under `evaluator/official/`:
 MATH `is_equiv`/`_strip_string` (Hendrycks, MIT) + sympy fallback; MMLU-Pro
-extraction chain (TIGER-Lab, MIT); HumanEval `check_correctness` assembly
+extraction chain (TIGER-Lab, Apache-2.0); HumanEval `check_correctness` assembly
 (OpenAI human-eval, MIT). Prompts: official 0-shot CoT.
 
 **One documented deviation:** MMLU-Pro official extraction falls back to a
@@ -28,3 +28,10 @@ failure as incorrect. Affected items: <N> (from the disagreement audit).
 ## Disagreement audit
 
 <count + notable human-checked cases>
+
+**Known limitation:** the humaneval reference self-test synthesizes
+`prompt + canonical_solution` as its check, whereas real scoring
+(`evaluator/scorers/code.py`) grades the extracted completion alone (no
+prompt prepend) — so the self-test cannot catch a completion that silently
+relies on prompt context (e.g. an import) it never restates. Watch for
+humaneval false-negatives in the disagreement audit as a result.
