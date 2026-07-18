@@ -23,9 +23,14 @@ def test_unit_labelled_number():
     # official _remove_right_units strips the \text{...} unit label
     assert score(T("3"), "\\boxed{3\\text{ treeks}}").correct
 
-def test_var_in_prefix_now_strict():
-    # documents the intentional alignment change: "x \in" prefix is not stripped
-    assert not score(T("x \\in [-2,7]"), "so \\boxed{[-2,7]}").correct
+def test_var_in_prefix_symmetric_normalization():
+    # Paid-smoke regression: MATH gold "x \in [-2,7]", model boxes the bare
+    # interval "[-2,7]" (same answer). math_equiv's modern symmetric
+    # normalization strips the "x \in" prefix on both sides -> correct.
+    assert score(T("x \\in [-2,7]"), "so \\boxed{[-2,7]}").correct
+    assert score(T("x \\in [-2,7]"), "\\boxed{[-2,\\,7]}").correct  # thin-space
+    # a different interval is still wrong
+    assert not score(T("x \\in [-2,7]"), "\\boxed{[0,5]}").correct
 
 def test_frac_shorthand():
     # Regression from the pilot: models write \frac13 (no braces).

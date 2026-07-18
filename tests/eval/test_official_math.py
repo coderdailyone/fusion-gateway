@@ -18,9 +18,21 @@ def test_sympy_fallback_numeric():
     assert math_equiv("0.5", "\\frac{1}{2}")
     assert math_equiv("1+1", "2")
 
-def test_var_in_prefix_is_NOT_stripped():
-    # deliberate: official does not strip "x \in"; our old leniency is dropped
+def test_var_in_prefix_is_NOT_stripped_by_byte_faithful_is_equiv():
+    # is_equiv stays byte-faithful Hendrycks: it does NOT strip "x \in".
     assert not is_equiv("[-2,7]", "x \\in [-2,7]")
+
+def test_modern_normalization_interval_prefix():
+    # Regression from the paid smoke: every model boxed the bare interval
+    # "[-2,7]" while the MATH gold is "x \in [-2,7]" — same answer. The modern
+    # symmetric normalization in math_equiv strips the leading "x \in" (and the
+    # \, thin-space gpt-5.6-sol used) on BOTH sides.
+    assert math_equiv("[-2,7]", "x \\in [-2,7]")
+    assert math_equiv("x \\in [-2,7]", "[-2,7]")        # symmetric
+    assert math_equiv("[-2,\\,7]", "x \\in [-2,7]")     # LaTeX thin-space
+    assert math_equiv("[-2, 7]", "x \\in [-2,7]")       # plain space
+    # a genuinely different interval must still be wrong after normalization
+    assert not math_equiv("[0,5]", "x \\in [-2,7]")
 
 def test_wrong():
     assert not is_equiv("41", "42")

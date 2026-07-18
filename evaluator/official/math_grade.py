@@ -116,7 +116,26 @@ def is_equiv(str1: str | None, str2: str | None) -> bool:
         return str1 == str2
 
 
-# --- local addition: sympy equivalence fallback (lm-eval recipe) ----------
+# --- local addition: modern MATH-eval normalization + sympy fallback ------
+
+# Symmetric normalization used by current MATH graders (Qwen2.5-Math /
+# DeepSeek-Math) on top of the 2021 Hendrycks string comparison: drop LaTeX
+# spacing commands and a leading variable-assignment / set-membership prefix,
+# so a bare answer "[-2,7]" matches a gold written "x \in [-2,7]" (and vice
+# versa). Applied to BOTH sides in math_equiv, so it never favors one model's
+# phrasing. Hendrycks already strips a short "x =" LHS; it does NOT strip
+# "x \in ..." / "x < ..." or the \, thin-space, which is what this adds.
+_LATEX_SPACE = re.compile(r"\\[,!;: ]")
+_VAR_PREFIX = re.compile(
+    r"^\s*\$?\s*[a-zA-Z]\s*"
+    r"(?:\\in|\\leq|\\geq|\\le|\\ge|=|<|>|\\subseteq|\\subsetneq|\\subset)\s*"
+)
+
+
+def _modern_normalize(s: str) -> str:
+    s = _LATEX_SPACE.sub("", s)
+    return _VAR_PREFIX.sub("", s.strip())
+
 
 def _to_sympy(s: str):
     # _to_sympy must guard _strip_string itself: unlike is_equiv, it runs
@@ -144,10 +163,14 @@ def _to_sympy(s: str):
 
 
 def math_equiv(extracted: str, gold: str) -> bool:
-    """Official string match, then a sympy equivalence fallback."""
+    """Official Hendrycks string match, then modern symmetric normalization,
+    then a sympy equivalence fallback."""
     if is_equiv(extracted, gold):
         return True
-    a, b = _to_sympy(extracted), _to_sympy(gold)
+    # modern MATH-eval normalization on BOTH sides (variable prefix, \, spaces)
+    if is_equiv(_modern_normalize(extracted), _modern_normalize(gold)):
+        return True
+    a, b = _to_sympy(_modern_normalize(extracted)), _to_sympy(_modern_normalize(gold))
     if a is None or b is None:
         return False
     try:
