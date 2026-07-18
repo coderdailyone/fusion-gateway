@@ -22,6 +22,9 @@ packages = ["gateway", "evaluator", "evaluator.suite", "evaluator.scorers", "rou
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Put the repo root on sys.path so tests can `from scripts.X import ...` and
+# `from evaluator...` under a bare `pytest` invocation, not only `python -m pytest`.
+pythonpath = ["."]
 filterwarnings = [
   # Third-party: Starlette's TestClient warns about the bundled httpx version.
   # Not our code; silence so our own test output stays pristine.
