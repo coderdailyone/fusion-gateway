@@ -53,14 +53,15 @@ the real numbers. It pays down the evaluation debt the routing work was built on
 
 Each benchmark's **official judging core** is ported into the repo as pinned
 source (not a pip dependency). Each file carries a header naming its upstream
-**repo + commit/tag + license**. All three upstreams are MIT, so vendoring with
-attribution is license-clean and keeps the public repo self-contained and
+**repo + commit/tag + license**. MATH and human-eval are MIT; MMLU-Pro is
+Apache-2.0 — all permit vendoring with attribution, which keeps the public repo
+self-contained and
 offline-reproducible.
 
 | File | Ported from | Responsibility |
 |---|---|---|
 | `official/math_grade.py` | Hendrycks `MATH` `math_equivalence.py` (MIT) | `is_equiv(a, b)` + `_strip_string` normalization (fracs, `\text`/units, `\sqrt`, `\left/\right`, spaces) |
-| `official/mmlu_extract.py` | TIGER-Lab `MMLU-Pro` `evaluate_from_local.py` (MIT) | official answer-letter extraction regex chain from CoT |
+| `official/mmlu_extract.py` | TIGER-Lab `MMLU-Pro` `evaluate_from_local.py` (Apache-2.0) | official answer-letter extraction regex chain from CoT |
 | `official/humaneval_exec.py` | OpenAI `human-eval` `execution.py` (MIT) | official `check_correctness`: assemble `prompt + completion + test + check(entry_point)`, execute isolated with timeout |
 | `official/prompts.py` | each benchmark's official prompt spec | 0-shot CoT prompt templates per source (answer-format instruction only) |
 
