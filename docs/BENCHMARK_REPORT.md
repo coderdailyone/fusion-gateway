@@ -9,7 +9,9 @@ extraction chain (TIGER-Lab, Apache-2.0); HumanEval `check_correctness` assembly
 random option on parse failure; for deterministic re-scoring we treat a parse
 failure as incorrect. Affected items: <N> (from the disagreement audit).
 
-**Reference self-test:** <PASS 1063/1063 | list exceptions>.
+**Reference self-test:** PASS 1063/1063 — every dataset's own gold answer is
+recognized by the official grader (humaneval 164/164, math 300/300, mmlu_pro
+599/599), 0 failures. Run offline at $0 as the gate before paid sampling.
 
 ## True per-model accuracy (official scoring, official prompts)
 
