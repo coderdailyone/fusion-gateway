@@ -68,11 +68,82 @@ def build(seed: int = DEFAULT_SEED) -> Manifest:
     return Manifest(version=1, sources=tuple(sources))
 
 
+# --- hard tier (M2d) ----------------------------------------------------
+#
+# (source_name, hf_dataset, split, sample_size, filter_predicate|None)
+# filter_predicate: (PARSED record from extract) -> bool, applied before
+# sampling. `load_id_map` runs extract, so predicates read the record
+# fields extract carries (livecodebench -> "release_date"; math_l5 ->
+# "level").
+#
+# Dataset ids below are the LIVE-VERIFIED replacements found while
+# implementing Tasks 1-4 (M2d) -- the original plan's ids were written
+# from memory and are wrong/dead for 3 of these 4 sources:
+#   - livecodebench: `load_dataset(..., trust_remote_code=True)` is dead
+#     (loading-script support removed from the current `datasets`
+#     release); `load_id_map` streams the hub's raw jsonl shards directly
+#     for this source instead (see evaluator.hf_fetchers).
+#   - gpqa_diamond: `Idavidrein/gpqa` is a GATED dataset -- building this
+#     source needs an HF_TOKEN in the environment. The "gpqa_diamond"
+#     config is passed automatically via `hf_fetchers.HARD_CONFIG`.
+#   - math_l5: `hendrycks/competition_math` is dead (same loading-script
+#     issue); pinned to `EleutherAI/hendrycks_math` instead, a 7-subject-
+#     config parquet mirror with identical `problem`/`solution`/`level`/
+#     `type` fields -- `load_id_map` iterates all 7 configs internally.
+#   - aime: `Maxwell-Jia/AIME_2024` (as planned, 30 rows) + AIME 2025
+#     (`yentinglin/aime_2025`, config "default", split "train"; live-
+#     verified 30 rows, fields `id`/`problem`/`answer`/`year`) merged into
+#     this one source by `build_hard` below -- kept as a single "aime"
+#     entry rather than a 5th HARD_SOURCES name, since the hard-tier name
+#     set is fixed at exactly 4 (`test_hard_sources_declared`).
+HARD_SOURCES = [
+    ("livecodebench", "livecodebench/code_generation_lite", "test", 150,
+     lambda rec: str(rec.get("release_date", "")) >= "2024-08-01"),
+    ("gpqa_diamond", "Idavidrein/gpqa", "train", 198, None),
+    ("aime", "Maxwell-Jia/AIME_2024", "train", 60, None),  # + AIME 2025, merged below
+    ("math_l5", "EleutherAI/hendrycks_math", "test", 250,
+     lambda rec: rec.get("level") == "Level 5"),
+]
+
+# AIME 2025 half of the merged "aime" source (see HARD_SOURCES note above
+# and `hf_fetchers._load_aime_merged_id_map`).
+AIME_2025_HF = "yentinglin/aime_2025"
+AIME_2025_SPLIT = "train"
+
+
+def build_hard(seed: int = DEFAULT_SEED) -> Manifest:
+    from huggingface_hub import dataset_info  # lazy: needs the eval extra
+
+    from evaluator.hf_fetchers import HARD_CONFIG
+
+    sources: list[SourceSpec] = []
+    for name, hf, split, n, pred in HARD_SOURCES:
+        revision = dataset_info(hf).sha
+        if name == "aime":
+            revision_2025 = dataset_info(AIME_2025_HF).sha
+            hf = f"{hf}+{AIME_2025_HF}"
+            revision = f"{revision}+{revision_2025}"
+            split = f"{split}+{AIME_2025_SPLIT}"
+            id_map, strata = load_id_map(name, hf, revision, split)
+        else:
+            id_map, strata = load_id_map(name, hf, revision, split, config=HARD_CONFIG.get(name))
+        ids = [tid for tid in id_map if pred is None or pred(id_map[tid])]
+        sampled = stratified_sample(ids, strata, min(n, len(ids)), seed)
+        records = [id_map[tid] for tid in sampled]
+        sources.append(SourceSpec(name, hf, revision, split, tuple(sampled),
+                                  content_sha(records)))
+    return Manifest(version=1, sources=tuple(sources))
+
+
 def main() -> None:
-    manifest = build()
-    save(manifest, "configs/suite.manifest.json")
+    import sys
+    if "--hard" in sys.argv:
+        manifest, path = build_hard(), "configs/suite.hard.manifest.json"
+    else:
+        manifest, path = build(), "configs/suite.manifest.json"
+    save(manifest, path)
     total = sum(len(s.task_ids) for s in manifest.sources)
-    print(f"wrote configs/suite.manifest.json ({total} tasks)")
+    print(f"wrote {path} ({total} tasks)")
     for s in manifest.sources:
         print(f"  {s.name}: {len(s.task_ids)} tasks @ {s.hf_revision[:12]} sha={s.content_sha[:12]}")
 
