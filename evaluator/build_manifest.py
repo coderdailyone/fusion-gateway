@@ -114,8 +114,6 @@ AIME_2025_SPLIT = "train"
 def build_hard(seed: int = DEFAULT_SEED) -> Manifest:
     from huggingface_hub import dataset_info  # lazy: needs the eval extra
 
-    from evaluator.hf_fetchers import HARD_CONFIG
-
     sources: list[SourceSpec] = []
     for name, hf, split, n, pred in HARD_SOURCES:
         revision = dataset_info(hf).sha
@@ -124,9 +122,10 @@ def build_hard(seed: int = DEFAULT_SEED) -> Manifest:
             hf = f"{hf}+{AIME_2025_HF}"
             revision = f"{revision}+{revision_2025}"
             split = f"{split}+{AIME_2025_SPLIT}"
-            id_map, strata = load_id_map(name, hf, revision, split)
-        else:
-            id_map, strata = load_id_map(name, hf, revision, split, config=HARD_CONFIG.get(name))
+        # gpqa_diamond's config is resolved automatically inside
+        # hf_fetchers.raw_rows (via HARD_CONFIG), so no per-source config
+        # plumbing is needed here anymore.
+        id_map, strata = load_id_map(name, hf, revision, split)
         ids = [tid for tid in id_map if pred is None or pred(id_map[tid])]
         sampled = stratified_sample(ids, strata, min(n, len(ids)), seed)
         records = [id_map[tid] for tid in sampled]

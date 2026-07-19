@@ -60,6 +60,26 @@ def test_livecodebench_falls_back_to_public_on_bad_private_encoding():
     assert "candidate(3) == 9" in rec["tests"][0]["test"]
 
 
+def test_livecodebench_functional_flag_without_func_name_falls_back_to_stdin():
+    # A row whose cases are flagged testtype="functional" but whose metadata
+    # carries no func_name (a data anomaly, not expected in a real LCB row --
+    # but must not be allowed to poison scoring if it ever occurs) must NOT
+    # produce a {"kind":"pyfunc","entry_point":None} test: code.py's
+    # `_run_case` treats any dict with an "entry_point" key as pyfunc no
+    # matter its value, so entry_point=None would silently build a
+    # `check(None)` call that always fails (None is not callable) instead of
+    # surfacing the anomaly. It must fall back to a stdin-shaped test.
+    raw = {"question_id": "lcb_4", "question_content": "square it",
+           "public_test_cases": '[{"input":"3","output":"9","testtype":"functional"}]',
+           "private_test_cases": "[]", "metadata": "{}",  # no func_name
+           "starter_code": "", "difficulty": "easy", "contest_date": "2024-09-01"}
+    tid, rec = extract("livecodebench", raw)
+    assert tid == "lcb_4"
+    assert len(rec["tests"]) == 1
+    assert rec["tests"][0]["kind"] == "stdin"
+    assert "entry_point" not in rec["tests"][0]
+
+
 def test_gpqa_seeded_shuffle_tracks_correct_letter():
     raw = {"Question": "Q?", "Correct Answer": "RIGHT",
            "Incorrect Answer 1": "w1", "Incorrect Answer 2": "w2",

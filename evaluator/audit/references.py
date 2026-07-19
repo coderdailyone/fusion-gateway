@@ -90,12 +90,22 @@ def build_reference_index(rows_by_source: dict[str, list[dict]]) -> dict[str, Re
 
 
 def _fetch_rows(manifest, fetch) -> dict[str, list[dict]]:
+    """Fetch each manifest source's raw rows for the side-channel index.
+
+    Default `fetch` is `evaluator.hf_fetchers.raw_rows` -- the SAME
+    dataset-loading path `load_id_map`/`build_hard` use, so this self-test
+    gate sees correct rows for the 4 hard sources too (gpqa's config,
+    math_l5's 7-config merge, livecodebench's jsonl streaming, aime's
+    "+"-merge), not just the plain default that only the 3 standard
+    sources need. `fetch(source_name, hf_dataset, revision, split) ->
+    list[dict]` is injectable for tests (no network).
+    """
     if fetch is None:
-        from datasets import load_dataset  # lazy: only the real path needs it
-        fetch = lambda ds, split, revision: list(load_dataset(ds, split=split, revision=revision))
+        from evaluator.hf_fetchers import raw_rows  # lazy: only the real path needs `datasets`
+        fetch = raw_rows
     rows_by_source: dict[str, list[dict]] = {}
     for s in manifest.sources:
-        rows_by_source[s.name] = fetch(s.hf_dataset, s.split, s.hf_revision)
+        rows_by_source[s.name] = fetch(s.name, s.hf_dataset, s.hf_revision, s.split)
     return rows_by_source
 
 

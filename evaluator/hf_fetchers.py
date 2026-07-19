@@ -37,6 +37,18 @@ def extract(source_name: str, row: dict) -> tuple[str, dict]:
         is_functional = bool(fn) or any(
             c.get("testtype") == "functional" for c in raw_cases
         )
+        if is_functional and not fn:
+            # A row whose cases are flagged testtype="functional" but whose
+            # metadata carries no func_name (a data anomaly) would otherwise
+            # make normalize_tests emit {"kind":"pyfunc","entry_point":None}.
+            # code.py's `_run_case` treats ANY dict with an "entry_point" key
+            # as pyfunc regardless of its value, so a None entry_point does
+            # not raise -- it silently builds `check(None)` and always fails
+            # (candidate is the None object, not callable), permanently and
+            # confusingly, rather than surfacing the anomaly. Fall back to
+            # stdin scoring instead, matching the private-test-case-decode
+            # fallback's discipline (degrade gracefully, don't abort/crash).
+            is_functional = False
         test_type = "functional" if is_functional else "stdin"
         cases = [{"input": c["input"], "output": c["output"]} for c in raw_cases]
         tests = normalize_tests(
@@ -148,11 +160,12 @@ def stratum(source_name: str, row: dict) -> str:
 
 # Per-source HF config name, for sources whose dataset repo requires one
 # (e.g. GPQA ships gpqa_diamond/gpqa_main/gpqa_extended/gpqa_experts as
-# separate configs of the same repo). Looked up by both `build_hard`
-# (build time) and `make_fetcher` (suite-load time) so a source's config
-# only needs to be declared once. Absent for standard-tier sources ->
-# `HARD_CONFIG.get(name)` is None -> `load_id_map`'s `config` param stays
-# at its byte-compatible default.
+# separate configs of the same repo). Looked up ONLY inside `raw_rows`'s
+# default branch, so a source's config only needs to be declared once here
+# -- `build_hard` and `make_fetcher` no longer pass a `config` kwarg through
+# `load_id_map` at all. Absent for standard-tier sources -> `HARD_CONFIG.get
+# (name)` is None -> `raw_rows`'s default branch is byte-identical to the
+# pre-hard-tier `load_dataset(hf_dataset, split=split, revision=revision)`.
 HARD_CONFIG = {"gpqa_diamond": "gpqa_diamond"}
 
 # EleutherAI/hendrycks_math (the live parquet mirror Task 5 pins in place of
@@ -164,69 +177,63 @@ _MATH_L5_CONFIGS = (
 )
 
 
-def load_id_map(source_name: str, hf_dataset: str, revision: str, split: str,
-                 config: str | None = None, trust_remote_code: bool = False):
-    """Load the full split at a pinned revision; return (id->record, id->stratum).
+def raw_rows(source_name: str, hf_dataset: str, revision: str, split: str) -> list[dict]:
+    """Return the RAW HF rows for a source at a pinned revision/split -- the
+    ONE dataset-loading path shared by `load_id_map` (suite build/load time)
+    and `evaluator.audit.references._fetch_rows` (the $0 reference
+    side-channel, gate before paid sampling). Every source-specific loading
+    quirk lives here so both callers agree on exactly what a "row" is.
 
-    Standard-tier sources (mmlu_pro/math/humaneval) call this exactly as
-    before: `config`/`trust_remote_code` default to None/False, and with
-    those defaults the call below is byte-identical to the pre-hard-tier
-    version (`load_dataset(hf_dataset, split=split, revision=revision)`) --
-    the standard tier is unaffected by everything added here.
+    Standard-tier sources (mmlu_pro/math/humaneval) fall through to the
+    default branch with `HARD_CONFIG.get(name)` -> None, so the call there is
+    byte-identical to the pre-hard-tier `load_dataset(hf_dataset, split=split,
+    revision=revision)` -- the standard tier is unaffected by everything
+    added here.
 
     Hard-tier special cases (live-verified while implementing Tasks 1-5 of
     the M2d hard tier; `datasets.load_dataset(..., trust_remote_code=True)`
     is dead for loading-script datasets on the current `datasets` release):
+    - "gpqa_diamond": needs the "gpqa_diamond" config (`HARD_CONFIG`), passed
+      to `load_dataset` in the default branch below.
     - "livecodebench": streams the hub's raw jsonl shards directly instead
-      of `load_dataset` (see `_load_livecodebench_id_map`).
+      of `load_dataset` (see `_livecodebench_raw_rows`).
     - "math_l5": `EleutherAI/hendrycks_math` has no single flat split --
       iterates its 7 subject configs and merges them (see
-      `_load_math_l5_id_map`).
+      `_math_l5_raw_rows`).
     - "aime": `hf_dataset`/`revision`/`split` may each be a "+"-joined pair
       (built by `build_hard`) to fold AIME 2025 into the same "aime" source
-      as AIME 2024 (see `_load_aime_merged_id_map`) -- kept as one source,
-      not a 5th HARD_SOURCES entry, since the hard-tier name set is fixed
-      at 4 names.
+      as AIME 2024 (see `_aime_merged_raw_rows`) -- kept as one source, not
+      a 5th HARD_SOURCES entry, since the hard-tier name set is fixed at 4
+      names.
     """
     if source_name == "livecodebench":
-        return _load_livecodebench_id_map(hf_dataset, revision, split)
+        return _livecodebench_raw_rows(hf_dataset, revision, split)
     if source_name == "math_l5":
-        return _load_math_l5_id_map(hf_dataset, revision, split)
+        return _math_l5_raw_rows(hf_dataset, revision, split)
     if source_name == "aime" and "+" in hf_dataset:
-        return _load_aime_merged_id_map(hf_dataset, revision, split)
+        return _aime_merged_raw_rows(hf_dataset, revision, split)
 
     from datasets import load_dataset  # lazy: needs the eval extra
+    config = HARD_CONFIG.get(source_name)
     kwargs = {"split": split, "revision": revision}
-    if trust_remote_code:
-        kwargs["trust_remote_code"] = True
     ds = load_dataset(hf_dataset, config, **kwargs) if config is not None else load_dataset(hf_dataset, **kwargs)
-    id_map: dict[str, dict] = {}
-    strata: dict[str, str] = {}
-    for row in ds:
-        tid, rec = extract(source_name, row)
-        id_map[tid] = rec
-        strata[tid] = stratum(source_name, row)
-    return id_map, strata
+    return list(ds)
 
 
-def _load_math_l5_id_map(hf_dataset: str, revision: str, split: str):
+def _math_l5_raw_rows(hf_dataset: str, revision: str, split: str) -> list[dict]:
     """`EleutherAI/hendrycks_math` ships one parquet config per subject
     (no single flat split) -- iterate all 7 known configs and merge. The
     Level-5 filter itself is applied later, by `build_hard`, over the
-    merged (unfiltered) id_map this returns."""
+    merged (unfiltered) rows this returns."""
     from datasets import load_dataset  # lazy: needs the eval extra
-    id_map: dict[str, dict] = {}
-    strata: dict[str, str] = {}
+    rows: list[dict] = []
     for cfg in _MATH_L5_CONFIGS:
         ds = load_dataset(hf_dataset, cfg, split=split, revision=revision)
-        for row in ds:
-            tid, rec = extract("math_l5", row)
-            id_map[tid] = rec
-            strata[tid] = stratum("math_l5", row)
-    return id_map, strata
+        rows.extend(list(ds))
+    return rows
 
 
-def _load_aime_merged_id_map(hf_dataset: str, revision: str, split: str):
+def _aime_merged_raw_rows(hf_dataset: str, revision: str, split: str) -> list[dict]:
     """"+"-joined composite for the "aime" source: `hf_dataset`, `revision`
     and `split` are each two "+"-joined halves, in (2024, 2025) order --
     built by `build_hard`. Folds AIME 2025 into the same source as AIME
@@ -242,20 +249,17 @@ def _load_aime_merged_id_map(hf_dataset: str, revision: str, split: str):
     hf_2024, hf_2025 = hf_dataset.split("+")
     rev_2024, rev_2025 = revision.split("+")
     split_2024, split_2025 = split.split("+")
-    id_map, strata = load_id_map("aime", hf_2024, rev_2024, split_2024)
+    rows = list(raw_rows("aime", hf_2024, rev_2024, split_2024))
 
     from datasets import load_dataset  # lazy: needs the eval extra
     ds_2025 = load_dataset(hf_2025, "default", split=split_2025, revision=rev_2025)
     for row in ds_2025:
-        norm = {"ID": f"2025-{row.get('id')}", "Problem": row["problem"],
-                "Answer": row["answer"], "Year": str(row.get("year") or "2025")}
-        tid, rec = extract("aime", norm)
-        id_map[tid] = rec
-        strata[tid] = stratum("aime", norm)
-    return id_map, strata
+        rows.append({"ID": f"2025-{row.get('id')}", "Problem": row["problem"],
+                      "Answer": row["answer"], "Year": str(row.get("year") or "2025")})
+    return rows
 
 
-def _load_livecodebench_id_map(hf_dataset: str, revision: str, split: str):
+def _livecodebench_raw_rows(hf_dataset: str, revision: str, split: str) -> list[dict]:
     """`load_dataset(..., trust_remote_code=True)` fails on the current
     `datasets` release (loading-script support removed). Streams the raw
     dataset instead: `HfApi.list_repo_files` (live-verified in Task 1/5)
@@ -284,8 +288,7 @@ def _load_livecodebench_id_map(hf_dataset: str, revision: str, split: str):
     if not shards:
         raise FileNotFoundError(f"no {split}*.jsonl shard in {hf_dataset}@{revision}")
 
-    id_map: dict[str, dict] = {}
-    strata: dict[str, str] = {}
+    rows: list[dict] = []
     for shard in shards:
         path = hf_hub_download(repo_id=hf_dataset, filename=shard,
                                 repo_type="dataset", revision=revision)
@@ -294,10 +297,24 @@ def _load_livecodebench_id_map(hf_dataset: str, revision: str, split: str):
                 line = line.strip()
                 if not line:
                     continue
-                row = json.loads(line)
-                tid, rec = extract("livecodebench", row)
-                id_map[tid] = rec
-                strata[tid] = stratum("livecodebench", row)
+                rows.append(json.loads(line))
+    return rows
+
+
+def load_id_map(source_name: str, hf_dataset: str, revision: str, split: str):
+    """Load the full split at a pinned revision; return (id->record, id->stratum).
+
+    Thin wrapper around `raw_rows` + `extract`/`stratum` per row -- the
+    dataset-loading quirks (gpqa config, LCB jsonl streaming, math_l5
+    multi-config merge, aime "+"-merge) all live in `raw_rows` so this stays
+    the single place `extract`/`stratum` are applied, for every source.
+    """
+    id_map: dict[str, dict] = {}
+    strata: dict[str, str] = {}
+    for row in raw_rows(source_name, hf_dataset, revision, split):
+        tid, rec = extract(source_name, row)
+        id_map[tid] = rec
+        strata[tid] = stratum(source_name, row)
     return id_map, strata
 
 
@@ -305,8 +322,6 @@ def make_fetcher(source_name: str):
     """Return a `Fetcher` (SourceSpec -> list[dict]) for load_suite: it loads the
     pinned dataset and returns records for spec.task_ids, in that order."""
     def fetch(spec: SourceSpec) -> list[dict]:
-        config = HARD_CONFIG.get(source_name)
-        id_map, _ = load_id_map(source_name, spec.hf_dataset, spec.hf_revision, spec.split,
-                                 config=config)
+        id_map, _ = load_id_map(source_name, spec.hf_dataset, spec.hf_revision, spec.split)
         return [id_map[tid] for tid in spec.task_ids]
     return fetch
