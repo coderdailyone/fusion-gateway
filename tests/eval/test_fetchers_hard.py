@@ -81,3 +81,68 @@ def test_gpqa_seeded_shuffle_tracks_correct_letter():
 def test_gpqa_stratum_is_subdomain():
     raw = {"Subdomain": "Organic Chemistry"}
     assert stratum("gpqa_diamond", raw) == "Organic Chemistry"
+
+
+def test_aime_extract_parse():
+    raw = {"ID": "2024-I-1", "Problem": "Find n.", "Answer": "204", "Year": "2024"}
+    tid, rec = extract("aime", raw)
+    t = parse_task("aime", rec)
+    assert t.source == "aime" and t.answer == "204" and "Find n." in t.problem
+
+
+def test_aime_year_derived_from_id_when_no_year_field():
+    # Real Maxwell-Jia/AIME_2024 rows (live-verified in Step 0) have NO "Year"
+    # field at all -- year lives only in the "ID" prefix (e.g. "2024-II-4").
+    # Answer is also a real int in that dataset, not a string.
+    raw = {"ID": "2024-II-4", "Problem": "Evaluate x.", "Answer": 33}
+    tid, rec = extract("aime", raw)
+    assert tid == "2024-II-4"
+    assert rec["answer"] == "33"
+    assert rec["year"] == "2024"
+    assert stratum("aime", raw) == "2024"
+
+
+def test_aime_stratum_prefers_explicit_year_field():
+    raw = {"ID": "2024-I-1", "Answer": "1", "Problem": "p", "Year": "2025"}
+    assert stratum("aime", raw) == "2025"
+
+
+def test_math_l5_extract_parse():
+    raw = {"problem": "Compute.", "solution": "... \\boxed{3}", "level": "Level 5",
+           "type": "Algebra"}
+    tid, rec = extract("math_l5", raw)
+    t = parse_task("math_l5", rec)
+    assert t.source == "math_l5" and "Compute." in t.problem
+
+
+def test_math_l5_answer_is_boxed_content_of_solution():
+    raw = {"problem": "Compute.", "solution": "blah \\boxed{42} done", "level": "Level 5",
+           "type": "Algebra"}
+    tid, rec = extract("math_l5", raw)
+    assert rec["answer"] == "42"
+    t = parse_task("math_l5", rec)
+    assert t.answer == "42"
+
+
+def test_math_l5_carries_level_for_build_time_filter():
+    # Task 5's manifest builder filters level == "Level 5" on the *parsed*
+    # record, so "level" must survive extract() and land in Task.meta
+    # (parse_task only pops "problem"/"answer").
+    raw = {"problem": "Compute.", "solution": "\\boxed{1}", "level": "Level 5",
+           "type": "Geometry"}
+    tid, rec = extract("math_l5", raw)
+    assert rec["level"] == "Level 5"
+    t = parse_task("math_l5", rec)
+    assert t.meta["level"] == "Level 5"
+
+
+def test_math_l5_stratum_is_subject_type():
+    raw = {"type": "Number Theory"}
+    assert stratum("math_l5", raw) == "Number Theory"
+
+
+def test_math_l5_falls_back_to_answer_field_when_no_boxed_solution():
+    raw = {"problem": "Compute.", "solution": "no boxed content here",
+           "answer": "7", "level": "Level 5", "type": "Algebra"}
+    tid, rec = extract("math_l5", raw)
+    assert rec["answer"] == "7"

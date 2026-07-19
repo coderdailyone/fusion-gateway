@@ -70,7 +70,31 @@ def extract(source_name: str, row: dict) -> tuple[str, dict]:
         return tid, {"id": tid, "question": row["Question"],
                      "options": shuffled, "answer": answer_letter,
                      "subject": str(row.get("Subdomain", "?"))}
+    if source_name == "aime":
+        tid = str(row.get("ID") or row.get("id"))
+        return tid, {"id": tid, "problem": row["Problem"],
+                     "answer": str(row["Answer"]).strip(), "year": _aime_year(row)}
+    if source_name == "math_l5":
+        tid = str(row.get("unique_id") or
+                  hashlib.sha256(row["problem"].encode()).hexdigest()[:16])
+        # gold answer = boxed content of the solution (reuse the math extractor)
+        from evaluator.scorers.math import _find_last_boxed
+        gold = _find_last_boxed(row.get("solution", "")) or row.get("answer", "")
+        return tid, {"id": tid, "problem": row["problem"],
+                     "answer": (gold or "").strip(), "subject": str(row.get("type", "?")),
+                     "level": str(row.get("level", ""))}  # carried for the build-time L5 filter
     raise ValueError(f"unknown source: {source_name!r}")
+
+
+def _aime_year(row: dict) -> str:
+    """AIME year: prefer an explicit "Year" field; real Maxwell-Jia/AIME_2024
+    rows (live-verified) have NONE -- year lives only in the "ID" prefix
+    (e.g. "2024-II-4" -> "2024")."""
+    if row.get("Year"):
+        return str(row["Year"])
+    tid = str(row.get("ID") or row.get("id") or "")
+    prefix = tid.split("-", 1)[0]
+    return prefix if prefix.isdigit() else "?"
 
 
 def _decode_private_test_cases(priv) -> list[dict]:
@@ -115,6 +139,10 @@ def stratum(source_name: str, row: dict) -> str:
         return str(row.get("difficulty", "?"))
     if source_name == "gpqa_diamond":
         return str(row.get("Subdomain", "?"))
+    if source_name == "aime":
+        return _aime_year(row)
+    if source_name == "math_l5":
+        return str(row.get("type", "?"))
     return "all"  # humaneval: single stratum
 
 

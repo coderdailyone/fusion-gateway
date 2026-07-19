@@ -67,6 +67,12 @@ def parse_task(source: str, record: dict) -> Task:
         return Task(id=task_id, source=source, problem="\n".join(lines),
                     answer=answer, tests=(), meta=rec)
 
+    if source in ("aime", "math_l5"):
+        problem = rec.pop("problem")
+        answer = rec.pop("answer")
+        return Task(id=task_id, source=source, problem=problem, answer=answer,
+                    tests=(), meta=rec)
+
     raise ValueError(f"unknown source: {source!r}")
 
 
