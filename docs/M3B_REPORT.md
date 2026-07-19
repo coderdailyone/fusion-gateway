@@ -1,8 +1,11 @@
 # M3b — Cost-Aware Router Report
 
-> **⚠️ Retraction note:** Numbers regenerated under M2c official scoring (see
-> `BENCHMARK_REPORT.md`); the earlier cost-savings figures were inflated by a
-> math-scorer bug and are retracted pending recompute.
+> **⚠️ Superseded by M2c.** This 2-model (DeepSeek+Sonnet) experiment's numbers
+> were computed on a buggy math scorer and are **retracted**. The authoritative,
+> official-scored, 6-model result is in **`BENCHMARK_REPORT.md`** (M2c): on
+> correct scoring the router @λ=10 reaches 0.907 @ $0.00106 and Pareto-dominates
+> gpt-5.6-sol / GPT-5.5 / Sonnet / GLM; Opus (0.913) is the accuracy ceiling.
+> The inline ⚠️ markers below flag the specific bug-inflated claims.
 
 **⚠️ RETRACTED (bug-inflated; pending M2c official recompute): Headline: the
 learned dynamic policy Pareto-dominates the best single model.**
