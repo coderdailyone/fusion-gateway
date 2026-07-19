@@ -2,7 +2,7 @@
 in_usd_per_mtok = 0.14
 out_usd_per_mtok = 0.28
 
-["kimi-k2"]
+["kimi-k3"]
 in_usd_per_mtok = 0.60    # VERIFY vs Moonshot published pricing at run time
 out_usd_per_mtok = 2.50   # VERIFY
 

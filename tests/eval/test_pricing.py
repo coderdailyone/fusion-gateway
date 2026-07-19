@@ -17,4 +17,4 @@ def test_unknown_model_raises(tmp_path):
 
 def test_default_config_has_the_three_models():
     prices = load_prices()
-    assert {"deepseek-chat", "kimi-k2", "glm-5.2"} <= set(prices)
+    assert {"deepseek-chat", "kimi-k3", "glm-5.2"} <= set(prices)

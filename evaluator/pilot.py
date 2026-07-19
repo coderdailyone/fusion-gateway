@@ -170,7 +170,7 @@ def analyze(rows: list[ResultRow]) -> dict:
 
 
 # Pilot model pool (must exist in evaluator.validate.MODELS and configs/pricing.toml).
-PILOT_MODELS = ["deepseek-chat", "kimi-k2", "glm-5.2"]
+PILOT_MODELS = ["deepseek-chat", "kimi-k3", "glm-5.2"]
 
 
 def run_pilot(n: int = 150, seed: int = 1234,

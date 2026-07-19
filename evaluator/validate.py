@@ -120,8 +120,10 @@ def validate(gateway_model_name: str, completion_fn, n_per_source: int = 5,
 MODELS = {
     "deepseek-chat": lambda: make_completion_fn(
         "deepseek/deepseek-chat", api_key=os.environ["DEEPSEEK_API_KEY"]),
-    "kimi-k2": lambda: make_completion_fn(  # reasoning model -> generous cap
-        "openai/kimi-k2-0711-preview",
+    "kimi-k3": lambda: make_completion_fn(  # reasoning model -> generous cap
+        # model id on the endpoint is literally "k3" (k2's billing-cycle quota
+        # was exhausted; k3 is the current model and has quota).
+        "openai/k3",
         max_tokens=8192,
         api_base="https://api.kimi.com/coding/v1",
         api_key=os.environ["MOONSHOT_API_KEY"]),

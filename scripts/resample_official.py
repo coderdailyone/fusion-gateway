@@ -14,7 +14,7 @@ from typing import Callable
 
 FEASIBLE_MODELS = [
     "deepseek-chat", "claude-sonnet-5", "claude-opus-4-8",
-    "gpt-5.6-sol", "gpt-5.5", "glm-5.2", "kimi-k2",
+    "gpt-5.6-sol", "gpt-5.5", "glm-5.2", "kimi-k3",
 ]
 BUDGET_CEILING_USD = 35.0
 WARN_FRACTION = 0.80
