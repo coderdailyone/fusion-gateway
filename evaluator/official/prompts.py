@@ -16,9 +16,12 @@ _MATH = ("Solve the following math problem. Reason step by step, and put your "
          "final answer within \\boxed{{}}.\n\n{problem}")
 _HUMANEVAL = ("Complete the following Python function. Respond with a single "
               "Python code block containing the full function definition.\n\n{problem}")
+_LIVECODEBENCH = ("Solve the following programming problem. Respond with a single "
+                  "Python code block containing the complete solution.\n\n{problem}")
 _DEFAULT = "Solve the following problem. Put your final answer clearly at the end.\n\n{problem}"
 
-_TEMPLATES = {"mmlu_pro": _MMLU, "math": _MATH, "humaneval": _HUMANEVAL}
+_TEMPLATES = {"mmlu_pro": _MMLU, "math": _MATH, "humaneval": _HUMANEVAL,
+              "livecodebench": _LIVECODEBENCH}
 
 
 def build(task: Task) -> str:

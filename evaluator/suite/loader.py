@@ -48,7 +48,9 @@ def parse_task(source: str, record: dict) -> Task:
                     meta=rec)
 
     if source == "livecodebench":
-        problem = rec.pop("question", None)
+        problem = rec.pop("prompt", None)
+        if problem is None:
+            problem = rec.pop("question", None)
         if problem is None:
             problem = rec.pop("problem")
         tests = tuple(rec.pop("tests"))

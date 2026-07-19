@@ -23,7 +23,63 @@ def extract(source_name: str, row: dict) -> tuple[str, dict]:
         tid = str(row["task_id"])
         return tid, {"id": tid, "prompt": row["prompt"],
                      "test": row["test"], "entry_point": row["entry_point"]}
+    if source_name == "livecodebench":
+        import json
+        from evaluator.official.livecodebench_exec import normalize_tests
+
+        tid = str(row["question_id"])
+        meta = json.loads(row.get("metadata") or "{}")
+        fn = meta.get("func_name")
+        raw_cases = json.loads(row.get("public_test_cases") or "[]")
+        raw_cases += _decode_private_test_cases(row.get("private_test_cases"))
+        is_functional = bool(fn) or any(
+            c.get("testtype") == "functional" for c in raw_cases
+        )
+        test_type = "functional" if is_functional else "stdin"
+        cases = [{"input": c["input"], "output": c["output"]} for c in raw_cases]
+        tests = normalize_tests(
+            {"test_type": test_type, "fn_name": fn, "cases": cases}
+        )
+        return tid, {
+            "id": tid,
+            "prompt": row["question_content"],
+            "tests": [dict(t) for t in tests],
+            "difficulty": row.get("difficulty", "?"),
+            "release_date": str(row.get("contest_date", "")),
+        }
     raise ValueError(f"unknown source: {source_name!r}")
+
+
+def _decode_private_test_cases(priv) -> list[dict]:
+    """Decode LiveCodeBench's private test cases.
+
+    Unlike `public_test_cases` (a plain JSON string), upstream encodes
+    `private_test_cases` as base64(zlib(pickle.dumps(json_string))) --
+    verified directly against the pinned, trusted
+    `livecodebench/code_generation_lite` HF dataset in Task 1. `pickle.loads`
+    below runs only here, at suite-build time on this isolated eval box, over
+    that pinned trusted dataset -- never on model output or any other
+    untrusted input -- so it does not carry pickle's usual untrusted-data risk.
+
+    If a row's private cases fail to decode (encoding drift, truncation,
+    etc.) we fall back to public-only tests for that row rather than
+    aborting the whole build.
+    """
+    if not priv or priv == "[]":
+        return []
+    try:
+        import base64
+        import pickle
+        import zlib
+
+        decoded = pickle.loads(zlib.decompress(base64.b64decode(priv)))
+        if isinstance(decoded, (bytes, str)):
+            import json as _json
+
+            decoded = _json.loads(decoded)
+        return list(decoded)
+    except Exception:
+        return []
 
 
 def stratum(source_name: str, row: dict) -> str:
@@ -32,6 +88,8 @@ def stratum(source_name: str, row: dict) -> str:
         return str(row.get("category", "?"))
     if source_name == "math":
         return str(row.get("level", "?"))
+    if source_name == "livecodebench":
+        return str(row.get("difficulty", "?"))
     return "all"  # humaneval: single stratum
 
 

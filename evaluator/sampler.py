@@ -26,7 +26,8 @@ from evaluator.scorers import math as math_scorer
 from evaluator.store import append_frozen, read_frozen
 from evaluator.suite.types import Task
 
-SCORERS = {"mmlu_pro": mcq.score, "math": math_scorer.score, "humaneval": code.score}
+SCORERS = {"mmlu_pro": mcq.score, "math": math_scorer.score, "humaneval": code.score,
+           "livecodebench": code.score}
 
 
 def sample(
