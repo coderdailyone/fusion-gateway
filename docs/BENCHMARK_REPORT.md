@@ -36,9 +36,11 @@ above (verified: smoke re-score every model math 4/4; 1063 self-test still 100%)
 ## True per-model accuracy (official scoring, common 1057-task set)
 
 The comparison is restricted to the **1057/1063** tasks every model answered
-successfully (fair, identical-task comparison). **Kimi-k2 is excluded**: its API
-quota was exhausted mid-run (159/1063 ok, 904 usage-limit errors) — a coverage
-failure, not a quality result.
+successfully (fair, identical-task comparison). **Kimi is excluded from this
+table**: the Moonshot account quota (shared across k2/k3) was exhausted mid-run,
+so neither variant could cover the full suite (k2 159/1063, k3 492/1063 ok) — a
+coverage failure, not a quality result. A preliminary k3 comparison on its
+covered subset is in the addendum below.
 
 | rank | model | overall | mmlu_pro | math | humaneval | mean cost/task |
 |---|---|---|---|---|---|---|
@@ -104,3 +106,30 @@ The humaneval reference self-test synthesizes `prompt + canonical_solution`,
 whereas real scoring grades the extracted completion alone — so the self-test
 cannot catch a completion that silently relies on prompt context (e.g. an import)
 it never restates. Watch humaneval false-negatives in the disagreement audit.
+
+## Addendum: Kimi k3 (preliminary, partial coverage — NOT in the main table)
+
+Kimi k3 was sampled to gauge its quality, but the Moonshot account quota died at
+**492/1063** tasks. It therefore cannot join the authoritative 1057-task table.
+The comparison below is on the **489 tasks k3 did complete** (that all seven
+models answered) — a smaller, self-selected subset whose **absolute accuracies
+run higher than the 1057-task table** (the subset is easier: e.g. DeepSeek's MMLU
+is 0.690 here vs 0.813 on the full suite). **These numbers are comparable only
+within this subset, not against the main table.**
+
+| model | overall (489) | mmlu_pro | math | humaneval |
+|---|---|---|---|---|
+| gpt-5.5 | 0.955 | 0.828 | 0.959 | 0.970 |
+| claude-opus-4-8 | 0.953 | 0.862 | 0.946 | 0.982 |
+| **kimi-k3** | **0.953** | **0.897** | 0.949 | 0.970 |
+| claude-sonnet-5 | 0.935 | 0.828 | 0.919 | 0.982 |
+| gpt-5.6-sol | 0.922 | 0.828 | 0.949 | 0.890 |
+| deepseek-chat | 0.904 | 0.690 | 0.929 | 0.896 |
+| glm-5.2 | 0.902 | 0.793 | 0.892 | 0.939 |
+
+**Read:** on its covered subset k3 is **top-tier — statistically tied with Opus
+and just behind GPT-5.5** — and has the **best MMLU-Pro of the group (0.897)**.
+A full-suite k3 number requires a quota refresh or account top-up, after which
+`kimi-k3` (registered in `evaluator/validate.py`) can be re-sampled into the
+main table.
+
