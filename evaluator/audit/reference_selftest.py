@@ -25,13 +25,13 @@ class SelfTestFailure:
 
 
 def _synth_output(task: Task, ref: Reference) -> str:
-    if task.source == "mmlu_pro":
+    if task.source in ("mmlu_pro", "gpqa_diamond"):
         return f"Reasoning about the options. The answer is ({ref.gold})."
-    if task.source == "math":
+    if task.source in ("math", "aime", "math_l5"):
         if ref.solution:
             return ref.solution
         return f"Therefore the answer is \\boxed{{{ref.gold}}}."
-    if task.source == "humaneval":
+    if task.source in ("humaneval", "livecodebench"):
         # KNOWN LIMITATION: we synthesize prompt + canonical_solution here,
         # but the real scoring path (evaluator/scorers/code.py) grades the
         # extracted completion ALONE — it never prepends the prompt. A real
@@ -42,12 +42,24 @@ def _synth_output(task: Task, ref: Reference) -> str:
         # program; it is structurally blind to prompt-context leakage into
         # "correctness". See docs/BENCHMARK_REPORT.md's disagreement-audit
         # note for humaneval false-negatives.
+        #
+        # For livecodebench specifically: `code_generation_lite` ships no
+        # gold/canonical completion at all (`ref.canonical_solution` is
+        # always None for it — see `build_reference_index`), so this branch
+        # degrades to a prompt-only body for LCB and will legitimately FAIL
+        # to produce a passing program. That is expected and documented,
+        # not a scorer bug: the LCB reference self-test is a best-effort
+        # smoke (there is no independently-sourced gold solution to prove
+        # the scorer recognizes), not a "gold recognized" guarantee like
+        # the other sources get.
         body = (ref.prompt or "") + (ref.canonical_solution or "")
         return f"```python\n{body}\n```"
     return ref.gold or ""
 
 
-_SCORERS = {"mmlu_pro": mcq.score, "math": math_scorer.score, "humaneval": code.score}
+_SCORERS = {"mmlu_pro": mcq.score, "math": math_scorer.score, "humaneval": code.score,
+            "gpqa_diamond": mcq.score, "aime": math_scorer.score,
+            "math_l5": math_scorer.score, "livecodebench": code.score}
 
 
 def selftest_one(task: Task, ref: Reference) -> SelfTestFailure | None:
