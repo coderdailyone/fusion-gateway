@@ -57,6 +57,16 @@ def parse_task(source: str, record: dict) -> Task:
         return Task(id=task_id, source=source, problem=problem, answer=None,
                     tests=tests, meta=rec)
 
+    if source == "gpqa_diamond":
+        question = rec.pop("question")
+        options = rec.pop("options")
+        answer = rec.pop("answer")
+        lines = [question, ""]
+        for letter, opt in zip(_letters(), options):
+            lines.append(f"{letter}. {opt}")
+        return Task(id=task_id, source=source, problem="\n".join(lines),
+                    answer=answer, tests=(), meta=rec)
+
     raise ValueError(f"unknown source: {source!r}")
 
 

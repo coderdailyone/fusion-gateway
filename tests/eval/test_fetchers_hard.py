@@ -58,3 +58,26 @@ def test_livecodebench_falls_back_to_public_on_bad_private_encoding():
     tid, rec = extract("livecodebench", raw)
     assert tid == "lcb_3"
     assert "candidate(3) == 9" in rec["tests"][0]["test"]
+
+
+def test_gpqa_seeded_shuffle_tracks_correct_letter():
+    raw = {"Question": "Q?", "Correct Answer": "RIGHT",
+           "Incorrect Answer 1": "w1", "Incorrect Answer 2": "w2",
+           "Incorrect Answer 3": "w3", "Subdomain": "Physics",
+           "Record ID": "gpqa_7"}
+    tid, rec = extract("gpqa_diamond", raw)
+    # the option at rec["answer"] letter must be the correct text
+    letters = "ABCD"
+    idx = letters.index(rec["answer"])
+    assert rec["options"][idx] == "RIGHT"
+    # deterministic: same row -> same letter
+    _, rec2 = extract("gpqa_diamond", raw)
+    assert rec2["answer"] == rec["answer"]
+    t = parse_task("gpqa_diamond", rec)
+    assert t.source == "gpqa_diamond" and t.answer == rec["answer"]
+    assert "RIGHT" in t.problem
+
+
+def test_gpqa_stratum_is_subdomain():
+    raw = {"Subdomain": "Organic Chemistry"}
+    assert stratum("gpqa_diamond", raw) == "Organic Chemistry"

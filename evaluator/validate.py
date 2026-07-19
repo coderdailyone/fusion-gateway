@@ -23,7 +23,7 @@ from evaluator.scorers import mcq, code
 from evaluator.scorers import math as math_scorer
 
 SCORERS = {"mmlu_pro": mcq.score, "math": math_scorer.score, "humaneval": code.score,
-           "livecodebench": code.score}
+           "livecodebench": code.score, "gpqa_diamond": mcq.score}
 
 
 def load_secrets(path: str = "runs/secrets/.env") -> None:

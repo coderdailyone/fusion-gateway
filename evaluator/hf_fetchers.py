@@ -7,6 +7,8 @@ without the `eval` extra installed (only the actual fetch needs it).
 """
 from __future__ import annotations
 
+import hashlib
+
 from evaluator.suite.manifest import SourceSpec
 
 
@@ -47,6 +49,27 @@ def extract(source_name: str, row: dict) -> tuple[str, dict]:
             "difficulty": row.get("difficulty", "?"),
             "release_date": str(row.get("contest_date", "")),
         }
+    if source_name == "gpqa_diamond":
+        import random as _random
+
+        tid = str(row.get("Record ID") or row.get("id") or
+                  hashlib.sha256(row["Question"].encode()).hexdigest()[:16])
+        correct = row["Correct Answer"].strip()
+        options = [correct,
+                   row["Incorrect Answer 1"].strip(),
+                   row["Incorrect Answer 2"].strip(),
+                   row["Incorrect Answer 3"].strip()]
+        # Seed derived from the STABLE question id (not global `random`) so
+        # the manifest's content_sha pins the exact letter<->option mapping
+        # and re-running extract on the same row is byte-identical.
+        seed = int(hashlib.sha256(tid.encode()).hexdigest()[:8], 16)
+        order = list(range(4))
+        _random.Random(seed).shuffle(order)
+        shuffled = [options[i] for i in order]
+        answer_letter = "ABCD"[shuffled.index(correct)]
+        return tid, {"id": tid, "question": row["Question"],
+                     "options": shuffled, "answer": answer_letter,
+                     "subject": str(row.get("Subdomain", "?"))}
     raise ValueError(f"unknown source: {source_name!r}")
 
 
@@ -90,6 +113,8 @@ def stratum(source_name: str, row: dict) -> str:
         return str(row.get("level", "?"))
     if source_name == "livecodebench":
         return str(row.get("difficulty", "?"))
+    if source_name == "gpqa_diamond":
+        return str(row.get("Subdomain", "?"))
     return "all"  # humaneval: single stratum
 
 

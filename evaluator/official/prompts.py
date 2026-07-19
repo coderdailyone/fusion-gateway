@@ -21,7 +21,7 @@ _LIVECODEBENCH = ("Solve the following programming problem. Respond with a singl
 _DEFAULT = "Solve the following problem. Put your final answer clearly at the end.\n\n{problem}"
 
 _TEMPLATES = {"mmlu_pro": _MMLU, "math": _MATH, "humaneval": _HUMANEVAL,
-              "livecodebench": _LIVECODEBENCH}
+              "livecodebench": _LIVECODEBENCH, "gpqa_diamond": _MMLU}
 
 
 def build(task: Task) -> str:
