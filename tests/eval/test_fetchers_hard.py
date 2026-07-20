@@ -22,7 +22,7 @@ def test_livecodebench_extract_and_parse():
     t = parse_task("livecodebench", rec)
     assert t.source == "livecodebench"
     assert t.tests and t.tests[0]["kind"] == "pyfunc"
-    assert t.tests[0]["entry_point"] == "sq"
+    assert t.tests[0]["entry_point"] == "(Solution().sq if 'Solution' in dir() else sq)"
 
 
 def test_livecodebench_stratum_is_difficulty():

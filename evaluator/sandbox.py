@@ -45,9 +45,9 @@ def _make_preexec_fn(mem_mb: int, cpu_s: int):
 def run_code(
     code: str,
     stdin: str = "",
-    timeout_s: float = 5.0,
-    mem_mb: int = 256,
-    cpu_s: int = 5,
+    timeout_s: float = 8.0,
+    mem_mb: int = 512,
+    cpu_s: int = 8,
 ) -> SandboxResult:
     """Run `code` as a standalone Python script under resource limits.
 

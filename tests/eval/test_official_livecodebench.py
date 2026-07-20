@@ -1,4 +1,7 @@
-from evaluator.official.livecodebench_exec import normalize_tests, build_functional_check
+from evaluator.official.livecodebench_exec import (
+    normalize_tests, build_functional_check, functional_entry_point)
+from evaluator.scorers.code import score
+from evaluator.suite.types import Task
 
 
 def test_stdin_case_shape():
@@ -20,5 +23,25 @@ def test_functional_case_shape():
            "cases": [{"input": "3", "output": "9"}]}
     out = normalize_tests(row)
     assert len(out) == 1 and out[0]["kind"] == "pyfunc"
-    assert out[0]["entry_point"] == "sq"
+    # entry_point resolves a class-method callable (LeetCode style), not a bare name
+    assert out[0]["entry_point"] == "(Solution().sq if 'Solution' in dir() else sq)"
     assert "candidate(3) == 9" in out[0]["test"]
+
+
+def test_leetcode_class_solution_completion_passes():
+    # regression from the paid hard-tier smoke: LCB functional problems are
+    # LeetCode `class Solution` methods; a correct completion must PASS, not
+    # NameError on a bare entry-point.
+    tests = normalize_tests({"test_type": "functional", "fn_name": "sq",
+                             "cases": [{"input": "3", "output": "9"},
+                                       {"input": "4", "output": "16"}]})
+    task = Task(id="q", source="livecodebench", problem="", answer=None,
+                tests=tests, meta={})
+    completion = "```python\nclass Solution:\n    def sq(self, x):\n        return x * x\n```"
+    assert score(task, completion).correct
+
+    top_level = "```python\ndef sq(x):\n    return x * x\n```"  # fallback path
+    assert score(task, top_level).correct
+
+    wrong = "```python\nclass Solution:\n    def sq(self, x):\n        return x + 1\n```"
+    assert not score(task, wrong).correct

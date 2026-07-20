@@ -84,12 +84,23 @@ def build_functional_check(fn_name: str, cases: list[tuple[str, str]]) -> str:
     return "\n".join(lines)
 
 
+def functional_entry_point(fn_name: str) -> str:
+    """The callable `check(candidate)` receives. LiveCodeBench functional
+    problems are LeetCode-style: the completion defines `class Solution` and
+    `fn_name` is a METHOD, so it must be called on an instance
+    (`Solution().fn_name`), not as a bare top-level name (which was HumanEval's
+    contract and NameErrors here). Falls back to a top-level function if no
+    `Solution` class is defined, so both shapes work."""
+    return f"(Solution().{fn_name} if 'Solution' in dir() else {fn_name})"
+
+
 def normalize_tests(row: dict) -> tuple[dict, ...]:
     cases = row.get("cases", [])
     if row.get("test_type") == "functional":
         fn = row["fn_name"]
         check = build_functional_check(fn, [(c["input"], c["output"]) for c in cases])
-        return ({"kind": "pyfunc", "test": check, "entry_point": fn},)
+        return ({"kind": "pyfunc", "test": check,
+                 "entry_point": functional_entry_point(fn)},)
     return tuple(
         {"kind": "stdin", "stdin": c["input"], "expected_stdout": c["output"]}
         for c in cases
