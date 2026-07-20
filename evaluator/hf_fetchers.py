@@ -50,7 +50,8 @@ def extract(source_name: str, row: dict) -> tuple[str, dict]:
             # fallback's discipline (degrade gracefully, don't abort/crash).
             is_functional = False
         test_type = "functional" if is_functional else "stdin"
-        cases = [{"input": c["input"], "output": c["output"]} for c in raw_cases]
+        cases = [{"input": c["input"], "output": c["output"]}
+                 for c in raw_cases[:LCB_MAX_TESTS_PER_PROBLEM]]
         tests = normalize_tests(
             {"test_type": test_type, "fn_name": fn, "cases": cases}
         )
@@ -168,6 +169,20 @@ def stratum(source_name: str, row: dict) -> str:
 # pre-hard-tier `load_dataset(hf_dataset, split=split, revision=revision)`.
 HARD_CONFIG = {"gpqa_diamond": "gpqa_diamond"}
 
+# LiveCodeBench release window: keep only problems whose contest_date is on/after
+# this (past most models' training cutoffs -> contamination-resistant). Used both
+# by _livecodebench_raw_rows (to bound memory/download by dropping older shards)
+# and by build_hard's HARD_SOURCES predicate; keep the two in sync.
+LIVECODEBENCH_MIN_DATE = "2024-08-01"
+
+# Cap on test cases kept per LiveCodeBench problem (public first, then private).
+# Competitive problems ship 30-50+ private cases; holding every decoded case for
+# every in-window problem in memory OOMs a small box (the accumulation across
+# problems, not any single decode). A wrong solution almost always fails within
+# the first ~25 cases, so capping preserves pass@1 discrimination while bounding
+# memory. Documented resource compromise -- noted in HARD_TIER_REPORT.
+LCB_MAX_TESTS_PER_PROBLEM = 25
+
 # EleutherAI/hendrycks_math (the live parquet mirror Task 5 pins in place of
 # the dead hendrycks/competition_math) ships one config per subject, not a
 # single flat split -- live-verified in Task 4.
@@ -273,8 +288,17 @@ def _livecodebench_raw_rows(hf_dataset: str, revision: str, split: str) -> list[
     base64+zlib+pickle-encoded private test cases per row) -- a full build
     downloads several GB total. This is expected to be slow/best-effort in
     a bandwidth-constrained environment; see the M2d Task 5 report.
+
+    `LCB_SHARD_CACHE_DIR` (env var, optional): if set and a shard's filename
+    exists under it, that local file is used instead of `hf_hub_download`.
+    On a stalled/flaky connection, `hf_hub_download`'s session has been
+    observed to hang indefinitely with no read timeout; a shard fetched
+    out-of-band (e.g. `curl -C -` with its own stall/retry logic) can be
+    dropped here to unblock the build without touching this function's
+    normal path (unset by default, so behavior is unchanged elsewhere).
     """
     import json
+    import os
     import re
 
     from huggingface_hub import HfApi, hf_hub_download
@@ -288,16 +312,44 @@ def _livecodebench_raw_rows(hf_dataset: str, revision: str, split: str) -> list[
     if not shards:
         raise FileNotFoundError(f"no {split}*.jsonl shard in {hf_dataset}@{revision}")
 
+    # Memory + bandwidth bound: shards are chronological and the hard tier only
+    # keeps contest_date >= LIVECODEBENCH_MIN_DATE, so walk NEWEST shard first,
+    # keep only in-window rows, and stop once a shard contributes none (all
+    # older shards are then also before the cutoff). This avoids loading the
+    # full ~4.5GB corpus (with per-row base64+pickle private tests) into RAM on
+    # a small box, and skips downloading the old shards entirely. Same filter
+    # build_hard applies to parsed records — enforced here to bound memory.
+    # When a local shard cache is supplied, restrict to the shards present in
+    # it and never fall back to the network -- older (fully pre-window) shards
+    # are legitimately absent, so this is an explicit "use exactly these
+    # cached shards" mode, not a partial download to be completed online.
+    local_dir = os.environ.get("LCB_SHARD_CACHE_DIR")
+    if local_dir:
+        cached = [s for s in shards if os.path.exists(os.path.join(local_dir, s))]
+        if not cached:
+            raise FileNotFoundError(
+                f"LCB_SHARD_CACHE_DIR={local_dir} has none of {shards}")
+        shards = cached
+
     rows: list[dict] = []
-    for shard in shards:
-        path = hf_hub_download(repo_id=hf_dataset, filename=shard,
-                                repo_type="dataset", revision=revision)
+    for shard in reversed(shards):
+        if local_dir:
+            path = os.path.join(local_dir, shard)
+        else:
+            path = hf_hub_download(repo_id=hf_dataset, filename=shard,
+                                    repo_type="dataset", revision=revision)
+        kept = 0
         with open(path, encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
                 if not line:
                     continue
-                rows.append(json.loads(line))
+                row = json.loads(line)
+                if str(row.get("contest_date", "")) >= LIVECODEBENCH_MIN_DATE:
+                    rows.append(row)
+                    kept += 1
+        if kept == 0 and rows:  # gone past the window; older shards too
+            break
     return rows
 
 
