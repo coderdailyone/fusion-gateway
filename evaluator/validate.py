@@ -36,13 +36,19 @@ def load_secrets(path: str = "runs/secrets/.env") -> None:
                 os.environ.setdefault(k, v)
 
 
-def make_completion_fn(litellm_model: str, max_tokens: int = 2048, **overrides):
+def make_completion_fn(litellm_model: str, max_tokens: int = 2048,
+                       timeout: float = 180.0, **overrides):
     """Return completion_fn(model, prompt) -> {text,in_tokens,out_tokens,cost_usd}
     that calls the given litellm model. `overrides` (api_base/api_key) are passed through.
 
     Reasoning models (Kimi/GLM) need a generous max_tokens: a small cap gets spent
     on hidden reasoning and returns EMPTY content (seen in the M3a pilot — Kimi
-    produced 86 empty answers at 2048)."""
+    produced 86 empty answers at 2048).
+
+    `timeout` (seconds) caps each request: an overloaded/flaky mirror endpoint
+    otherwise leaves the HTTP read blocked forever (no default read timeout),
+    hanging the whole sampling loop. On timeout litellm raises, run_one records
+    an error row, and the resumable sampler retries it — progress never stalls."""
     import litellm
     litellm.suppress_debug_info = True
 
@@ -51,6 +57,7 @@ def make_completion_fn(litellm_model: str, max_tokens: int = 2048, **overrides):
             model=litellm_model,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=max_tokens,
+            timeout=timeout,
             **overrides,
         )
         try:
