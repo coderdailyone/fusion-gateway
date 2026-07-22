@@ -33,12 +33,12 @@ accounting, a budget kill-switch, replayable traces, automatic fallback — and 
 - [Why this exists](#why-this-exists)
 - [Headline result](#headline-result--cost-quality-pareto-sota)
 - [Why you can trust the numbers](#why-you-can-trust-the-numbers)
+- [Mapped to OpenAI's scorecard](#mapped-to-openais-scorecard) · [How it's different](#how-its-different)
 - [What you get today](#what-you-get-today)
-- [Quick start](#quick-start)
-- [Configuration](#configuration) · [API](#api)
-- [How it works](#how-it-works)
-- [Benchmark tiers](#benchmark-tiers)
-- [Engineering disciplines](#engineering-disciplines)
+- [Quick start](#quick-start) · [Configuration](#configuration) · [API](#api)
+- [How it works](#how-it-works) · [Repository map](#repository-map)
+- [Benchmark tiers](#benchmark-tiers) · [Reproduce the numbers yourself](#reproduce-the-numbers-yourself)
+- [Engineering disciplines](#engineering-disciplines) · [FAQ](#faq)
 - [Status & roadmap](#status--roadmap)
 
 ## Why this exists
@@ -109,6 +109,31 @@ Benchmark scores are worth exactly as much as their grader. This project treats
 
 This is the difference between "we got a high score" and "here is a number you
 can reproduce and audit." See **[docs/DISCIPLINES.md](docs/DISCIPLINES.md)**.
+
+## Mapped to OpenAI's scorecard
+
+OpenAI's CFO proposed four questions for measuring AI's value. Fusion Gateway has
+a concrete component answering each — the full mapping is in
+**[docs/POSITIONING.md](docs/POSITIONING.md)**:
+
+| Scorecard question | Fusion Gateway's answer |
+|---|---|
+| **Useful work** — did the AI do meaningful work? | objective, execution-based scoring — "task solved," not "output produced" |
+| **Cost per successful task** | *literally* the router's objective: maximize `P(correct) − λ·cost` |
+| **Dependability** — escalate appropriately | the deterministic verify-cascade: run cheap → execute the tests → escalate on fail |
+| **Return on compute** — more value per dollar as usage grows | the `λ` dial moves along the frontier by budget, not by swapping infrastructure |
+
+We were optimizing this metric before it had a name.
+
+## How it's different
+
+A plain model gateway routes by **static rules** — price tiers, round-robin,
+availability. Fusion Gateway routes by a **learned prediction of success**: per
+task, it estimates which model is likely to be correct and whether escalating is
+worth the marginal cost. And it doesn't ask you to take that on faith — the policy
+is trained and measured on an **audited, reproducible benchmark** with official
+graders. The value proposition isn't "access to many models"; it's **spending the
+least to actually get the task done.**
 
 ## What you get today
 
@@ -243,6 +268,24 @@ Deeper docs: **[docs/DESIGN.md](docs/DESIGN.md)** (architecture + milestones) ·
 **[docs/POSITIONING.md](docs/POSITIONING.md)** (mapping to OpenAI's scorecard) ·
 **[docs/adr/](docs/adr/)** (decision records).
 
+## Repository map
+
+```text
+gateway/     the live OpenAI-compatible service — app · router · ledger · traces · providers
+router/      the learned cost-aware policy — features · OOF classifiers (train) ·
+             λ-swept selection (policy) · verify-cascade · Pareto envelope
+evaluator/   the benchmark harness, fully isolated from the gateway
+  official/    vendored official graders (MATH is_equiv · MMLU-Pro · HumanEval · LiveCodeBench)
+  scorers/     thin adapters over the official graders
+  audit/       grader self-test + human-eyeball disagreement audit
+  agentic/     M4 SWE-bench-Live agentic tier (records · dataset · verifier · cascade)
+  suite/       content-hashed, locked manifests + loader
+configs/     gateway.toml + the locked benchmark manifests
+scripts/     resample · official scoring · reports · daily rollup · smoke
+docs/        DESIGN · DISCIPLINES · POSITIONING · benchmark reports · ADRs
+tests/       166 tests, test-first throughout
+```
+
 ## Benchmark tiers
 
 Routing is evaluated on three complementary tiers, all under the disciplines
@@ -258,6 +301,29 @@ The agentic tier extends the verify-cascade to a full multi-step agent loop
 (read repo → edit → run tests → iterate), with the escalation gate driven by an
 agent-authored **reproduction test** — never the hidden grader.
 
+## Reproduce the numbers yourself
+
+The benchmark is built to be **audited, not admired** — every result re-derives
+from frozen data:
+
+```bash
+.venv/bin/pip install -e '.[eval]'
+
+# the full suite (166 tests, TDD throughout)
+.venv/bin/pytest -q
+
+# (needs provider keys + spend) re-sample the locked suite under a budget gate,
+# then recompute the official scores + Pareto frontier from the frozen outputs
+.venv/bin/python scripts/resample_official.py            # sample the 1063-task suite
+.venv/bin/python scripts/final_numbers.py <run_dir>      # official scoring + Pareto
+```
+
+Before any paid run, a **grader self-test** requires every dataset's own gold
+answer to score correct (**1063/1063**) — a grader that can't recognize the
+reference answer isn't trusted to score a model's. And because outputs are frozen,
+re-scoring costs **$0** — which is how three real scorer bugs were caught and
+fixed without re-spending a cent.
+
 ## Engineering disciplines
 
 The project is built test-first, with rules that exist because breaking them
@@ -272,6 +338,29 @@ already cost real bugs (documented in
   before spending; a free/cheap gate before every paid run.
 - **Every design goes spec → plan → reviewed implementation**, with decision
   records in **[docs/adr/](docs/adr/)**.
+
+## FAQ
+
+**Does it use an LLM to judge answers?**  No. Every task is scored objectively —
+MCQ letter extraction, math equivalence, or running tests in a sandbox.
+
+**How do you know models didn't just memorize the benchmark?**  The hard tier
+mixes timestamped, post-cutoff tasks (AIME 2025, recent LiveCodeBench) with public
+ones and reports a per-model **fresh-vs-public** gap; a large gap flags a
+memorization suspect, and conclusions are cross-checked on the fresh split.
+
+**Is it production-ready?**  The gateway — auth, fallback, cost metering,
+kill-switch, replayable traces — is code-complete and test-covered; deployment is
+the pending step. The learned router is validated offline and not yet wired into
+the live path.
+
+**Can I use my own models?**  Yes — add a provider + model block to
+`configs/gateway.toml`. The router and benchmark operate over whatever pool you
+configure.
+
+**How is cost computed?**  Per call, from token usage × configured per-token
+prices, into a `preflight → settle` SQLite ledger — the same numbers the budget
+kill-switch enforces.
 
 ## Status & roadmap
 
