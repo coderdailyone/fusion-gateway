@@ -29,8 +29,34 @@ and non-streaming) and, per request:
 - writes an **append-only, replayable trace** of every decision, call, cost, and
   latency to a single SQLite file.
 
-The learned cost-aware **routing / cascade / fusion** (the namesake) is under
-active development — see [Status](#status--roadmap).
+The learned cost-aware **routing / cascade** (the namesake) is **validated on the
+benchmark** — it Pareto-dominates the frontier single models (see
+[Results](#results--cost-quality-pareto-sota)); wiring the trained policy into the
+live gateway is the remaining step.
+
+## Results — cost-quality Pareto SOTA
+
+On a 1063-task objective benchmark scored with **official** graders (Hendrycks
+MATH `is_equiv`, TIGER-Lab MMLU-Pro extraction, OpenAI HumanEval — **no LLM
+judge**), the learned cost-aware router **Pareto-dominates** the frontier singles:
+
+| strategy | accuracy | cost/task | reading |
+|---|---|---|---|
+| **router @ λ=10** | **0.907** | **$0.00106** | dominates GPT-5.5 / Sonnet 5 / GLM |
+| claude-opus-4-8 (quality ceiling) | 0.913 | $0.00421 | router ≈ Opus at ~4× lower cost |
+| deepseek-chat (cost floor) | 0.859 | $0.00011 | cheapest |
+| **code verify-cascade** | **0.994** | ~$0.0005 | run-cheap → execute tests → escalate |
+
+A separate **hard / contamination-resistant tier** (657 timestamped tasks:
+LiveCodeBench + GPQA-Diamond + AIME 2024/25 + MATH-L5) de-ties the saturated
+frontier, and a **SWE-bench-Live agentic tier** (long-horizon, real GitHub
+issues) is under construction — carrying the same *cost per successful task*
+discipline from single-turn benchmarks to real work.
+
+Full numbers: **[docs/BENCHMARK_REPORT.md](docs/BENCHMARK_REPORT.md)** ·
+hard tier **[docs/HARD_TIER_REPORT.md](docs/HARD_TIER_REPORT.md)** ·
+positioning vs OpenAI's *"Useful Intelligence per Dollar"* scorecard
+**[docs/POSITIONING.md](docs/POSITIONING.md)**.
 
 ## Quick start
 
@@ -149,16 +175,17 @@ Active, test-driven development.
 |---|---|
 | **M0** governance & disciplines | ✅ done |
 | **M1** minimal gateway (this README) | ✅ code complete; deploy pending |
-| **M2a** objective benchmark harness (1063 tasks, 3-model validated) | ✅ done |
-| **M3** cost-aware router (signal pilot → full sampling + training) | 🚧 in progress |
-| **M4** cascade + learned fusion gate | ⬜ |
-| **M5** reproducible SOTA benchmark report | ⬜ |
+| **M2** objective benchmark + official-aligned scoring (standard, 1063 tasks) | ✅ done |
+| **M2d** hard / contamination-resistant tier (657 timestamped tasks) | ✅ done |
+| **M3** learned cost-aware router + code verify-cascade | ✅ done — Pareto-dominant |
+| **M4** SWE-bench-Live agentic tier (long-task routing) | 🚧 in progress |
 
 ## Tech
 
 Python 3.10+ · FastAPI · httpx · SQLite (WAL) — a single async process, no ORM,
-no queue, no Docker. The evaluator adds LiteLLM / datasets / sympy (an `[eval]`
-extra) and stays fully decoupled from the gateway core.
+no queue, no Docker in the gateway core. The evaluator adds LiteLLM / datasets /
+sympy (an `[eval]` extra) — and, for the agentic tier, an isolated Docker eval
+box — all fully decoupled from the gateway core.
 
 ## License
 
