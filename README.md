@@ -2,20 +2,113 @@
 
 # ⚡ Fusion Gateway
 
-**An OpenRouter-style, self-hosted LLM gateway.**
-One OpenAI-compatible endpoint in front of many models — with per-call cost
-accounting, budget kill-switch, replayable traces, and automatic fallback.
-Its research goal is **cost-quality Pareto-SOTA** routing and fusion.
+**An OpenRouter-style, self-hosted LLM gateway that optimizes _cost per successful task_ — not cost per token.**
+
+One OpenAI-compatible endpoint in front of many models, with per-call cost
+accounting, a budget kill-switch, replayable traces, automatic fallback — and a
+**learned cost-aware router** whose research goal is **cost-quality Pareto-SOTA**.
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![API](https://img.shields.io/badge/API-OpenAI--compatible-412991?logo=openai&logoColor=white)
 ![Truth store](https://img.shields.io/badge/state-SQLite%20event--sourced-003B57?logo=sqlite&logoColor=white)
+![Scoring](https://img.shields.io/badge/benchmark-official%20graders%2C%20no%20LLM%20judge-2ea44f)
 ![Status](https://img.shields.io/badge/status-active%20development-orange)
 ![License](https://img.shields.io/badge/license-TBD-lightgrey)
 
 </div>
 
 ---
+
+> **The bet.** As models get cheaper per token but tasks get harder, the metric
+> that matters is not *cost per token* — it is **cost per _successful_ task**
+> (OpenAI's CFO calls it *["Useful Intelligence per
+> Dollar"](https://openai.com/index/a-scorecard-for-the-ai-age/)*). Fusion
+> Gateway is the engineering realization of that idea: a router that, per
+> request, picks the model — or the cheap→strong **cascade** — that maximizes
+> `P(correct) − λ·cost`, measured on benchmarks scored the way the *original*
+> benchmark authors score them.
+
+## Contents
+
+- [Why this exists](#why-this-exists)
+- [Headline result](#headline-result--cost-quality-pareto-sota)
+- [Why you can trust the numbers](#why-you-can-trust-the-numbers)
+- [What you get today](#what-you-get-today)
+- [Quick start](#quick-start)
+- [Configuration](#configuration) · [API](#api)
+- [How it works](#how-it-works)
+- [Benchmark tiers](#benchmark-tiers)
+- [Engineering disciplines](#engineering-disciplines)
+- [Status & roadmap](#status--roadmap)
+
+## Why this exists
+
+The frontier is a **cost-quality trade-off, not a single best model**. On easy
+tasks a $0.0001 model is indistinguishable from a $0.004 one; on hard tasks the
+expensive model earns its price. Paying frontier rates for every call wastes
+money; routing everything to the cheapest model drops quality. The right answer
+is **per-task**: send each request to the cheapest model *likely to get it
+right*, and escalate only when it pays off.
+
+Fusion Gateway does this behind **one OpenAI-compatible endpoint**:
+
+- a **learned cost-aware router** picks a single model, a cheap→strong
+  **cascade**, or (research) a fused panel — using **only public task features**
+  (never the answer key, never an LLM judge);
+- every fusion/cascade point is held to one rule: **expand the cost–quality
+  Pareto frontier, or be cut**;
+- and the whole thing is wrapped in production-grade governance — cost metering,
+  a budget kill-switch, and a replayable trace of every decision.
+
+## Headline result — cost-quality Pareto SOTA
+
+On a **1063-task objective benchmark** (MMLU-Pro · MATH · HumanEval) scored with
+the datasets' **official** graders — **no LLM judge** — the learned router
+**Pareto-dominates** the frontier single models across the pool we tested
+(DeepSeek, GLM, Kimi, Claude Sonnet/Opus, GPT-5.x):
+
+| strategy | accuracy | cost / task | reading |
+|---|---:|---:|---|
+| **router @ λ=10** | **0.907** | **$0.00106** | **Pareto-dominates** GPT-5.5 · Sonnet 5 · GLM |
+| claude-opus-4-8 *(quality ceiling)* | 0.913 | $0.00421 | router ≈ Opus quality at **~4× lower cost** |
+| gpt-5.5 | 0.905 | — | below the router curve |
+| deepseek-chat *(cost floor)* | 0.859 | $0.00011 | cheapest possible |
+| **code verify-cascade** | **0.994** | ~$0.0005 | run cheap → **execute the tests** → escalate on fail |
+
+The picture is a **frontier, not a winner**: `DeepSeek (floor) → router curve →
+Opus (ceiling)`. One gateway serves the whole curve; you move along it with a
+single dial (`λ`), not by swapping infrastructure. The **code verify-cascade** is
+the hero — because code can be *checked by running it*, "escalate only on a
+failing test" reaches near-perfect accuracy at near-cheapest cost.
+
+> Full numbers and methodology: **[docs/BENCHMARK_REPORT.md](docs/BENCHMARK_REPORT.md)**.
+
+## Why you can trust the numbers
+
+Benchmark scores are worth exactly as much as their grader. This project treats
+**scoring as a first-class engineering problem**:
+
+- **Official graders, vendored with provenance.** MATH uses Hendrycks'
+  `is_equiv`, MMLU-Pro uses TIGER-Lab's extraction, HumanEval uses OpenAI's
+  `check_correctness` — each vendored at a pinned upstream commit with its
+  license recorded. Scores are comparable to the papers, not to a scorer we
+  wished into being.
+- **No LLM judge.** Every task is graded objectively: MCQ letter extraction,
+  math equivalence, or **sandboxed test execution**. "Correct" means *the task
+  was solved*, not *an LLM liked the answer*.
+- **A grader self-test.** Before any paid run, each grader must recognize every
+  dataset's own gold answer (**1063 / 1063**). A grader that can't score the
+  reference answer can't be trusted to score a model's.
+- **Frozen, re-scorable outputs.** Every model output is persisted, so the whole
+  benchmark can be **re-graded for $0** when a scorer improves — which is how
+  three real scorer bugs were caught and corrected without re-spending.
+- **Contamination is measured, not assumed.** A separate **hard tier** mixes
+  **timestamped / post-cutoff** sources (LiveCodeBench, AIME 2025) with public
+  ones, and reports a **fresh-vs-public** delta per model — a large gap flags a
+  memorization suspect. Conclusions are cross-checked on genuinely-unseen data.
+
+This is the difference between "we got a high score" and "here is a number you
+can reproduce and audit." See **[docs/DISCIPLINES.md](docs/DISCIPLINES.md)**.
 
 ## What you get today
 
@@ -31,32 +124,8 @@ and non-streaming) and, per request:
 
 The learned cost-aware **routing / cascade** (the namesake) is **validated on the
 benchmark** — it Pareto-dominates the frontier single models (see
-[Results](#results--cost-quality-pareto-sota)); wiring the trained policy into the
-live gateway is the remaining step.
-
-## Results — cost-quality Pareto SOTA
-
-On a 1063-task objective benchmark scored with **official** graders (Hendrycks
-MATH `is_equiv`, TIGER-Lab MMLU-Pro extraction, OpenAI HumanEval — **no LLM
-judge**), the learned cost-aware router **Pareto-dominates** the frontier singles:
-
-| strategy | accuracy | cost/task | reading |
-|---|---|---|---|
-| **router @ λ=10** | **0.907** | **$0.00106** | dominates GPT-5.5 / Sonnet 5 / GLM |
-| claude-opus-4-8 (quality ceiling) | 0.913 | $0.00421 | router ≈ Opus at ~4× lower cost |
-| deepseek-chat (cost floor) | 0.859 | $0.00011 | cheapest |
-| **code verify-cascade** | **0.994** | ~$0.0005 | run-cheap → execute tests → escalate |
-
-A separate **hard / contamination-resistant tier** (657 timestamped tasks:
-LiveCodeBench + GPQA-Diamond + AIME 2024/25 + MATH-L5) de-ties the saturated
-frontier, and a **SWE-bench-Live agentic tier** (long-horizon, real GitHub
-issues) is under construction — carrying the same *cost per successful task*
-discipline from single-turn benchmarks to real work.
-
-Full numbers: **[docs/BENCHMARK_REPORT.md](docs/BENCHMARK_REPORT.md)** ·
-hard tier **[docs/HARD_TIER_REPORT.md](docs/HARD_TIER_REPORT.md)** ·
-positioning vs OpenAI's *"Useful Intelligence per Dollar"* scorecard
-**[docs/POSITIONING.md](docs/POSITIONING.md)**.
+[Headline result](#headline-result--cost-quality-pareto-sota)); wiring the
+trained policy into the live gateway is the remaining step.
 
 ## Quick start
 
@@ -156,16 +225,53 @@ flowchart LR
     A -.->|preflight → settle| L[("SQLite<br/>ledger · events · traces")]
 ```
 
-Today the router is static (a model name → primary + fallbacks). The research
-line adds a **learned cost-aware router** that reads only public task features
-and decides between a single model, a cheap→strong **cascade**, or a multi-model
-**panel** that is **fused only when a learned gate says it pays off** — with
-every fusion/cascade point held to "expand the cost–quality Pareto frontier or
-be cut." Judges and reference answers never enter routing inputs.
+Today the **live** router is static (a model name → primary + fallbacks). The
+**research** router — trained and validated offline — adds a learned cost-aware
+policy that reads only public task features and chooses, per task:
+
+1. a **single model** (cheap when the task looks easy, strong when it looks hard);
+2. a cheap→strong **cascade** — run the cheap model, and for code **execute the
+   tests**; escalate to the strong model only on a failing check;
+3. (research) a small **panel fused only when a learned gate says it pays off**.
+
+Every escalation/fusion point is gated on the same rule — *expand the Pareto
+frontier or be cut* — and **judges and reference answers never enter routing
+inputs** (the leakage guarantee is structural and tested).
 
 Deeper docs: **[docs/DESIGN.md](docs/DESIGN.md)** (architecture + milestones) ·
 **[docs/DISCIPLINES.md](docs/DISCIPLINES.md)** (engineering rules and why) ·
+**[docs/POSITIONING.md](docs/POSITIONING.md)** (mapping to OpenAI's scorecard) ·
 **[docs/adr/](docs/adr/)** (decision records).
+
+## Benchmark tiers
+
+Routing is evaluated on three complementary tiers, all under the disciplines
+above:
+
+| Tier | What | Size | Why |
+|---|---|---:|---|
+| **Standard** | MMLU-Pro · MATH · HumanEval, official scoring | 1063 | mixed difficulty — where routing's "cheap on easy, escalate on hard" value shows |
+| **Hard** | LiveCodeBench · GPQA-Diamond · AIME 24/25 · MATH-L5 | 657 | **de-ties** the saturated frontier + a **fresh-vs-public contamination** probe |
+| **Agentic** *(building)* | **SWE-bench-Live** — real GitHub issues, timestamped, graded by *do the hidden tests pass* | — | carries *cost per successful task* from single-turn benchmarks to **real work** |
+
+The agentic tier extends the verify-cascade to a full multi-step agent loop
+(read repo → edit → run tests → iterate), with the escalation gate driven by an
+agent-authored **reproduction test** — never the hidden grader.
+
+## Engineering disciplines
+
+The project is built test-first, with rules that exist because breaking them
+already cost real bugs (documented in
+**[docs/DISCIPLINES.md](docs/DISCIPLINES.md)**):
+
+- **SQLite as the single source of truth** — event-sourced ledger + traces, so
+  every cost and decision is replayable, not reconstructed from logs.
+- **`evaluator/` is fully isolated from the gateway** — the benchmark harness
+  never imports gateway code or touches its database.
+- **Frozen outputs + reference self-tests** — re-grade for $0; prove the grader
+  before spending; a free/cheap gate before every paid run.
+- **Every design goes spec → plan → reviewed implementation**, with decision
+  records in **[docs/adr/](docs/adr/)**.
 
 ## Status & roadmap
 
