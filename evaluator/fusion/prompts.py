@@ -9,12 +9,13 @@ from __future__ import annotations
 _MCQ_FMT = ("Finish your response with a single line 'The answer is (X).' "
             "where X is the correct option letter.")
 _MATH_FMT = "Put your final answer within \\boxed{}."
-_CODE_FMT = "Respond with a single Python code block containing the complete solution."
+_HUMANEVAL_FMT = "Respond with a single Python code block containing the full function definition."
+_LIVECODEBENCH_FMT = "Respond with a single Python code block containing the complete solution."
 _DEFAULT_FMT = "Put your final answer clearly at the end."
 
 _FORMAT = {"mmlu_pro": _MCQ_FMT, "gpqa_diamond": _MCQ_FMT,
            "math": _MATH_FMT, "aime": _MATH_FMT, "math_l5": _MATH_FMT,
-           "humaneval": _CODE_FMT, "livecodebench": _CODE_FMT}
+           "humaneval": _HUMANEVAL_FMT, "livecodebench": _LIVECODEBENCH_FMT}
 
 
 def format_instruction(task) -> str:

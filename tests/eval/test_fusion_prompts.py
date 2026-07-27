@@ -17,6 +17,38 @@ def test_format_instruction_matches_official_wording():
     assert "\\boxed{}" in format_instruction(MATH)
 
 
+def _task(source: str) -> Task:
+    return Task(id="x", source=source, problem="p", answer="a", tests=(), meta={})
+
+
+def test_format_instruction_covers_every_manifest_source():
+    # mmlu_pro / suite.manifest.json + suite.hard.manifest.json sources.
+    mcq_sources = ("mmlu_pro", "gpqa_diamond")
+    for source in mcq_sources:
+        instr = format_instruction(_task(source))
+        assert "The answer is (X)." in instr, source
+
+    math_sources = ("math", "aime", "math_l5")
+    for source in math_sources:
+        instr = format_instruction(_task(source))
+        assert "\\boxed{}" in instr, source
+
+    humaneval_instr = format_instruction(_task("humaneval"))
+    assert "full function definition" in humaneval_instr
+
+    livecodebench_instr = format_instruction(_task("livecodebench"))
+    assert "complete solution" in livecodebench_instr
+
+    # humaneval and livecodebench must NOT share wording: HumanEval's
+    # extractor needs the full function signature, LiveCodeBench's does not.
+    assert humaneval_instr != livecodebench_instr
+
+    # Unknown source falls back to the generic default.
+    assert format_instruction(_task("some_unknown_source")) == (
+        "Put your final answer clearly at the end."
+    )
+
+
 def test_review_prompt_excludes_the_reviewers_own_answer():
     p = build_review_prompt(MCQ, CASE, reviewer="deepseek-chat")
     assert "I say (B)." in p          # the other candidate is reviewed
