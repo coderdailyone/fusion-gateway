@@ -20,12 +20,31 @@ import json
 import sys
 from pathlib import Path
 
-# panel members (domestic) and where their frozen candidates live
-PANEL = {
-    "deepseek-chat": "evaluator/runs/m2c_full/deepseek-chat",
-    "glm-5.2": "evaluator/runs/m2c_full/glm-5.2",
-    "kimi-k3": "evaluator/runs/m5_fusion/kimi-k3",
+# panel members (domestic) and where their frozen candidates live. kimi was
+# sampled in parallel shards, so a model may map to several run dirs; they are
+# merged first-ok-wins, matching load_frozen_by_model's semantics.
+PANEL_DIRS = {
+    "deepseek-chat": ["evaluator/runs/m2c_full/deepseek-chat"],
+    "glm-5.2": ["evaluator/runs/m2c_full/glm-5.2"],
+    "kimi-k3": [f"evaluator/runs/m5_fusion/kimi-k3-s{s}" for s in range(8)],
 }
+PANEL = list(PANEL_DIRS)
+
+
+def _load_panel_frozen() -> dict[str, dict[str, str]]:
+    """model -> {task_id: text}, merging each model's (possibly sharded) dirs."""
+    from evaluator.fusion.panel import load_frozen_by_model
+
+    merged: dict[str, dict[str, str]] = {}
+    for model, dirs in PANEL_DIRS.items():
+        texts: dict[str, str] = {}
+        for d in dirs:
+            if not Path(d).exists():
+                continue
+            for tid, text in load_frozen_by_model({model: d})[model].items():
+                texts.setdefault(tid, text)
+        merged[model] = texts
+    return merged
 FUSER = "glm-5.2"
 FRONTIER_BAR = 0.894  # gpt-5.6-sol, M2c official scoring
 RUN_ROOT = Path("evaluator/runs/m5_fusion")
@@ -52,12 +71,12 @@ def _score(task, text: str) -> bool:
 
 def cmd_oracle() -> int:
     """Free gate: can the domestic panel even reach the frontier bar?"""
-    from evaluator.fusion.panel import assemble, load_frozen_by_model
+    from evaluator.fusion.panel import assemble
     from scripts.fusion_report import oracle
 
     tasks = _load_tasks()
     by_id = {t.id: t for t in tasks}
-    frozen = load_frozen_by_model(PANEL)
+    frozen = _load_panel_frozen()
     for model, texts in frozen.items():
         print(f"  {model:16} frozen ok rows: {len(texts)}")
 
@@ -111,13 +130,13 @@ def _dispatch():
 
 def cmd_run(limit: int | None, ceiling: float, out_name: str) -> int:
     """PAID: cross-review + fusion, resumable, budget-gated."""
-    from evaluator.fusion.panel import assemble, load_frozen_by_model
+    from evaluator.fusion.panel import assemble
     from evaluator.fusion.review import cross_review
     from evaluator.fusion.fuse import fuse
 
     tasks = _load_tasks()
     by_id = {t.id: t for t in tasks}
-    frozen = load_frozen_by_model(PANEL)
+    frozen = _load_panel_frozen()
     cases, _ = assemble(frozen, [t.id for t in tasks], min_candidates=2)
     if limit:
         # stratify the smoke across sources
