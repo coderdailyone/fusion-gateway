@@ -5,6 +5,9 @@ FUSION = pathlib.Path("evaluator/fusion")
 
 
 def test_fusion_modules_never_import_gateway():
+    # Guard against the test passing vacuously (e.g. cwd != repo root, so the
+    # glob matches nothing and the loop body never runs).
+    assert list(FUSION.glob("*.py"))
     for py in FUSION.glob("*.py"):
         tree = ast.parse(py.read_text())
         for node in ast.walk(tree):

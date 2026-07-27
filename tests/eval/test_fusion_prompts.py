@@ -63,3 +63,22 @@ def test_fusion_prompt_carries_candidates_reviews_and_format():
     assert "B is not 4" in p                           # review evidence present
     assert "The answer is (X)." in p                   # official output contract
     assert MCQ.problem in p
+
+
+def test_fusion_prompt_forbids_early_answer_is_for_mcq_sources():
+    # evaluator/official/mmlu_extract.py::extract_answer takes the FIRST
+    # occurrence of "answer is". The fusion prompt tells the fuser to
+    # "decide using the specific objections raised", which invites restating
+    # a rejected candidate's answer (e.g. "Candidate X's answer is (A), but
+    # that is wrong ... The answer is (B)."), extracting the wrong letter. For
+    # MCQ-format tasks, the prompt must explicitly rule this out.
+    p_mcq = build_fusion_prompt(MCQ, CASE, {})
+    assert "final answer line" in p_mcq
+    assert "answer is" in p_mcq.lower()
+
+
+def test_fusion_prompt_omits_early_answer_is_rule_for_non_mcq_sources():
+    math_case = PanelCase(task_id="t2", source="math",
+                          candidates={"deepseek-chat": "2+2=4", "glm-5.2": "4"})
+    p_math = build_fusion_prompt(MATH, math_case, {})
+    assert "final answer line" not in p_math

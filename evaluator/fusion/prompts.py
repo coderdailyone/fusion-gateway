@@ -17,6 +17,23 @@ _FORMAT = {"mmlu_pro": _MCQ_FMT, "gpqa_diamond": _MCQ_FMT,
            "math": _MATH_FMT, "aime": _MATH_FMT, "math_l5": _MATH_FMT,
            "humaneval": _HUMANEVAL_FMT, "livecodebench": _LIVECODEBENCH_FMT}
 
+_MCQ_SOURCES = {"mmlu_pro", "gpqa_diamond"}
+
+# The official MCQ extractor (evaluator/official/mmlu_extract.py) takes the
+# FIRST occurrence of "answer is" in the text. The fusion prompt below asks
+# the fuser to "decide using the specific objections raised", which invites
+# restating a rejected candidate's answer while explaining why it's wrong
+# (e.g. "Candidate deepseek-chat's answer is (A), but that is wrong ... The
+# answer is (B)."). That extracts (A) and scores a correct fusion WRONG. So
+# for MCQ-format tasks, the fusion prompt must explicitly forbid the phrase
+# anywhere except the final answer line.
+_MCQ_NO_EARLY_ANSWER_IS_RULE = (
+    "- Do not write the phrase \"answer is\" anywhere in your response except "
+    "on the final answer line. The grader extracts the FIRST occurrence of "
+    "that phrase, so writing it earlier (e.g. while explaining why a "
+    "candidate's answer is wrong) would be mis-scored as your final answer."
+)
+
 
 def format_instruction(task) -> str:
     return _FORMAT.get(task.source, _DEFAULT_FMT)
@@ -51,15 +68,19 @@ def build_fusion_prompt(task, case, reviews) -> str:
         for target, v in sorted(verdicts.items()):
             lines.append(f"{reviewer} says {target} is {v.verdict}: {v.reason}")
     review_block = "\n".join(lines) if lines else "(no reviews available)"
+    rules = [
+        "- If the candidates agree and no review objects, adopt that answer.",
+        "- If they disagree, decide using the specific objections raised, and "
+        "write a corrected answer (you may combine correct parts of several).",
+    ]
+    if task.source in _MCQ_SOURCES:
+        rules.append(_MCQ_NO_EARLY_ANSWER_IS_RULE)
+    rules.append(f"- {format_instruction(task)}")
     return (
         "Several models answered the problem below, and reviewed each other. "
         "Produce the single best final answer.\n\n"
         f"Problem:\n{task.problem}\n\n"
         f"{_candidate_block(case.candidates)}\n\n"
         f"--- Peer review ---\n{review_block}\n\n"
-        "Rules:\n"
-        "- If the candidates agree and no review objects, adopt that answer.\n"
-        "- If they disagree, decide using the specific objections raised, and "
-        "write a corrected answer (you may combine correct parts of several).\n"
-        f"- {format_instruction(task)}"
+        "Rules:\n" + "\n".join(rules)
     )
