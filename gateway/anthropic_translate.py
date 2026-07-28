@@ -24,7 +24,10 @@ _STOP_REASON_MAP = {
 
 def _content_to_anthropic(content: Any) -> Any:
     """OpenAI content is a string or a list of parts; Anthropic takes either a
-    string or a list of blocks. Strings pass through unchanged."""
+    string or a list of blocks. Strings pass through unchanged.
+
+    Only `type: "text"` parts survive: vision is a stated non-goal for this
+    gateway, so image/audio parts are dropped rather than translated."""
     if content is None:
         return ""
     if isinstance(content, str):
@@ -36,6 +39,24 @@ def _content_to_anthropic(content: Any) -> Any:
     return blocks or ""
 
 
+def _system_text(content: Any) -> str:
+    """Flatten one system message's content to a string.
+
+    Anthropic's top-level `system` is a plain string, but OpenAI allows the
+    array-of-parts shape here too — and `/v1/chat/completions` reads the body
+    with no schema validation, so any client-controlled JSON reaches us. Parts
+    that are not text contribute nothing instead of raising."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n\n".join(
+            part["text"] for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+            and isinstance(part.get("text"), str) and part["text"]
+        )
+    return ""
+
+
 def to_anthropic_request(payload: dict, upstream_model: str) -> dict:
     """Translate an OpenAI chat-completions body into an Anthropic messages body."""
     system_parts: list[str] = []
@@ -44,7 +65,7 @@ def to_anthropic_request(payload: dict, upstream_model: str) -> dict:
     for msg in payload.get("messages", []):
         role = msg.get("role")
         if role == "system":
-            system_parts.append(msg.get("content") or "")
+            system_parts.append(_system_text(msg.get("content")))
             continue
         if role == "tool":
             # Anthropic returns tool results as USER content blocks.
@@ -100,6 +121,9 @@ def to_anthropic_request(payload: dict, upstream_model: str) -> dict:
     choice = payload.get("tool_choice")
     if choice == "auto":
         out["tool_choice"] = {"type": "auto"}
+    elif choice == "required":
+        # OpenAI's "must call some tool" is Anthropic's {"type": "any"}.
+        out["tool_choice"] = {"type": "any"}
     elif choice == "none":
         out["tool_choice"] = {"type": "none"}
     elif isinstance(choice, dict):

@@ -15,6 +15,19 @@ def test_system_messages_are_hoisted_to_the_top_level_field():
     assert out["model"] == "glm-5.2"
 
 
+def test_array_content_system_message_is_hoisted_as_a_string():
+    # OpenAI allows system content as a list of parts. The public endpoint does
+    # no pydantic validation, so this shape reaches the translator verbatim.
+    out = to_anthropic_request({
+        "messages": [
+            {"role": "system", "content": [{"type": "text", "text": "be terse"}]},
+            {"role": "system", "content": "and polite"},
+            {"role": "user", "content": "hi"},
+        ]}, "m")
+    assert out["system"] == "be terse\n\nand polite"
+    assert [m["role"] for m in out["messages"]] == ["user"]
+
+
 def test_max_tokens_defaults_because_anthropic_requires_it():
     out = to_anthropic_request({"messages": [{"role": "user", "content": "hi"}]}, "m")
     assert out["max_tokens"] == DEFAULT_MAX_TOKENS
@@ -57,6 +70,16 @@ def test_named_tool_choice_is_mapped():
     assert out["tool_choice"] == {"type": "tool", "name": "search"}
 
 
+def test_required_tool_choice_maps_to_anthropic_any():
+    out = to_anthropic_request({
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"name": "search",
+                                                    "parameters": {}}}],
+        "tool_choice": "required",
+    }, "m")
+    assert out["tool_choice"] == {"type": "any"}
+
+
 def test_assistant_tool_calls_become_tool_use_blocks():
     out = to_anthropic_request({"messages": [
         {"role": "user", "content": "search cats"},
@@ -67,6 +90,17 @@ def test_assistant_tool_calls_become_tool_use_blocks():
     blocks = out["messages"][1]["content"]
     assert blocks == [{"type": "tool_use", "id": "call_1", "name": "search",
                        "input": {"q": "cats"}}]
+
+
+def test_malformed_tool_call_arguments_degrade_to_empty_input():
+    # A truncated/invalid arguments string must not 500 the whole request.
+    out = to_anthropic_request({"messages": [
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "call_1", "type": "function",
+             "function": {"name": "search", "arguments": '{"q": "cat'}}]},
+    ]}, "m")
+    assert out["messages"][0]["content"] == [
+        {"type": "tool_use", "id": "call_1", "name": "search", "input": {}}]
 
 
 def test_tool_result_messages_become_user_tool_result_blocks():
