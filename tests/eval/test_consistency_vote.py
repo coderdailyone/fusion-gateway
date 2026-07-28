@@ -4,6 +4,7 @@ from evaluator.consistency.vote import Ballot, first_k, tally_keys, vote
 MCQ = Task(id="m1", source="mmlu_pro", problem="?", answer="B", tests=(), meta={})
 MATH = Task(id="q1", source="math", problem="?", answer="0.5", tests=(), meta={})
 CODE = Task(id="c1", source="humaneval", problem="?", answer=None, tests=(), meta={})
+LCB = Task(id="l1", source="livecodebench", problem="?", answer=None, tests=(), meta={})
 
 
 def _b(model, key, text=""):
@@ -41,6 +42,16 @@ def test_math_equivalent_answers_merge_into_one_candidate():
 def test_code_passing_sample_beats_more_numerous_failing_ones():
     res = vote(CODE, [_b("a", "FAIL:aaa"), _b("b", "FAIL:aaa"), _b("c", "PASS:2")])
     assert res.winner_key == "PASS:2"       # execution beats popularity
+
+
+def test_code_text_beginning_with_pass_is_not_mistaken_for_a_passing_run():
+    # livecodebench problems carry no ">>>" doctests, so ballot_key falls back
+    # to the raw source for essentially every LCB sample. "PASS_THRESHOLD = 3"
+    # is code, not a "PASS:<n>" signature, and must not outrank a plurality.
+    res = vote(LCB, [_b("a", "PASS_THRESHOLD = 3"),
+                     _b("b", "def f(): ..."), _b("c", "def f(): ...")])
+    assert res.winner_key == "def f(): ..."   # plurality, not a fake pass
+    assert res.tied is False
 
 
 def test_first_k_takes_k_ballots_per_model():

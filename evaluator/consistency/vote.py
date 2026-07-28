@@ -28,6 +28,9 @@ class Ballot:
 class VoteResult:
     winner_text: str | None
     winner_key: str | None
+    # PRE-filter counts: for code tasks this still holds the FAIL keys, so it is
+    # NOT the tally the winner was drawn from -- do not derive "did the winner
+    # have a majority?" from it.
     tally: dict[str, int]
     tied: bool
     spoiled: int
@@ -72,7 +75,12 @@ def vote(task, ballots) -> VoteResult:
         return VoteResult(None, None, {}, False, spoiled, n)
 
     if task.source in _CODE:
-        passing = {k: v for k, v in tally.items() if k.startswith("PASS")}
+        # The colon matters: doctest_signature emits "PASS:<n>" / "FAIL:<...>",
+        # but ballot_key falls back to the RAW SOURCE whenever a problem has no
+        # ">>>" doctests -- which is every livecodebench problem. Without the
+        # colon a sample starting with e.g. "PASS_THRESHOLD = 3" would be
+        # counted as a verified passing run and outrank a real plurality.
+        passing = {k: v for k, v in tally.items() if k.startswith("PASS:")}
         if passing:
             tally_for_pick = passing
         else:
