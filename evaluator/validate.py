@@ -124,57 +124,81 @@ def validate(gateway_model_name: str, completion_fn, n_per_source: int = 5,
     return rows, agg, run_dir
 
 
-# Model registry: gateway name -> factory building its LiteLLM completion_fn.
-# GLM currently has no account balance; kept here for when it is recharged.
-MODELS = {
-    "deepseek-chat": lambda: make_completion_fn(
-        "deepseek/deepseek-chat", api_key=os.environ["DEEPSEEK_API_KEY"]),
-    "kimi-k3": lambda: make_completion_fn(  # reasoning model -> generous cap
+# Model registry: gateway name -> LAZY spec factory returning make_completion_fn's
+# kwargs. Lazy because the api_key lookups must happen after load_secrets(), not
+# at import time. GLM currently has no account balance; kept here for when it is
+# recharged.
+MODEL_SPECS = {
+    "deepseek-chat": lambda: dict(
+        litellm_model="deepseek/deepseek-chat",
+        api_key=os.environ["DEEPSEEK_API_KEY"]),
+    "kimi-k3": lambda: dict(  # reasoning model -> generous cap
         # model id on the endpoint is literally "k3" (k2's billing-cycle quota
         # was exhausted; k3 is the current model and has quota).
-        "openai/k3",
+        litellm_model="openai/k3",
         max_tokens=8192,
         api_base="https://api.kimi.com/coding/v1",
         api_key=os.environ["MOONSHOT_API_KEY"]),
     # glm-5.2 (paid) is reachable on the Anthropic-compatible endpoint; the
     # paid glm-5.2/glm-4.6 on the OpenAI /paas/v4 endpoint return 余额不足,
     # while glm-4.5-flash is free there (a cheaper fallback if needed).
-    "glm-5.2": lambda: make_completion_fn(
-        "anthropic/glm-5.2",
+    "glm-5.2": lambda: dict(
+        litellm_model="anthropic/glm-5.2",
         max_tokens=8192,
         api_base="https://open.bigmodel.cn/api/anthropic",
         api_key=os.environ["GLM_API_KEY"]),
-    "glm-4.5-flash": lambda: make_completion_fn(
-        "openai/glm-4.5-flash",
+    "glm-4.5-flash": lambda: dict(
+        litellm_model="openai/glm-4.5-flash",
         api_base="https://open.bigmodel.cn/api/paas/v4",
         api_key=os.environ["GLM_API_KEY"]),
     # strong+expensive frontier model (via OpenAI-compatible mirror); reasoning
     # model -> generous max_tokens. The "expensive" leg for the routing crux.
-    "gpt-5.5": lambda: make_completion_fn(
-        "openai/gpt-5.5",
+    "gpt-5.5": lambda: dict(
+        litellm_model="openai/gpt-5.5",
         max_tokens=8192,
         api_base="https://mirror.xinshu.ai/v1",
         api_key=os.environ["OPENAI_MIRROR_KEY"]),
     # gpt-5.6-sol: fast GPT-5.x variant on the mirror (gpt-5.5 was too slow) —
     # the M3b pool's 4th (strong) leg.
-    "gpt-5.6-sol": lambda: make_completion_fn(
-        "openai/gpt-5.6-sol",
+    "gpt-5.6-sol": lambda: dict(
+        litellm_model="openai/gpt-5.6-sol",
         max_tokens=8192,
         api_base="https://mirror.xinshu.ai/v1",
         api_key=os.environ["OPENAI_MIRROR_KEY"]),
     # Claude frontier models via an Anthropic-compatible mirror — the strongest
     # "strong leg" options for the routing crux.
-    "claude-sonnet-5": lambda: make_completion_fn(
-        "anthropic/claude-sonnet-5",
+    "claude-sonnet-5": lambda: dict(
+        litellm_model="anthropic/claude-sonnet-5",
         max_tokens=8192,
         api_base="https://api.aicodemirror.com/api/claudecode",
         api_key=os.environ["CLAUDE_MIRROR_KEY"]),
-    "claude-opus-4-8": lambda: make_completion_fn(
-        "anthropic/claude-opus-4-8",
+    "claude-opus-4-8": lambda: dict(
+        litellm_model="anthropic/claude-opus-4-8",
         max_tokens=8192,
         api_base="https://api.aicodemirror.com/api/claudecode",
         api_key=os.environ["CLAUDE_MIRROR_KEY"]),
 }
+
+
+def make_model_fn(name: str, **overrides):
+    """Build a registered model's completion_fn, merging extra litellm kwargs.
+
+    `overrides` win over the registered spec and are forwarded verbatim to
+    litellm.completion, so `make_model_fn("glm-5.2", temperature=0.8)` samples
+    that model at 0.8 with its registered endpoint/key/max_tokens untouched.
+    This is the ONE place model wiring lives -- M6 needs the same endpoints as
+    M2/M5 but a different temperature, and a second copy of the table would
+    drift.
+    """
+    if name not in MODEL_SPECS:
+        raise KeyError(f"unknown model {name!r}; choices: {list(MODEL_SPECS)}")
+    spec = MODEL_SPECS[name]()
+    litellm_model = spec.pop("litellm_model")
+    return make_completion_fn(litellm_model, **{**spec, **overrides})
+
+
+# gateway name -> zero-arg factory building its LiteLLM completion_fn.
+MODELS = {name: (lambda n=name: make_model_fn(n)) for name in MODEL_SPECS}
 
 
 def main() -> None:
