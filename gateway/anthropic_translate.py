@@ -131,3 +131,79 @@ def to_anthropic_request(payload: dict, upstream_model: str) -> dict:
         if name:
             out["tool_choice"] = {"type": "tool", "name": name}
     return out
+
+
+def _token_count(value: Any) -> int:
+    """Coerce one upstream usage number to a non-negative int.
+
+    The result feeds the ledger's settle(), so a garbage or absent count must
+    become 0 rather than raise — a mis-typed field should not cost a request."""
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def from_anthropic_response(resp: dict, model: str) -> dict:
+    """Translate an Anthropic messages response into an OpenAI chat.completion.
+
+    Upstream JSON is no more trusted than a client body: every block is shape-
+    checked, and anything unrecognised is skipped instead of raising out of the
+    request handler."""
+    text_parts: list[str] = []
+    tool_calls: list[dict] = []
+    thinking_blocks = 0
+
+    content_blocks = resp.get("content")
+    if not isinstance(content_blocks, list):
+        content_blocks = []
+
+    for block in content_blocks:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "text":
+            text = block.get("text")
+            if isinstance(text, str):
+                text_parts.append(text)
+        elif btype == "tool_use":
+            args = block.get("input")
+            tool_calls.append({
+                "id": block.get("id", ""),
+                "type": "function",
+                "function": {"name": block.get("name", ""),
+                             "arguments": json.dumps(args) if isinstance(args, dict) else "{}"},
+            })
+        elif btype == "thinking":
+            thinking_blocks += 1  # counted, never surfaced (OpenAI has no field)
+
+    # `content` is None rather than "" when there is no text: OpenAI clients
+    # branch on `content is None` to recognise a tool-only reply.
+    joined = "".join(text_parts)
+    message: dict[str, Any] = {"role": "assistant", "content": joined or None}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+
+    usage_in = resp.get("usage")
+    if not isinstance(usage_in, dict):
+        usage_in = {}
+    prompt = _token_count(usage_in.get("input_tokens"))
+    completion = _token_count(usage_in.get("output_tokens"))
+
+    stop_reason = resp.get("stop_reason")
+    finish_reason = _STOP_REASON_MAP.get(stop_reason, "stop") \
+        if isinstance(stop_reason, str) else "stop"
+
+    return {
+        "id": resp.get("id") or f"chatcmpl-{uuid.uuid4().hex}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason,
+        }],
+        "usage": {"prompt_tokens": prompt, "completion_tokens": completion,
+                  "total_tokens": prompt + completion},
+    }

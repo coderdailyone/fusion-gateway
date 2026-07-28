@@ -125,3 +125,98 @@ def test_gateway_only_fields_are_not_forwarded():
     }, "upstream-name")
     assert out["model"] == "upstream-name"
     assert "stream" not in out and "stream_options" not in out
+
+
+from gateway.anthropic_translate import from_anthropic_response
+
+
+def _resp(content, stop_reason="end_turn", usage=None):
+    return {"id": "msg_1", "type": "message", "role": "assistant",
+            "model": "glm-5.2", "content": content, "stop_reason": stop_reason,
+            "usage": usage or {"input_tokens": 11, "output_tokens": 7}}
+
+
+def test_text_blocks_concatenate_into_message_content():
+    out = from_anthropic_response(
+        _resp([{"type": "text", "text": "he"}, {"type": "text", "text": "llo"}]), "glm-5.2")
+    assert out["object"] == "chat.completion"
+    assert out["model"] == "glm-5.2"
+    choice = out["choices"][0]
+    assert choice["message"]["role"] == "assistant"
+    assert choice["message"]["content"] == "hello"
+    assert choice["finish_reason"] == "stop"
+
+
+def test_usage_is_renamed_to_openai_fields():
+    out = from_anthropic_response(_resp([{"type": "text", "text": "x"}]), "m")
+    assert out["usage"] == {"prompt_tokens": 11, "completion_tokens": 7,
+                            "total_tokens": 18}
+
+
+def test_tool_use_blocks_become_tool_calls_with_json_arguments():
+    out = from_anthropic_response(_resp(
+        [{"type": "tool_use", "id": "toolu_9", "name": "search",
+          "input": {"q": "cats"}}], stop_reason="tool_use"), "m")
+    choice = out["choices"][0]
+    call = choice["message"]["tool_calls"][0]
+    assert call["id"] == "toolu_9" and call["type"] == "function"
+    assert call["function"]["name"] == "search"
+    assert json.loads(call["function"]["arguments"]) == {"q": "cats"}
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["content"] is None   # tool-only reply
+
+
+def test_thinking_blocks_are_dropped_not_leaked_into_content():
+    out = from_anthropic_response(_resp(
+        [{"type": "thinking", "thinking": "secret chain"},
+         {"type": "text", "text": "answer"}]), "m")
+    assert out["choices"][0]["message"]["content"] == "answer"
+    assert "secret chain" not in json.dumps(out)
+
+
+def test_stop_reason_mapping_covers_every_value():
+    for anthropic, openai in (("end_turn", "stop"), ("max_tokens", "length"),
+                              ("stop_sequence", "stop"), ("tool_use", "tool_calls")):
+        out = from_anthropic_response(
+            _resp([{"type": "text", "text": "x"}], stop_reason=anthropic), "m")
+        assert out["choices"][0]["finish_reason"] == openai
+
+
+# --- untrusted-input hardening -------------------------------------------------
+# Upstream replies are as untrusted as client bodies: nothing here is validated
+# against a schema before it reaches the translator, so a surprising shape has to
+# degrade into a valid completion rather than raise out of the request handler.
+
+
+def test_unexpected_content_shapes_degrade_instead_of_raising():
+    for content in (None, "just a string", ["oops", 7, None], {"type": "text"}):
+        out = from_anthropic_response(_resp(content), "m")
+        assert out["choices"][0]["message"]["content"] is None
+        assert "tool_calls" not in out["choices"][0]["message"]
+
+
+def test_non_string_text_and_non_object_tool_input_degrade():
+    out = from_anthropic_response(_resp([
+        {"type": "text", "text": None},
+        {"type": "tool_use", "id": "t1", "name": "search", "input": "not-an-object"},
+    ], stop_reason="tool_use"), "m")
+    call = out["choices"][0]["message"]["tool_calls"][0]
+    assert call["function"]["arguments"] == "{}"
+    assert out["choices"][0]["message"]["content"] is None
+
+
+def test_missing_or_garbage_usage_degrades_to_zero_tokens():
+    zero = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    no_usage = from_anthropic_response({"content": [{"type": "text", "text": "x"}]}, "m")
+    assert no_usage["usage"] == zero
+    garbage = from_anthropic_response(
+        _resp([{"type": "text", "text": "x"}],
+              usage={"input_tokens": "?", "output_tokens": None}), "m")
+    assert garbage["usage"] == zero
+
+
+def test_unknown_stop_reason_falls_back_to_stop():
+    for bad in (None, "overloaded", ["end_turn"]):
+        out = from_anthropic_response(
+            _resp([{"type": "text", "text": "x"}], stop_reason=bad), "m")
+        assert out["choices"][0]["finish_reason"] == "stop"
