@@ -234,3 +234,175 @@ def test_unknown_stop_reason_falls_back_to_stop():
         out = from_anthropic_response(
             _resp([{"type": "text", "text": "x"}], stop_reason=bad), "m")
         assert out["choices"][0]["finish_reason"] == "stop"
+
+
+from gateway.anthropic_translate import StreamTranslator, iter_sse_data
+
+
+def _drain(translator, events):
+    out = []
+    for e in events:
+        out.extend(translator.feed(e))
+    out.extend(translator.finish())
+    return out
+
+
+def test_iter_sse_data_parses_data_lines_and_skips_junk():
+    raw = (b'event: message_start\n'
+           b'data: {"type": "message_start"}\n\n'
+           b': a comment line\n'
+           b'data: not-json\n\n'
+           b'data: {"type": "message_stop"}\n\n')
+    got = list(iter_sse_data(raw))
+    assert [g["type"] for g in got] == ["message_start", "message_stop"]
+
+
+def test_text_stream_translates_to_openai_chunks_with_role_then_content():
+    t = StreamTranslator("glm-5.2")
+    chunks = _drain(t, [
+        {"type": "message_start", "message": {"usage": {"input_tokens": 12}}},
+        {"type": "content_block_start", "index": 0,
+         "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "text_delta", "text": "he"}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "text_delta", "text": "llo"}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+         "usage": {"output_tokens": 5}},
+        {"type": "message_stop"},
+    ])
+    assert all(c["object"] == "chat.completion.chunk" for c in chunks)
+    assert chunks[0]["choices"][0]["delta"] == {"role": "assistant"}
+    text = "".join(c["choices"][0]["delta"].get("content", "")
+                   for c in chunks if c["choices"])
+    assert text == "hello"
+    finishes = [c["choices"][0]["finish_reason"] for c in chunks
+                if c["choices"] and c["choices"][0].get("finish_reason")]
+    assert finishes == ["stop"]
+
+
+def test_usage_is_merged_from_message_start_and_message_delta():
+    t = StreamTranslator("m")
+    chunks = _drain(t, [
+        {"type": "message_start", "message": {"usage": {"input_tokens": 12}}},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+         "usage": {"output_tokens": 5}},
+        {"type": "message_stop"},
+    ])
+    usage_chunks = [c for c in chunks if c.get("usage")]
+    assert len(usage_chunks) == 1
+    assert usage_chunks[-1]["usage"] == {"prompt_tokens": 12,
+                                         "completion_tokens": 5,
+                                         "total_tokens": 17}
+
+
+def test_tool_stream_emits_name_then_reassemblable_argument_fragments():
+    t = StreamTranslator("m")
+    chunks = _drain(t, [
+        {"type": "message_start", "message": {"usage": {"input_tokens": 3}}},
+        {"type": "content_block_start", "index": 0,
+         "content_block": {"type": "tool_use", "id": "toolu_1", "name": "search"}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "input_json_delta", "partial_json": '{"q":'}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "input_json_delta", "partial_json": ' "cats"}'}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "message_delta", "delta": {"stop_reason": "tool_use"},
+         "usage": {"output_tokens": 9}},
+        {"type": "message_stop"},
+    ])
+    # the opening chunk names the tool
+    starts = [c for c in chunks if c["choices"]
+              and c["choices"][0]["delta"].get("tool_calls")
+              and c["choices"][0]["delta"]["tool_calls"][0]["function"].get("name")]
+    assert starts[0]["choices"][0]["delta"]["tool_calls"][0]["id"] == "toolu_1"
+    # fragments concatenate into valid JSON, exactly as an OpenAI client does
+    args = "".join(
+        tc["function"].get("arguments", "")
+        for c in chunks if c["choices"]
+        for tc in c["choices"][0]["delta"].get("tool_calls", []))
+    assert json.loads(args) == {"q": "cats"}
+    finishes = [c["choices"][0]["finish_reason"] for c in chunks
+                if c["choices"] and c["choices"][0].get("finish_reason")]
+    assert finishes == ["tool_calls"]
+
+
+def test_thinking_deltas_are_dropped_and_counted():
+    t = StreamTranslator("m")
+    chunks = _drain(t, [
+        {"type": "message_start", "message": {"usage": {"input_tokens": 1}}},
+        {"type": "content_block_start", "index": 0,
+         "content_block": {"type": "thinking"}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "thinking_delta", "thinking": "secret"}},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+         "usage": {"output_tokens": 2}},
+        {"type": "message_stop"},
+    ])
+    assert "secret" not in json.dumps(chunks)
+    assert t.thinking_blocks == 1
+
+
+def test_delta_for_an_unknown_block_index_is_ignored_not_fatal():
+    t = StreamTranslator("m")
+    chunks = _drain(t, [
+        {"type": "message_start", "message": {"usage": {"input_tokens": 1}}},
+        {"type": "content_block_delta", "index": 7,
+         "delta": {"type": "input_json_delta", "partial_json": "{}"}},
+        {"type": "message_stop"},
+    ])
+    assert isinstance(chunks, list)   # no exception raised
+
+
+def test_emitted_stream_is_parseable_by_the_existing_usage_parser():
+    from gateway.providers import parse_stream_usage
+
+    t = StreamTranslator("m")
+    chunks = _drain(t, [
+        {"type": "message_start", "message": {"usage": {"input_tokens": 21}}},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+         "usage": {"output_tokens": 4}},
+        {"type": "message_stop"},
+    ])
+    wire = b"".join(b"data: " + json.dumps(c).encode() + b"\n\n" for c in chunks)
+    wire += b"data: [DONE]\n\n"
+    assert parse_stream_usage(wire) == {"prompt_tokens": 21,
+                                        "completion_tokens": 4,
+                                        "total_tokens": 25}
+
+
+def test_malformed_stream_events_degrade_instead_of_raising():
+    # Upstream SSE is no more trusted than a client body, and these are the same
+    # shapes the non-streaming path already guards against -- only now they
+    # arrive one event at a time, where a raise aborts a stream mid-flight and
+    # loses the usage chunk the ledger settles on.
+    t = StreamTranslator("m")
+    chunks = _drain(t, [
+        {"type": "message_start", "message": {"usage": {"input_tokens": "abc"}}},
+        {"type": "message_start", "message": {"usage": 7}},
+        {"type": "message_start", "message": [1]},
+        {"type": "content_block_start", "index": 0, "content_block": "x"},
+        {"type": "content_block_start", "index": [],
+         "content_block": {"type": "tool_use"}},
+        {"type": "content_block_delta", "index": 0, "delta": "oops"},
+        {"type": "content_block_delta", "index": [],
+         "delta": {"type": "input_json_delta", "partial_json": "{}"}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "text_delta", "text": {"not": "a string"}}},
+        {"type": "message_delta", "delta": "x", "usage": {"output_tokens": "x"}},
+        {"type": "message_delta", "delta": {"stop_reason": ["end_turn"]}},
+        {},
+    ])
+    assert (t.input_tokens, t.output_tokens) == (0, 0)
+    assert chunks[-1]["usage"] == {"prompt_tokens": 0, "completion_tokens": 0,
+                                   "total_tokens": 0}
+    assert chunks[-2]["choices"][0]["finish_reason"] == "stop"
+    # whatever survives stays string-shaped, so a client can still concatenate it
+    for chunk in chunks:
+        for choice in chunk["choices"]:
+            for key in ("content", "role"):
+                assert isinstance(choice["delta"].get(key, ""), str)
+            for call in choice["delta"].get("tool_calls", []):
+                for key in ("name", "arguments"):
+                    assert isinstance(call["function"].get(key, ""), str)

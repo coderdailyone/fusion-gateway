@@ -207,3 +207,153 @@ def from_anthropic_response(resp: dict, model: str) -> dict:
         "usage": {"prompt_tokens": prompt, "completion_tokens": completion,
                   "total_tokens": prompt + completion},
     }
+
+
+def iter_sse_data(raw: bytes) -> Iterator[dict]:
+    """Yield the JSON object of every well-formed SSE `data:` line.
+
+    Anthropic also sends `event:` lines, but each data payload carries its own
+    "type", so the event lines are redundant. Malformed lines are skipped —
+    never fatal.
+    """
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:"):].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            obj = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            yield obj
+
+
+def _as_text(value: Any) -> str:
+    """An upstream string field, or "" when it is absent or not a string.
+
+    Every delta value the client concatenates has to be a string: a dict where
+    a fragment was expected would break the client's own reassembly, not ours."""
+    return value if isinstance(value, str) else ""
+
+
+def _block_key(index: Any) -> Any:
+    """Anthropic's content-block index, made safe to use as a dict key.
+
+    A missing index collapses to -1 so a stream that omits it still pairs a
+    block's start with its deltas; an unhashable one yields None, which is
+    never registered and never matches — an ignored fragment, not a TypeError."""
+    if index is None:
+        return -1
+    try:
+        hash(index)
+    except TypeError:
+        return None
+    return index
+
+
+class StreamTranslator:
+    """Anthropic SSE events -> OpenAI chat.completion.chunk objects.
+
+    Stateful on purpose: usage arrives split across `message_start`
+    (input_tokens) and `message_delta` (output_tokens), and Anthropic's
+    content-block indices must be mapped onto OpenAI's tool_calls[].index.
+    """
+
+    def __init__(self, model: str):
+        self.model = model
+        self.id = f"chatcmpl-{uuid.uuid4().hex}"
+        self.created = int(time.time())
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.thinking_blocks = 0
+        self._finish_reason: str | None = None
+        self._tool_index: dict[Any, int] = {}   # anthropic block idx -> tool_calls idx
+        self._next_tool_index = 0
+        self._role_sent = False
+
+    def _chunk(self, delta: dict, finish_reason: str | None = None) -> dict:
+        return {
+            "id": self.id, "object": "chat.completion.chunk",
+            "created": self.created, "model": self.model,
+            "choices": [{"index": 0, "delta": delta,
+                         "finish_reason": finish_reason}],
+        }
+
+    def feed(self, event: dict) -> list[dict]:
+        etype = event.get("type")
+        out: list[dict] = []
+
+        if etype == "message_start":
+            message = event.get("message")
+            usage = message.get("usage") if isinstance(message, dict) else None
+            if isinstance(usage, dict):
+                self.input_tokens = _token_count(usage.get("input_tokens"))
+            if not self._role_sent:
+                self._role_sent = True
+                out.append(self._chunk({"role": "assistant"}))
+
+        elif etype == "content_block_start":
+            block = event.get("content_block")
+            if not isinstance(block, dict):
+                block = {}
+            if block.get("type") == "tool_use":
+                idx = self._next_tool_index
+                self._next_tool_index += 1
+                key = _block_key(event.get("index"))
+                if key is not None:
+                    self._tool_index[key] = idx
+                out.append(self._chunk({"tool_calls": [{
+                    "index": idx, "id": _as_text(block.get("id")), "type": "function",
+                    "function": {"name": _as_text(block.get("name")), "arguments": ""},
+                }]}))
+            elif block.get("type") == "thinking":
+                self.thinking_blocks += 1
+
+        elif etype == "content_block_delta":
+            delta = event.get("delta")
+            if not isinstance(delta, dict):
+                delta = {}
+            dtype = delta.get("type")
+            if dtype == "text_delta":
+                out.append(self._chunk({"content": _as_text(delta.get("text"))}))
+            elif dtype == "input_json_delta":
+                key = _block_key(event.get("index"))
+                idx = self._tool_index.get(key) if key is not None else None
+                if idx is not None:      # unknown block index -> ignore, not fatal
+                    out.append(self._chunk({"tool_calls": [{
+                        "index": idx, "type": "function",
+                        "function": {"arguments": _as_text(delta.get("partial_json"))},
+                    }]}))
+            elif dtype == "thinking_delta":
+                pass                      # dropped: OpenAI has no field for it
+
+        elif etype == "message_delta":
+            usage = event.get("usage")
+            if isinstance(usage, dict) and usage.get("output_tokens") is not None:
+                self.output_tokens = _token_count(usage.get("output_tokens"))
+            delta = event.get("delta")
+            reason = delta.get("stop_reason") if isinstance(delta, dict) else None
+            if isinstance(reason, str) and reason:
+                self._finish_reason = _STOP_REASON_MAP.get(reason, "stop")
+
+        return out
+
+    def finish(self) -> list[dict]:
+        """Terminal chunks: finish_reason, then a usage-bearing chunk.
+
+        The usage chunk is what gateway.providers.parse_stream_usage() finds,
+        which is how settle() bills real tokens for an Anthropic upstream.
+        """
+        out = [self._chunk({}, finish_reason=self._finish_reason or "stop")]
+        usage_chunk = {
+            "id": self.id, "object": "chat.completion.chunk",
+            "created": self.created, "model": self.model, "choices": [],
+            "usage": {"prompt_tokens": self.input_tokens,
+                      "completion_tokens": self.output_tokens,
+                      "total_tokens": self.input_tokens + self.output_tokens},
+        }
+        out.append(usage_chunk)
+        return out
