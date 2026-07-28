@@ -65,3 +65,69 @@ on `open.bigmodel.cn/api/paas/v4` returns error `1113` (no balance / no resource
 pack), surfacing as `502 upstream_exhausted`. This reproduces the M2c finding.
 `configs/gateway.toml` now serves **glm-4.5-flash**, which works on the same
 endpoint and is priced at 0 pending a paid plan.
+
+## Smoke executed 2026-07-28 — glm-5.2 over the Anthropic wire (M7)
+
+The M7 adapter's paid live gate. Gateway started locally with real provider
+keys; `configs/gateway.toml` now carries a **second** GLM provider,
+`glm_anthropic` (`wire = "anthropic"`), rather than a `wire` flip on the
+existing `glm` block — flipping that one would have rerouted `glm-4.5-flash`,
+which is `deepseek-chat`'s fallback, onto a wire its endpoint does not speak.
+
+### Non-streaming (`scripts/smoke.py`, every configured model)
+
+| model | returned | status | latency |
+|---|---|---|---|
+| deepseek-chat | deepseek-chat | 200 | 1172 ms |
+| glm-4.5-flash | glm-4.5-flash | 200 | 9328 ms |
+| **glm-5.2** | **glm-5.2** | **200** | **849 ms** |
+
+Ledger `consumed_usd` delta: **$0.000017**.
+
+### The billing claim, verified
+
+Every glm-5.2 row settled with `usage_source='reported'` — real translated
+counts, not estimates:
+
+| # | call | in | out | actual_usd |
+|---|---|---:|---:|---:|
+| 3 | non-streaming | 11 | 2 | $0.000011 |
+| 4 | streaming | 9 | 9 | $0.0000252 |
+| 5 | tool call, non-streaming | 157 | 12 | $0.0001206 |
+| 6 | tool call, streaming | 157 | 12 | $0.0001206 |
+
+All 6 ledger rows reached `settled`; none stranded in a consuming state. Total
+outlay for the whole gate: **$0.000283**.
+
+### Streaming
+
+`stream: true` to glm-5.2 returned 11 chunks, every one `"chat.completion.chunk"`,
+reassembling to `1, 2, 3.`, `finish_reason: "stop"`, then a usage-bearing chunk
+and `data: [DONE]`. The existing OpenAI-wire `parse_stream_usage()` parses that
+chunk unchanged — `{'prompt_tokens': 9, 'completion_tokens': 9, 'total_tokens': 18}` —
+which is what lets `settle()` bill a translated stream with no ledger change.
+
+### Tool calls, both directions, live
+
+Non-streaming returned `finish_reason: "tool_calls"` with
+`get_weather({"city": "Beijing"})`. Streaming delivered the same call as
+`input_json_delta` fragments that reassembled into valid JSON
+(`{"city":"Beijing"}`) — the fragment-reassembly path had until now only been
+exercised against recorded fixtures.
+
+### Raw upstream usage
+
+```json
+{"input_tokens": 11, "output_tokens": 2, "cache_read_input_tokens": 0,
+ "server_tool_use": {"web_search_requests": 0}, "service_tier": "standard"}
+```
+
+`cache_read_input_tokens` is **0**, so M7's decision to read only
+`input_tokens`/`output_tokens` costs nothing today. If it ever goes non-zero we
+would *under*-bill (Anthropic excludes cache reads from `input_tokens`), so this
+field is worth re-checking before glm-5.2 carries prompt-cached traffic.
+
+**Prices are unverified.** `in 0.60 / out 2.20 USD-per-Mtok` mirror
+`configs/pricing.toml`, still flagged `VERIFY` against Zhipu's published table.
+They drive the ledger and therefore the budget killswitch — confirm them before
+real traffic.
