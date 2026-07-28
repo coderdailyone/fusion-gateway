@@ -25,6 +25,14 @@ EVENTS = [
 ]
 BODY = b"".join(b"event: x\ndata: " + json.dumps(e).encode() + b"\n\n"
                 for e in EVENTS)
+# WHATWG SSE permits CRLF; the same exchange, framed that way.
+CRLF_BODY = b"".join(b"event: x\r\ndata: " + json.dumps(e).encode() + b"\r\n\r\n"
+                     for e in EVENTS)
+# Ends on message_delta -- the event carrying output_tokens -- so a body cut
+# short here loses the only count that makes the ledger bill real tokens.
+BODY_NO_TRAILING_BLANK = b"".join(
+    b"event: x\ndata: " + json.dumps(e).encode() + b"\n\n"
+    for e in EVENTS[:4]).rstrip(b"\n")
 
 
 def _adapter(handler, monkeypatch):
@@ -186,8 +194,11 @@ async def test_stream_reassembles_data_lines_split_across_byte_chunks(monkeypatc
 
 @pytest.mark.anyio
 async def test_stream_survives_a_body_with_no_trailing_blank_line(monkeypatch):
+    """The last event of a body that stops without its terminating blank line
+    is still a real event. Here that event is message_delta, so dropping the
+    residual buffer would lose output_tokens entirely."""
     def handler(request):
-        return httpx.Response(200, content=_sliced(BODY.rstrip(b"\n"), 7),
+        return httpx.Response(200, content=_sliced(BODY_NO_TRAILING_BLANK, 7),
                               headers={"content-type": "text/event-stream"})
 
     collected = await _collect(_adapter(handler, monkeypatch).chat_stream(
@@ -195,6 +206,65 @@ async def test_stream_survives_a_body_with_no_trailing_blank_line(monkeypatch):
 
     assert parse_stream_usage(collected) == {
         "prompt_tokens": 8, "completion_tokens": 3, "total_tokens": 11}
+
+
+@pytest.mark.anyio
+async def test_stream_delivers_crlf_framed_events_before_the_body_ends(monkeypatch):
+    """Splitting on b"\\n\\n" alone never matches a \\r\\n\\r\\n-framed stream, so
+    the whole body accumulates in RAM and the client sees nothing until EOF --
+    a hang, as far as an SSE client with an idle timeout is concerned."""
+    slices = [CRLF_BODY[i:i + 7] for i in range(0, len(CRLF_BODY), 7)]
+    produced = {"n": 0}
+
+    async def gen():
+        for part in slices:
+            produced["n"] += 1
+            yield part
+
+    def handler(request):
+        return httpx.Response(200, content=gen(),
+                              headers={"content-type": "text/event-stream"})
+
+    collected = bytearray()
+    first_chunk_after = None
+    async for chunk in _adapter(handler, monkeypatch).chat_stream(
+            "m", {"messages": [{"role": "user", "content": "hi"}]}):
+        if first_chunk_after is None:
+            first_chunk_after = produced["n"]
+        collected.extend(chunk)
+
+    assert first_chunk_after < len(slices), "buffered the whole body before emitting"
+    assert parse_stream_usage(bytes(collected)) == {
+        "prompt_tokens": 8, "completion_tokens": 3, "total_tokens": 11}
+    assert "".join(o["choices"][0]["delta"].get("content", "")
+                   for o in _data_objects(bytes(collected)) if o["choices"]) == "hi"
+
+
+@pytest.mark.anyio
+async def test_stream_omits_usage_when_upstream_never_reported_output_tokens(monkeypatch):
+    """A stream that ends cleanly before message_delta never reported an output
+    count. Emitting {"completion_tokens": 0} would be taken by app.py as
+    authoritative and bill zero for text the client actually received; with no
+    usage chunk at all it degrades to an estimate, like the OpenAI path."""
+    body = b"".join(b"event: x\ndata: " + json.dumps(e).encode() + b"\n\n"
+                    for e in EVENTS[:3] + [{"type": "message_stop"}])
+
+    def handler(request):
+        return httpx.Response(200, content=body,
+                              headers={"content-type": "text/event-stream"})
+
+    collected = await _collect(_adapter(handler, monkeypatch).chat_stream(
+        "m", {"messages": [{"role": "user", "content": "hi"}]}))
+
+    assert parse_stream_usage(collected) is None
+    objs = _data_objects(collected)
+    assert not [o for o in objs if "usage" in o]
+    # The stream is still well-formed: content, one finish_reason, then [DONE].
+    assert "".join(o["choices"][0]["delta"].get("content", "")
+                   for o in objs if o["choices"]) == "hi"
+    assert len([o for o in objs
+                if any(c.get("finish_reason") for c in o.get("choices", []))]) == 1
+    assert collected.decode().rstrip().endswith("data: [DONE]")
 
 
 @pytest.mark.anyio
@@ -281,3 +351,50 @@ async def test_stream_error_event_before_the_first_byte_is_a_provider_error(monk
         async for _ in agen:
             pass
     assert exc.value.kind == "http"
+
+
+def _error_stream(prefix_events) -> bytes:
+    return b"".join(b"event: x\ndata: " + json.dumps(e).encode() + b"\n\n"
+                    for e in prefix_events) + (
+        b'event: error\ndata: {"type":"error",'
+        b'"error":{"message":"overloaded"}}\n\n')
+
+
+@pytest.mark.anyio
+async def test_stream_error_after_the_first_byte_terminates_the_stream_cleanly(monkeypatch):
+    """Returning bare on a mid-stream error gives the client an abrupt EOF with
+    no finish_reason and no [DONE] -- indistinguishable from a dropped
+    connection. Signal the failure, close the protocol, then stop."""
+    def handler(request):
+        return httpx.Response(200, content=_error_stream(EVENTS[:3]),
+                              headers={"content-type": "text/event-stream"})
+
+    collected = await _collect(_adapter(handler, monkeypatch).chat_stream(
+        "m", {"messages": [{"role": "user", "content": "hi"}]}))
+
+    text = collected.decode()
+    objs = _data_objects(collected)
+    errors = [o for o in objs if o.get("error")]
+    assert [o["error"]["type"] for o in errors] == ["upstream_error"]
+    assert len([o for o in objs
+                if any(c.get("finish_reason") for c in o.get("choices", []))]) == 1
+    assert text.rstrip().endswith("data: [DONE]") and text.count("data: [DONE]") == 1
+    # No output count ever arrived, so usage stays unknown rather than zero.
+    assert parse_stream_usage(collected) is None
+
+
+@pytest.mark.anyio
+async def test_stream_error_after_a_complete_usage_report_keeps_the_real_counts(monkeypatch):
+    """When the upstream did report both counts before failing, those banked
+    numbers must survive into the terminating usage chunk -- the error object
+    carries no `usage` key, so it cannot displace them in parse_stream_usage."""
+    def handler(request):
+        return httpx.Response(200, content=_error_stream(EVENTS[:4]),
+                              headers={"content-type": "text/event-stream"})
+
+    collected = await _collect(_adapter(handler, monkeypatch).chat_stream(
+        "m", {"messages": [{"role": "user", "content": "hi"}]}))
+
+    assert parse_stream_usage(collected) == {
+        "prompt_tokens": 8, "completion_tokens": 3, "total_tokens": 11}
+    assert collected.decode().rstrip().endswith("data: [DONE]")

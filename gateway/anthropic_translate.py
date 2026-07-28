@@ -273,6 +273,11 @@ class StreamTranslator:
         self.input_tokens = 0
         self.output_tokens = 0
         self.thinking_blocks = 0
+        # Whether the stream ever *stated* each count. "Never counted" and
+        # "counted zero" are different answers, and finish() must not turn the
+        # first into the second -- see the note there.
+        self._input_reported = False
+        self._output_reported = False
         self._finish_reason: str | None = None
         self._tool_index: dict[Any, int] = {}   # anthropic block idx -> tool_calls idx
         self._next_tool_index = 0
@@ -296,6 +301,8 @@ class StreamTranslator:
             message = event.get("message")
             usage = message.get("usage") if isinstance(message, dict) else None
             if isinstance(usage, dict):
+                if usage.get("input_tokens") is not None:
+                    self._input_reported = True
                 self.input_tokens = _token_count(usage.get("input_tokens"))
             if not self._role_sent:
                 self._role_sent = True
@@ -339,6 +346,7 @@ class StreamTranslator:
         elif etype == "message_delta":
             usage = event.get("usage")
             if isinstance(usage, dict) and usage.get("output_tokens") is not None:
+                self._output_reported = True
                 self.output_tokens = _token_count(usage.get("output_tokens"))
             delta = event.get("delta")
             reason = delta.get("stop_reason") if isinstance(delta, dict) else None
@@ -352,8 +360,18 @@ class StreamTranslator:
 
         The usage chunk is what gateway.providers.parse_stream_usage() finds,
         which is how settle() bills real tokens for an Anthropic upstream.
+
+        It is emitted only when the stream actually stated BOTH counts. A
+        stream that ends before message_delta never stated an output count, and
+        app.py consumes the usage dict wholesale as usage_source="reported" --
+        so a half-report would bill a confident zero for one direction. With no
+        usage chunk, parse_stream_usage returns None and app.py falls back to an
+        estimate, which is how the OpenAI path already behaves when usage is
+        missing. An explicit zero still counts as stated, and is still reported.
         """
         out = [self._chunk({}, finish_reason=self._finish_reason or "stop")]
+        if not (self._input_reported and self._output_reported):
+            return out
         usage_chunk = {
             "id": self.id, "object": "chat.completion.chunk",
             "created": self.created, "model": self.model, "choices": [],

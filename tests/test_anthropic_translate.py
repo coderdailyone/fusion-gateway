@@ -498,3 +498,61 @@ def test_two_tool_blocks_map_onto_dense_openai_indices_without_cross_talk():
                                     + tc["function"].get("arguments", ""))
     assert json.loads(reassembled[0]) == {"q": "cats"}
     assert json.loads(reassembled[1]) == {"url": "u"}
+
+
+def test_finish_omits_usage_when_the_stream_never_reported_an_output_count():
+    # A stream can end cleanly after its content deltas but before message_delta
+    # -- the only event that carries output_tokens. Emitting completion_tokens: 0
+    # there is not "we counted zero", it is "we never counted", and app.py takes
+    # a usage chunk as authoritative (usage_source="reported"). That bills zero
+    # for text the client actually received. With no usage chunk at all,
+    # parse_stream_usage returns None and app.py degrades to an estimate,
+    # exactly like the OpenAI path.
+    t = StreamTranslator("m")
+    chunks = _drain(t, [
+        {"type": "message_start", "message": {"usage": {"input_tokens": 8}}},
+        {"type": "content_block_start", "index": 0,
+         "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "text_delta", "text": "hi"}},
+        {"type": "message_stop"},
+    ])
+    assert not [c for c in chunks if "usage" in c]
+    # the stream is still terminated properly
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+def test_finish_omits_usage_when_no_usage_event_arrived_at_all():
+    t = StreamTranslator("m")
+    chunks = _drain(t, [
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "text_delta", "text": "hi"}},
+        {"type": "message_stop"},
+    ])
+    assert not [c for c in chunks if "usage" in c]
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+def test_finish_reports_an_explicitly_zero_output_count():
+    # "Counted, and it was zero" is a real answer and must still be billed as
+    # reported -- only the never-counted case may withhold the usage chunk.
+    t = StreamTranslator("m")
+    chunks = _drain(t, [
+        {"type": "message_start", "message": {"usage": {"input_tokens": 8}}},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+         "usage": {"output_tokens": 0}},
+    ])
+    assert chunks[-1]["usage"] == {"prompt_tokens": 8, "completion_tokens": 0,
+                                   "total_tokens": 8}
+
+
+def test_finish_omits_usage_when_only_the_output_count_arrived():
+    # The mirror image: prompt_tokens: 0 reported as authoritative would
+    # under-bill the whole prompt. app.py consumes the usage dict wholesale,
+    # so a half-report is not usable either way.
+    t = StreamTranslator("m")
+    chunks = _drain(t, [
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+         "usage": {"output_tokens": 4}},
+    ])
+    assert not [c for c in chunks if "usage" in c]

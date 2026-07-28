@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import AsyncIterator
 
 import httpx
@@ -20,6 +21,14 @@ from gateway.anthropic_translate import (ANTHROPIC_VERSION, StreamTranslator,
                                          iter_sse_data, to_anthropic_request)
 from gateway.config import ProviderCfg
 from gateway.providers import ProviderError
+
+
+# A blank line ends an SSE event. WHATWG allows either terminator, and an
+# upstream that frames with CRLF contains no b"\n\n" at all — matching only LF
+# would buffer its entire body in RAM and deliver nothing until EOF, which an
+# SSE client with an idle timeout sees as a hang. A newline never appears raw
+# inside a `data:` payload (JSON escapes it), so this cannot split an event.
+_EVENT_END = re.compile(rb"\r?\n\r?\n")
 
 
 async def _iter_event_blocks(resp: httpx.Response) -> AsyncIterator[bytes]:
@@ -35,8 +44,11 @@ async def _iter_event_blocks(resp: httpx.Response) -> AsyncIterator[bytes]:
     buffer = b""
     async for raw in resp.aiter_bytes():
         buffer += raw
-        while b"\n\n" in buffer:
-            block, buffer = buffer.split(b"\n\n", 1)
+        while True:
+            match = _EVENT_END.search(buffer)
+            if match is None:
+                break
+            block, buffer = buffer[:match.start()], buffer[match.end():]
             yield block + b"\n\n"
     if buffer.strip():
         # Body ended without a terminating blank line. Emit the remainder
@@ -115,14 +127,23 @@ class AnthropicAdapter:
                         if event.get("type") == "error":
                             if not yielded:
                                 raise ProviderError(self.cfg.name, "http")
+                            # Bytes are already out, so falling back is unsafe.
+                            # Tell the client what happened and close the
+                            # protocol properly: a bare return would leave it
+                            # with no finish_reason and no [DONE], which is
+                            # indistinguishable from a dropped connection.
+                            yield b'data: {"error": {"type": "upstream_error"}}\n\n'
+                            for chunk in translator.finish():
+                                yield _wire(chunk)
+                            yield b"data: [DONE]\n\n"
                             return
                         for chunk in translator.feed(event):
                             yielded = True
                             yield _wire(chunk)
-                # finish() is NOT idempotent — exactly one call, and every
-                # chunk it returns is emitted. The last one carries usage in a
-                # chunk whose choices list is empty; filtering that out as
-                # "no content" is what makes a stream bill zero.
+                # finish() is NOT idempotent — exactly one call on each exit
+                # path, and every chunk it returns is emitted. The usage chunk
+                # it may append has an EMPTY choices list; filtering that out
+                # as "no content" is what makes a stream bill zero.
                 for chunk in translator.finish():
                     yielded = True
                     yield _wire(chunk)
