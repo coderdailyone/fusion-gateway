@@ -33,6 +33,7 @@ rsync -az --delete \
   --exclude '.superpowers' \
   --exclude 'runs' --exclude 'evaluator/runs' \
   --exclude '.pytest_cache' --exclude '*.egg-info' \
+  --exclude 'data' \
   ./ "${HOST}:${DEST}/"
 
 echo "→ building venv + installing on ${HOST}"
