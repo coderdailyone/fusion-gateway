@@ -9,7 +9,20 @@ def test_loads_models_and_providers():
     assert cfg.models["deepseek-chat"].fallback == ("glm-4.5-flash",)
     assert cfg.providers["glm"].api_key_env == "GLM_API_KEY"
     assert cfg.default_model in cfg.models
-    assert cfg.budget_caps[cfg.active_budget] == 5.0
+    # M1 runs deliberately uncapped: cap_usd is omitted, which loads as None.
+    assert cfg.budget_caps[cfg.active_budget] is None
+
+def test_cap_usd_is_optional_and_a_stated_cap_still_loads(tmp_path):
+    base = GOOD.read_text()
+    capped = base.replace("[budgets.M1]", "[budgets.M1]\ncap_usd = 12.5")
+    p = tmp_path / "g.toml"; p.write_text(capped)
+    assert load_config(p).budget_caps["M1"] == 12.5
+
+def test_active_budget_without_a_table_is_rejected(tmp_path):
+    bad = GOOD.read_text().replace("[budgets.M1]", "[budgets.other]")
+    p = tmp_path / "g.toml"; p.write_text(bad)
+    with pytest.raises(ConfigError):
+        load_config(p)
 
 def test_unknown_fallback_rejected(tmp_path):
     bad = GOOD.read_text().replace('fallback = ["glm-4.5-flash"]', 'fallback = ["nope"]')

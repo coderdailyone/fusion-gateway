@@ -389,6 +389,14 @@ def create_app(
         counts = {row["status"]: row["c"] for row in rows}
         return {"ledger": ledger.status(), "requests": counts}
 
+    @app.post("/admin/killswitch/trip")
+    async def killswitch_trip(principal: str = Depends(require_admin)):
+        # With no cap configured the automatic trip never fires, so this is the
+        # operator's only way to stop spending short of stopping the service.
+        ledger.trip()
+        events.append("admin", "killswitch.tripped", {"by": principal})
+        return {"ok": True, "state": ledger.status()["state"]}
+
     @app.post("/admin/killswitch/release")
     async def killswitch_release(principal: str = Depends(require_admin)):
         ledger.release()

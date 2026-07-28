@@ -2,7 +2,9 @@
 active = "M1"
 
 [budgets.M1]
-cap_usd = 5.0
+# No cap_usd: deliberately unbounded. The automatic trip is off, so the only
+# brake is POST /admin/killswitch/trip (admin token). Watch spend with
+# scripts/rollup.py -- nothing will stop it for you.
 
 [providers.deepseek]
 base_url = "https://api.deepseek.com"
@@ -20,6 +22,10 @@ api_key_env = "GLM_API_KEY"
 base_url = "https://open.bigmodel.cn/api/anthropic"
 api_key_env = "GLM_API_KEY"
 wire = "anthropic"
+
+[providers.kimi]
+base_url = "https://api.kimi.com/coding/v1"
+api_key_env = "MOONSHOT_API_KEY"
 
 [models."deepseek-chat"]
 provider = "deepseek"
@@ -47,6 +53,16 @@ upstream_model = "glm-5.2"
 # table — they set billing, so confirm before this model carries real traffic.
 in_usd_per_mtok = 0.60
 out_usd_per_mtok = 2.20
+fallback = ["deepseek-chat"]
+
+[models."kimi-k3"]
+provider = "kimi"
+# The model id on this endpoint is literally "k3", not "kimi-k3".
+upstream_model = "k3"
+# Prices mirror configs/pricing.toml, still unverified against Moonshot's
+# published table. A reasoning model: expect ~30s latency and heavy output.
+in_usd_per_mtok = 0.60
+out_usd_per_mtok = 2.50
 fallback = ["deepseek-chat"]
 
 [policy]

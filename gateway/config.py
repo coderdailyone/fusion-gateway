@@ -22,7 +22,7 @@ class ModelCfg:
 class Config:
     providers: dict[str, ProviderCfg]; models: dict[str, ModelCfg]
     policy_version: str; default_model: str
-    active_budget: str; budget_caps: dict[str, float]
+    active_budget: str; budget_caps: dict[str, float | None]   # None == no cap
 
 def load_config(path: Path) -> Config:
     data = tomllib.loads(Path(path).read_text())
@@ -46,8 +46,13 @@ def load_config(path: Path) -> Config:
     pol = data["policy"]
     if pol["default_model"] not in models:
         raise ConfigError("policy.default_model not in models")
-    caps = {k: float(v["cap_usd"]) for k, v in data["budgets"].items()}
+    # cap_usd omitted == no ceiling. Kept explicit rather than defaulted to a
+    # number, so "unbounded" is something an operator writes on purpose.
+    caps = {
+        k: (float(v["cap_usd"]) if "cap_usd" in v else None)
+        for k, v in data["budgets"].items()
+    }
     if data["budget"]["active"] not in caps:
-        raise ConfigError("active budget has no cap")
+        raise ConfigError("active budget has no [budgets.<name>] table")
     return Config(providers, models, pol["version"], pol["default_model"],
                   data["budget"]["active"], caps)

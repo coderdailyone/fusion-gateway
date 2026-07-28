@@ -23,7 +23,7 @@ class Ledger:
         self,
         store: Store,
         clock: Clock,
-        cap_usd: float,
+        cap_usd: float | None,
         budget_name: str,
         alert_cb=None,
     ):
@@ -42,11 +42,24 @@ class Ledger:
                     "VALUES (?, ?, 'active', ?)",
                     (budget_name, cap_usd, self.clock.now().isoformat()),
                 )
-                self.store.conn.commit()
+            else:
+                # The config is authoritative for the CAP; the row stays the
+                # runtime source of truth. Without this reconcile the row was
+                # written once and never revisited, so editing cap_usd in
+                # gateway.toml silently did nothing on any host that had
+                # already run -- an operator raising the cap would go on
+                # tripping at the old one. `state` is deliberately NOT synced:
+                # only an explicit release may clear a trip, never a restart.
+                self.store.conn.execute(
+                    "UPDATE budgets SET cap_usd=?, updated_at=? WHERE name=?",
+                    (cap_usd, self.clock.now().isoformat(), budget_name),
+                )
+            self.store.conn.commit()
 
         # cap_usd/state always sourced from the budgets row (single source of
         # truth); this mirrors what was upserted (or already present) above.
-        self._alerted = self.consumed() >= ALERT_THRESHOLD * self.cap_usd
+        cap = self.cap_usd
+        self._alerted = cap is not None and self.consumed() >= ALERT_THRESHOLD * cap
 
     # -- internal helpers (assume caller already holds store.lock) ----------
 
@@ -100,7 +113,12 @@ class Ledger:
         with self.store.lock:
             budget = self._budget_row_locked()
             consumed = self._consumed_locked()
-            if budget["state"] == "tripped" or consumed + cost > budget["cap_usd"]:
+            # cap_usd NULL means "no ceiling": the automatic trip is off, but a
+            # budget tripped by hand still blocks -- an unbounded budget must
+            # not be an unstoppable one.
+            cap = budget["cap_usd"]
+            over_cap = cap is not None and consumed + cost > cap
+            if budget["state"] == "tripped" or over_cap:
                 self.store.conn.execute(
                     "UPDATE budgets SET state='tripped', updated_at=? WHERE name=?",
                     (self.clock.now().isoformat(), self.budget_name),
@@ -120,9 +138,8 @@ class Ledger:
             self.store.conn.commit()
             entry_id = cursor.lastrowid
             consumed_now = self._consumed_locked()
-            cap = budget["cap_usd"]
 
-        if not self._alerted and consumed_now >= ALERT_THRESHOLD * cap:
+        if cap is not None and not self._alerted and consumed_now >= ALERT_THRESHOLD * cap:
             self._alerted = True
             if self.alert_cb is not None:
                 self.alert_cb(consumed_now, cap)
@@ -167,6 +184,15 @@ class Ledger:
         with self.store.lock:
             self.store.conn.execute(
                 "UPDATE ledger SET state='failed' WHERE id=?", (entry_id,)
+            )
+            self.store.conn.commit()
+
+    def trip(self) -> None:
+        """Stop spending now. With no cap configured this is the only brake."""
+        with self.store.lock:
+            self.store.conn.execute(
+                "UPDATE budgets SET state='tripped', updated_at=? WHERE name=?",
+                (self.clock.now().isoformat(), self.budget_name),
             )
             self.store.conn.commit()
 
