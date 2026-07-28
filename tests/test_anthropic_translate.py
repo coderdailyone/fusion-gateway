@@ -607,6 +607,24 @@ def test_a_message_delta_without_an_input_count_keeps_the_one_from_message_start
                                    "total_tokens": 17}
 
 
+def test_a_message_start_without_an_input_count_keeps_a_banked_count():
+    # The mirror of the case above. A second message_start (or one carrying
+    # cache counters but no input_tokens) must not zero a count already
+    # stated: doing so bills prompt_tokens: 0 as *reported*, which reads as
+    # authoritative and silently under-bills the whole prompt.
+    t = StreamTranslator("m")
+    chunks = _drain(t, [
+        {"type": "message_delta", "delta": {},
+         "usage": {"input_tokens": 900, "output_tokens": 400}},
+        {"type": "message_start",
+         "message": {"usage": {"cache_read_input_tokens": 64}}},
+        {"type": "message_stop"},
+    ])
+    assert (t.input_tokens, t.output_tokens) == (900, 400)
+    assert chunks[-1]["usage"] == {"prompt_tokens": 900, "completion_tokens": 400,
+                                   "total_tokens": 1300}
+
+
 def test_finish_omits_usage_when_only_the_output_count_arrived():
     # The mirror image: prompt_tokens: 0 reported as authoritative would
     # under-bill the whole prompt. app.py consumes the usage dict wholesale,

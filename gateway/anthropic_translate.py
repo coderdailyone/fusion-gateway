@@ -313,9 +313,13 @@ class StreamTranslator:
             message = event.get("message")
             usage = message.get("usage") if isinstance(message, dict) else None
             if isinstance(usage, dict):
+                # Same rule as message_delta below: only a STATED count writes.
+                # An unconditional write lets a usage-less (or duplicate, or
+                # out-of-order) message_start zero a count already banked, and
+                # the stream still reports it as authoritative.
                 if usage.get("input_tokens") is not None:
                     self._input_reported = True
-                self.input_tokens = _token_count(usage.get("input_tokens"))
+                    self.input_tokens = _token_count(usage.get("input_tokens"))
             if not self._role_sent:
                 self._role_sent = True
                 out.append(self._chunk({"role": "assistant"}))
