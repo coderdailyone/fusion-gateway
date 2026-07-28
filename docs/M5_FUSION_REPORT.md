@@ -120,3 +120,61 @@ are frozen at `evaluator/runs/m5_fusion/fused_full/fused.jsonl`. Re-scoring and
 gate-curve simulation cost **$0**. Driver: `scripts/run_fusion.py`
 (`oracle` | `run`); metrics: `scripts/fusion_report.py`.
 Design: `docs/superpowers/specs/2026-07-25-domestic-fusion-panel-design.md`.
+
+## Follow-up: two attempts to break the ceiling (2026-07-25)
+
+The first run's diagnosis was "the fuser is the bottleneck, `break` is the
+lever." Two cheap interventions were tested by re-running fusion over the same
+frozen candidates:
+
+- **v2-glm** — added an explicit rule: *if a majority of candidates give the same
+  final answer and no review objects, COPY it verbatim; do not rewrite.*
+- **v2-kimi** — same rule, but with **kimi-k3** (the strongest panel member,
+  +4.6 points over glm-5.2 as a solver) as the fuser.
+
+Common set of 995 tasks, official scoring:
+
+| strategy | correct | accuracy | 95% CI | vs kimi-k3 | fix / break / net | cost |
+|---|---:|---:|---|---|---|---:|
+| kimi-k3 *(best single)* | 886 | 0.8905 | [0.8695, 0.9084] | — | — | — |
+| v1 glm *(no rule)* | 893 | 0.8975 | [0.8771, 0.9148] | p=0.427 | 32 / 25 / **+7** | $0.1349 |
+| **v2 glm (+majority-copy)** | 893 | **0.8975** | [0.8771, 0.9148] | p=0.391 | 28 / 21 / **+7** | **$0.0311** |
+| v2 kimi (+majority-copy) | 889 | 0.8935 | [0.8728, 0.9111] | p=0.784 | 28 / 25 / +3 | $0.0305 |
+
+**Neither intervention moved the needle, and the reason is informative.**
+
+1. **The majority-copy rule worked as designed — and that wasn't enough.**
+   `break` fell 25 → 21, exactly the intended effect. But `fix` fell 32 → 28 in
+   lockstep, leaving net gain unchanged at +7. Making the fuser more conservative
+   buys fewer broken answers at the price of fewer repaired ones. **`fix` and
+   `break` are coupled**: they are two faces of the same willingness to overrule
+   the panel. That is a real trade-off, not a prompt-tuning defect.
+2. **A stronger solver made a worse fuser.** kimi-k3 outscores glm-5.2 by 4.6
+   points as a solver, yet fusing with it was *worse* (net +3 vs +7) — it tends
+   to defend its own answer rather than synthesize others'. Fusing and solving
+   are different skills.
+3. **The win remains statistically insignificant** across all three variants
+   (p = 0.39–0.78).
+4. **Cost dropped 4×** ($0.135 → $0.031) because copying on agreement spends far
+   fewer output tokens — the rule is worth keeping on cost grounds alone.
+
+### Where this leaves the original goal
+
+On this 995-task common set the numbers land as follows against the frontier
+(opus 0.913 · gpt-5.5 0.905 · sonnet 0.898 · gpt-5.6-sol 0.894):
+
+- **"Domestic models reaching gpt-5.6 level" — achieved, and without fusion.**
+  kimi-k3 alone scores **0.8905**, above gpt-5.6-sol's 0.894.
+- **"Fusion pushing that to opus level" — not achieved.** Best fusion is
+  **0.8975** (above sonnet, near gpt-5.5), still 1.5 points under opus, and the
+  gain over the best single model is not significant.
+- The pool is not the limit (oracle 0.9308). The limit is that **an LLM fuser
+  cannot separate "answers worth overruling" from "answers worth keeping"** —
+  every gain in `fix` is paid for in `break`.
+
+**Recommendation:** stop tuning the fuser prompt; the coupling above says that
+path is exhausted. The remaining levers are (a) an *objective* arbiter where one
+exists — for code, run the tests and pick the candidate that passes, which is
+this project's proven verify-cascade rather than an LLM judgment call; or (b) a
+learned gate that fuses only where fusion has historically won. Both are
+different milestones, not variations of this one.

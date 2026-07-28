@@ -45,7 +45,8 @@ def _load_panel_frozen() -> dict[str, dict[str, str]]:
                 texts.setdefault(tid, text)
         merged[model] = texts
     return merged
-FUSER = "glm-5.2"
+import os
+FUSER = os.environ.get("M5_FUSER", "glm-5.2")  # domestic only
 FRONTIER_BAR = 0.894  # gpt-5.6-sol, M2c official scoring
 RUN_ROOT = Path("evaluator/runs/m5_fusion")
 

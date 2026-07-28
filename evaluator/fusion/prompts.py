@@ -68,8 +68,16 @@ def build_fusion_prompt(task, case, reviews) -> str:
         for target, v in sorted(verdicts.items()):
             lines.append(f"{reviewer} says {target} is {v.verdict}: {v.reason}")
     review_block = "\n".join(lines) if lines else "(no reviews available)"
+    # The dominant failure mode measured on the standard tier was `break` —
+    # fusion talking itself out of an answer the panel already had right (26 of
+    # 1055 tasks). The majority rule below is deliberately blunt: when the panel
+    # already agrees, copying is strictly better than rewriting.
     rules = [
-        "- If the candidates agree and no review objects, adopt that answer.",
+        "- If a majority of the candidates give the SAME final answer and no "
+        "review calls it wrong, COPY that answer verbatim. Do not rewrite, "
+        "reword, or 'improve' it — copying is the correct action here.",
+        "- Only depart from the majority answer when a review identifies a "
+        "concrete error in it.",
         "- If they disagree, decide using the specific objections raised, and "
         "write a corrected answer (you may combine correct parts of several).",
     ]
