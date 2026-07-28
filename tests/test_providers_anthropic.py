@@ -140,6 +140,58 @@ async def test_chat_rejects_an_unparseable_upstream_body(monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_chat_rejects_a_200_that_carries_an_error_body(monkeypatch):
+    """configs/gateway.toml records that this endpoint answers a balance failure
+    with HTTP 200 and an error object. Translated as a message it becomes a
+    'successful' completion with content: null, settled at $0.00 as *reported*,
+    with no fallback to deepseek -- the client gets nothing and the ledger
+    records that nothing happened."""
+    def handler(request):
+        return httpx.Response(200, json={
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": "1113 balance"}})
+
+    with pytest.raises(ProviderError) as exc:
+        await _adapter(handler, monkeypatch).chat(
+            "m", {"messages": [{"role": "user", "content": "hi"}]})
+    assert exc.value.kind == "http" and exc.value.status == 200
+
+
+@pytest.mark.anyio
+async def test_chat_rejects_a_200_whose_content_is_not_a_list(monkeypatch):
+    """A messages reply always carries a `content` array. Anything else is not a
+    message, and from_anthropic_response would quietly turn it into an empty
+    answer the ledger bills as a success."""
+    for body in ({"id": "msg_1", "stop_reason": "end_turn"},
+                 {"id": "msg_1", "content": "just a string"},
+                 {"id": "msg_1", "content": None},
+                 {"id": "msg_1", "content": {"type": "text", "text": "x"}}):
+        def handler(request, body=body):
+            return httpx.Response(200, json=body)
+
+        with pytest.raises(ProviderError) as exc:
+            await _adapter(handler, monkeypatch).chat(
+                "m", {"messages": [{"role": "user", "content": "hi"}]})
+        assert exc.value.kind == "http" and exc.value.status == 200, body
+
+
+@pytest.mark.anyio
+async def test_chat_accepts_an_empty_content_list(monkeypatch):
+    """`content: []` is a real, if unusual, message -- a list that happens to be
+    empty. The error guard must key on the shape, not on emptiness."""
+    def handler(request):
+        return httpx.Response(200, json={
+            "id": "msg_1", "content": [], "stop_reason": "end_turn",
+            "usage": {"input_tokens": 5, "output_tokens": 0}})
+
+    out = await _adapter(handler, monkeypatch).chat(
+        "m", {"messages": [{"role": "user", "content": "hi"}]})
+    assert out["choices"][0]["message"]["content"] is None
+    assert out["usage"] == {"prompt_tokens": 5, "completion_tokens": 0,
+                            "total_tokens": 5}
+
+
+@pytest.mark.anyio
 async def test_chat_timeout_and_network_map_to_provider_error_kinds(monkeypatch):
     def timeout(request):
         raise httpx.ReadTimeout("timed out", request=request)
@@ -287,6 +339,55 @@ async def test_stream_emits_exactly_one_finish_and_one_usage_chunk(monkeypatch):
     assert len(usages) == 1 and usages[0]["choices"] == []
     assert objs.index(usages[0]) == len(objs) - 1
     assert collected.decode().count("data: [DONE]") == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("body,ctype", [
+    (b"", "text/event-stream"),
+    (b'{"error": {"type": "invalid_request_error", "message": "1113"}}',
+     "application/json"),
+    (b"<html>502 Bad Gateway</html>", "text/html"),
+    (b"data: not-json\n\n", "text/event-stream"),
+])
+async def test_stream_body_with_no_anthropic_event_is_a_provider_error(
+        monkeypatch, body, ctype):
+    """finish() always emits at least a finish_reason chunk, so without this
+    guard chat_stream can never produce a zero-byte stream: an empty or non-SSE
+    200 becomes a well-formed, empty finish_reason:"stop" answer, billed by
+    estimate and logged as call.succeeded, with no fallback. app.py's
+    empty_stream guard is therefore dead on this wire and cannot catch it.
+
+    Nothing has been yielded at the point of the raise, so the
+    ProviderError-before-the-first-byte contract still holds."""
+    def handler(request):
+        return httpx.Response(200, content=body, headers={"content-type": ctype})
+
+    seen = []
+    with pytest.raises(ProviderError) as exc:
+        async for chunk in _adapter(handler, monkeypatch).chat_stream(
+                "m", {"messages": [{"role": "user", "content": "hi"}]}):
+            seen.append(chunk)
+    assert not seen, "raised only after bytes were already on the wire"
+    assert exc.value.kind == "http" and exc.value.status == 200
+
+
+@pytest.mark.anyio
+async def test_stream_of_events_that_emit_no_chunks_is_still_a_success(monkeypatch):
+    """The guard is about parsing no EVENT, not about emitting no chunk. A
+    stream whose only events are a ping and a message_delta produced real
+    upstream work and must terminate normally, not fall back."""
+    body = (b'event: ping\ndata: {"type": "ping"}\n\n'
+            b'event: message_delta\ndata: {"type": "message_delta",'
+            b' "delta": {"stop_reason": "end_turn"},'
+            b' "usage": {"output_tokens": 3}}\n\n')
+
+    def handler(request):
+        return httpx.Response(200, content=body,
+                              headers={"content-type": "text/event-stream"})
+
+    collected = await _collect(_adapter(handler, monkeypatch).chat_stream(
+        "m", {"messages": [{"role": "user", "content": "hi"}]}))
+    assert collected.decode().rstrip().endswith("data: [DONE]")
 
 
 @pytest.mark.anyio

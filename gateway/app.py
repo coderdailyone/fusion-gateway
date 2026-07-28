@@ -335,6 +335,24 @@ def create_app(
                     {"model": model_name, "kind": exc.kind, "status": exc.status},
                 )
                 continue
+            except Exception:
+                # Mirrors the streaming loop's net. Nothing has reached the
+                # client on this path, so any failure is as safe to fall back
+                # from as a ProviderError — and without this the ledger row
+                # stays in 'preflight', a CONSUMING_STATE that only
+                # _recover_orphans clears, and that runs at startup only. The
+                # translator raises on client-controlled JSON (`stop: 5`,
+                # `tools: "abc"`), and httpx.DecodingError / TooManyRedirects
+                # are RequestError but not TransportError, so neither adapter's
+                # except clauses catch them either.
+                logger.exception("call.failed model=%s request_id=%s",
+                                 model_name, request_id)
+                ledger.fail(entry_id)
+                events.append(
+                    request_id, "call.failed",
+                    {"model": model_name, "kind": "unknown"},
+                )
+                continue
 
             latency_ms = int((clock.now() - start).total_seconds() * 1000)
             usage = upstream_resp.get("usage") or {}

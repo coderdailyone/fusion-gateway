@@ -188,17 +188,11 @@ def from_anthropic_response(resp: dict, model: str) -> dict:
     if tool_calls:
         message["tool_calls"] = tool_calls
 
-    usage_in = resp.get("usage")
-    if not isinstance(usage_in, dict):
-        usage_in = {}
-    prompt = _token_count(usage_in.get("input_tokens"))
-    completion = _token_count(usage_in.get("output_tokens"))
-
     stop_reason = resp.get("stop_reason")
     finish_reason = _STOP_REASON_MAP.get(stop_reason, "stop") \
         if isinstance(stop_reason, str) else "stop"
 
-    return {
+    out: dict[str, Any] = {
         "id": resp.get("id") or f"chatcmpl-{uuid.uuid4().hex}",
         "object": "chat.completion",
         "created": int(time.time()),
@@ -208,9 +202,27 @@ def from_anthropic_response(resp: dict, model: str) -> dict:
             "message": message,
             "finish_reason": finish_reason,
         }],
-        "usage": {"prompt_tokens": prompt, "completion_tokens": completion,
-                  "total_tokens": prompt + completion},
     }
+
+    # Same rule as StreamTranslator.finish(): the `usage` key exists only when
+    # the upstream actually STATED both counts. app.py branches on key presence
+    # and settles a present usage dict as usage_source="reported", so a
+    # manufactured {0, 0} would record a real, billed call as $0.00
+    # authoritative -- the budget guard would see no consumption and the
+    # killswitch would fail open. With no key, app.py degrades to an estimate,
+    # exactly like the OpenAI path. An explicit 0 still counts as stated, and a
+    # mis-typed count was still counted: _token_count coerces it to 0.
+    usage_in = resp.get("usage")
+    if not isinstance(usage_in, dict):
+        usage_in = {}
+    raw_in = usage_in.get("input_tokens")
+    raw_out = usage_in.get("output_tokens")
+    if raw_in is not None and raw_out is not None:
+        prompt = _token_count(raw_in)
+        completion = _token_count(raw_out)
+        out["usage"] = {"prompt_tokens": prompt, "completion_tokens": completion,
+                        "total_tokens": prompt + completion}
+    return out
 
 
 def iter_sse_data(raw: bytes) -> Iterator[dict]:
@@ -345,9 +357,20 @@ class StreamTranslator:
 
         elif etype == "message_delta":
             usage = event.get("usage")
-            if isinstance(usage, dict) and usage.get("output_tokens") is not None:
-                self._output_reported = True
-                self.output_tokens = _token_count(usage.get("output_tokens"))
+            if isinstance(usage, dict):
+                # Anthropic proper puts input_tokens on message_start only, but
+                # a clone may restate BOTH counts here. Reading output alone
+                # would leave such a stream looking "never counted" on the input
+                # side, so finish() withholds the usage chunk and a real call is
+                # billed by estimate with no error anywhere. Only a STATED count
+                # overwrites: a later message_delta that omits input_tokens must
+                # not erase the number banked at message_start.
+                if usage.get("input_tokens") is not None:
+                    self._input_reported = True
+                    self.input_tokens = _token_count(usage.get("input_tokens"))
+                if usage.get("output_tokens") is not None:
+                    self._output_reported = True
+                    self.output_tokens = _token_count(usage.get("output_tokens"))
             delta = event.get("delta")
             reason = delta.get("stop_reason") if isinstance(delta, dict) else None
             if isinstance(reason, str) and reason:

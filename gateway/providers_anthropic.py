@@ -103,6 +103,15 @@ class AnthropicAdapter:
             # scalar here would silently become an empty completion with zero
             # usage, which the ledger would then bill as a successful call.
             raise ProviderError(self.cfg.name, "http", status=resp.status_code)
+        if "error" in data or not isinstance(data.get("content"), list):
+            # A 2xx is not proof of a message. configs/gateway.toml records that
+            # this endpoint answers a balance failure with HTTP 200 and an error
+            # object, and a messages reply always carries a `content` array.
+            # Translating either shape yields a hollow success: the client gets
+            # content: null and the ledger settles the call, so the fallback
+            # chain never engages. `content: []` is a real, if unusual, message
+            # and stays accepted -- the guard keys on shape, not emptiness.
+            raise ProviderError(self.cfg.name, "http", status=resp.status_code)
         return from_anthropic_response(data, upstream_model)
 
     async def chat_stream(self, upstream_model: str,
@@ -115,6 +124,7 @@ class AnthropicAdapter:
             return b"data: " + json.dumps(chunk).encode() + b"\n\n"
 
         yielded = False
+        saw_event = False
         try:
             async with self._client.stream("POST", self._url(), json=body,
                                            headers=self._headers()) as resp:
@@ -124,6 +134,7 @@ class AnthropicAdapter:
                                         status=resp.status_code)
                 async for block in _iter_event_blocks(resp):
                     for event in iter_sse_data(block):
+                        saw_event = True
                         if event.get("type") == "error":
                             if not yielded:
                                 raise ProviderError(self.cfg.name, "http")
@@ -140,6 +151,18 @@ class AnthropicAdapter:
                         for chunk in translator.feed(event):
                             yielded = True
                             yield _wire(chunk)
+                if not saw_event:
+                    # The body ended without one parseable Anthropic event: an
+                    # empty 200, or a non-SSE error page. finish() always emits
+                    # at least a finish_reason chunk, so continuing here would
+                    # fabricate a well-formed EMPTY answer — billed by estimate,
+                    # logged as call.succeeded, with no fallback — and app.py's
+                    # empty_stream guard can never fire on this wire because a
+                    # zero-byte stream is impossible. Nothing has been yielded
+                    # at this point (no event fed the translator), so the
+                    # ProviderError-before-the-first-byte contract holds.
+                    raise ProviderError(self.cfg.name, "http",
+                                        status=resp.status_code)
                 # finish() is NOT idempotent — exactly one call on each exit
                 # path, and every chunk it returns is emitted. The usage chunk
                 # it may append has an EMPTY choices list; filtering that out

@@ -205,13 +205,40 @@ def test_non_string_text_and_non_object_tool_input_degrade():
     assert out["choices"][0]["message"]["content"] is None
 
 
-def test_missing_or_garbage_usage_degrades_to_zero_tokens():
-    zero = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+def test_usage_is_omitted_unless_the_upstream_stated_both_counts():
+    # app.py branches on KEY PRESENCE: any usage dict here is taken as
+    # authoritative and settled with usage_source="reported". A reply that never
+    # stated a count must therefore carry no `usage` key at all, so app.py
+    # degrades to an estimate exactly like the OpenAI path. Emitting a
+    # manufactured {0, 0} instead settles a real, billed call at $0.00 as
+    # authoritative -- the budget guard sees no consumption and the killswitch
+    # fails open. This is the same rule StreamTranslator.finish() already applies.
     no_usage = from_anthropic_response({"content": [{"type": "text", "text": "x"}]}, "m")
-    assert no_usage["usage"] == zero
+    assert "usage" not in no_usage
+
+    for half in ({"input_tokens": 11},
+                 {"output_tokens": 7},
+                 {"input_tokens": 11, "output_tokens": None},
+                 {"input_tokens": None, "output_tokens": 7},
+                 7, "nope", [], {}):
+        # built inline, not via _resp(): a falsy usage must stay falsy here.
+        out = from_anthropic_response(
+            {"content": [{"type": "text", "text": "x"}], "usage": half}, "m")
+        assert "usage" not in out, half
+
+
+def test_a_stated_count_is_reported_even_when_it_is_zero_or_garbage():
+    # "Stated" is about presence, not sanity. An explicit zero is a real answer
+    # and must still be billed as reported; a mis-typed count was still counted,
+    # so _token_count coerces it to 0 rather than withholding the whole report.
+    zero = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    explicit = from_anthropic_response(
+        _resp([{"type": "text", "text": ""}],
+              usage={"input_tokens": 0, "output_tokens": 0}), "m")
+    assert explicit["usage"] == zero
     garbage = from_anthropic_response(
         _resp([{"type": "text", "text": "x"}],
-              usage={"input_tokens": "?", "output_tokens": None}), "m")
+              usage={"input_tokens": "?", "output_tokens": "?"}), "m")
     assert garbage["usage"] == zero
 
 
@@ -544,6 +571,40 @@ def test_finish_reports_an_explicitly_zero_output_count():
     ])
     assert chunks[-1]["usage"] == {"prompt_tokens": 8, "completion_tokens": 0,
                                    "total_tokens": 8}
+
+
+def test_usage_is_read_from_message_delta_when_it_carries_both_counts():
+    # Anthropic proper splits the counts across message_start (input) and
+    # message_delta (output), but a clone may restate BOTH on message_delta.
+    # Reading input_tokens only from message_start makes such a stream look
+    # "never counted": finish() withholds the usage chunk and a real 900/400
+    # call is billed by estimate, silently and with no error anywhere.
+    t = StreamTranslator("m")
+    chunks = _drain(t, [
+        {"type": "message_start", "message": {"id": "msg_1"}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "text_delta", "text": "hi"}},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+         "usage": {"input_tokens": 900, "output_tokens": 400}},
+    ])
+    assert (t.input_tokens, t.output_tokens) == (900, 400)
+    assert chunks[-1]["usage"] == {"prompt_tokens": 900, "completion_tokens": 400,
+                                   "total_tokens": 1300}
+
+
+def test_a_message_delta_without_an_input_count_keeps_the_one_from_message_start():
+    # Only a STATED count may overwrite: a later message_delta that omits
+    # input_tokens must not erase the number banked at message_start, or the
+    # whole prompt goes unbilled while still looking authoritative.
+    t = StreamTranslator("m")
+    chunks = _drain(t, [
+        {"type": "message_start", "message": {"usage": {"input_tokens": 12}}},
+        {"type": "message_delta", "delta": {}, "usage": {"output_tokens": 5}},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+         "usage": {"output_tokens": 5}},
+    ])
+    assert chunks[-1]["usage"] == {"prompt_tokens": 12, "completion_tokens": 5,
+                                   "total_tokens": 17}
 
 
 def test_finish_omits_usage_when_only_the_output_count_arrived():
