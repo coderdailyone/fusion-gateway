@@ -9,6 +9,12 @@ A genuine tie is reported (tied=True) for the caller's LLM tie-break; it is
 never resolved here. The placeholder winner returned alongside tied=True is the
 lexicographically smallest top-count key, so it does not depend on the order the
 ballots were listed in.
+
+Nothing about the result may depend on ballot order, tie or no tie. winner_key is
+min() over the top-count keys; winner_text is min() over the texts of the ballots
+carrying that key, because a code key like "PASS:2" is many-to-one over distinct
+programs and the text -- not the key -- is what a caller submits to the official
+grader.
 """
 from __future__ import annotations
 
@@ -107,10 +113,19 @@ def vote(task, ballots) -> VoteResult:
     # The caller still routes tied=True to the fuser; this only makes the
     # placeholder winner deterministic and model-independent.
     winner_key = winners[0]
-    winner_text = next(
-        (b.text for b in ballots
-         if b.key == winner_key or (task.source in _MATH and _equiv(b.key, winner_key))),
-        None)
+    # min(text), NOT the first ballot carrying the winning key. The key alone
+    # being deterministic is not enough: "PASS:<n>" is many-to-one over distinct
+    # source texts, so several different programs share the winning key even when
+    # it is an outright plurality (tied=False), and "first" is once again
+    # "whichever model was listed first". Phase B submits winner_text -- not
+    # winner_key -- to the official grader, and two programs sharing "PASS:2" can
+    # differ on the hidden tests, so an order-dependent text is an order-dependent
+    # benchmark number. min() makes no claim to pick *better* code; it makes the
+    # pick reproducible, which is the actual requirement.
+    matching = [b.text for b in ballots
+                if b.key == winner_key
+                or (task.source in _MATH and _equiv(b.key, winner_key))]
+    winner_text = min(matching) if matching else None
     return VoteResult(winner_text=winner_text, winner_key=winner_key,
                       tally=tally, winner_count=top_count,
                       effective_n=sum(tally_for_pick.values()),

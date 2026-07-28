@@ -78,6 +78,23 @@ def test_code_tie_winner_is_order_independent_too():
     assert vote(CODE, list(reversed(ballots))).winner_key == "PASS:2"
 
 
+def test_code_winner_text_does_not_depend_on_ballot_order():
+    """`PASS:<n>` is many-to-one over source texts, so the KEY being stable is not
+    enough: several distinct programs share `PASS:2` and Phase B submits the TEXT
+    to the official grader. Two programs sharing a key can differ on the hidden
+    tests, so an order-dependent text is an order-dependent benchmark number.
+    """
+    ballots = [_b("a", "PASS:2", "z_solution"),
+               _b("b", "PASS:2", "a_solution"),
+               _b("c", "FAIL:xyz", "c_solution")]
+    fwd = vote(CODE, ballots)
+    rev = vote(CODE, list(reversed(ballots)))
+    assert fwd.winner_key == rev.winner_key == "PASS:2"
+    assert fwd.tied is False and rev.tied is False   # outright plurality both ways
+    assert fwd.winner_text == rev.winner_text        # the point of the test
+    assert fwd.winner_text == "a_solution"           # min(), not first-encountered
+
+
 def test_winner_count_and_effective_n_describe_the_deciding_tally():
     res = vote(MCQ, [_b("a", "B"), _b("b", "B"), _b("c", "A"), _b("d", None)])
     assert res.winner_count == 2         # "B" appeared twice
