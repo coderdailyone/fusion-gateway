@@ -54,6 +54,58 @@ def test_code_text_beginning_with_pass_is_not_mistaken_for_a_passing_run():
     assert res.tied is False
 
 
+def test_tie_winner_does_not_depend_on_ballot_order():
+    """A tie must not be broken by "whichever model was listed first".
+
+    Sorting by count alone is stable, so the old winners[0] returned the
+    first-encountered top key. On the frozen HumanEval data 51.2% of tasks tie
+    and permuting only the ballot order moved vote accuracy 149/164 -> 160/164.
+    """
+    ballots = [_b("a", "C"), _b("b", "A"), _b("c", "B")]
+    first = vote(MCQ, ballots).winner_key
+    for perm in ([ballots[1], ballots[2], ballots[0]],
+                 [ballots[2], ballots[0], ballots[1]],
+                 list(reversed(ballots))):
+        res = vote(MCQ, perm)
+        assert res.winner_key == first
+        assert res.tied is True          # still routed to the fuser
+    assert first == "A"                  # min(), not first-encountered
+
+
+def test_code_tie_winner_is_order_independent_too():
+    ballots = [_b("a", "PASS:3", "z-code"), _b("b", "PASS:2", "y-code")]
+    assert vote(CODE, ballots).winner_key == "PASS:2"
+    assert vote(CODE, list(reversed(ballots))).winner_key == "PASS:2"
+
+
+def test_winner_count_and_effective_n_describe_the_deciding_tally():
+    res = vote(MCQ, [_b("a", "B"), _b("b", "B"), _b("c", "A"), _b("d", None)])
+    assert res.winner_count == 2         # "B" appeared twice
+    assert res.effective_n == 3          # 4 ballots, 1 spoiled
+    assert res.n == 4 and res.spoiled == 1
+
+
+def test_winner_count_and_effective_n_are_taken_after_the_pass_filter():
+    """`tally` is the PRE-filter dict, so the new fields must not be read off it."""
+    res = vote(CODE, [_b("a", "FAIL:aaa"), _b("b", "FAIL:aaa"),
+                      _b("c", "FAIL:bbb"), _b("d", "PASS:2")])
+    assert res.winner_key == "PASS:2"
+    assert res.winner_count == 1         # NOT 2 (the FAIL:aaa plurality)
+    assert res.effective_n == 1          # only the passing pool decided it
+    assert res.tally == {"FAIL:aaa": 2, "FAIL:bbb": 1, "PASS:2": 1}
+
+
+def test_math_effective_n_counts_ballots_not_merged_keys():
+    res = vote(MATH, [_b("a", "0.5"), _b("b", "\\frac{1}{2}"), _b("c", "3")])
+    assert res.winner_key == "0.5" and res.winner_count == 2
+    assert res.effective_n == 3
+
+
+def test_no_winner_reports_zero_counts():
+    res = vote(MCQ, [_b("a", None), _b("b", None)])
+    assert res.winner_count == 0 and res.effective_n == 0
+
+
 def test_first_k_takes_k_ballots_per_model():
     ballots = [_b("a", "A"), _b("a", "A"), _b("a", "B"),
                _b("b", "A"), _b("b", "B")]

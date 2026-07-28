@@ -6,7 +6,9 @@ Plurality everywhere, with two source-specific twists:
   * code  — a sample that PASSES the problem's public doctests beats any number
             of failing samples. Execution outranks popularity.
 A genuine tie is reported (tied=True) for the caller's LLM tie-break; it is
-never resolved here.
+never resolved here. The placeholder winner returned alongside tied=True is the
+lexicographically smallest top-count key, so it does not depend on the order the
+ballots were listed in.
 """
 from __future__ import annotations
 
@@ -32,6 +34,11 @@ class VoteResult:
     # NOT the tally the winner was drawn from -- do not derive "did the winner
     # have a majority?" from it.
     tally: dict[str, int]
+    # The two fields below describe the tally the winner was ACTUALLY drawn
+    # from -- i.e. after the "PASS:" filter for code -- so a caller can compute
+    # agreement (winner_count / effective_n) without reimplementing that filter.
+    winner_count: int            # count of winner_key in that tally
+    effective_n: int             # non-spoiled ballots that tally was computed over
     tied: bool
     spoiled: int
     n: int
@@ -72,7 +79,9 @@ def vote(task, ballots) -> VoteResult:
     spoiled = sum(1 for b in ballots if b.key is None)
     tally = tally_keys(task, ballots)
     if not tally:
-        return VoteResult(None, None, {}, False, spoiled, n)
+        return VoteResult(winner_text=None, winner_key=None, tally={},
+                          winner_count=0, effective_n=0, tied=False,
+                          spoiled=spoiled, n=n)
 
     if task.source in _CODE:
         # The colon matters: doctest_signature emits "PASS:<n>" / "FAIL:<...>",
@@ -88,16 +97,24 @@ def vote(task, ballots) -> VoteResult:
     else:
         tally_for_pick = tally
 
-    ordered = sorted(tally_for_pick.items(), key=lambda kv: -kv[1])
-    top_count = ordered[0][1]
-    winners = [k for k, v in ordered if v == top_count]
+    top_count = max(tally_for_pick.values())
+    winners = sorted(k for k, v in tally_for_pick.items() if v == top_count)
     tied = len(winners) > 1
+    # min(winners), NOT the first key encountered. Sorting by count alone is
+    # stable, so "first" meant "whichever model happened to be listed first" --
+    # a zero-signal variable. On the frozen HumanEval data 51.2% of tasks tie,
+    # and permuting only the ballot order swung vote accuracy 149/164 -> 160/164.
+    # The caller still routes tied=True to the fuser; this only makes the
+    # placeholder winner deterministic and model-independent.
     winner_key = winners[0]
     winner_text = next(
         (b.text for b in ballots
          if b.key == winner_key or (task.source in _MATH and _equiv(b.key, winner_key))),
         None)
-    return VoteResult(winner_text, winner_key, tally, tied, spoiled, n)
+    return VoteResult(winner_text=winner_text, winner_key=winner_key,
+                      tally=tally, winner_count=top_count,
+                      effective_n=sum(tally_for_pick.values()),
+                      tied=tied, spoiled=spoiled, n=n)
 
 
 def _equiv(a, b) -> bool:
