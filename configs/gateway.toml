@@ -17,13 +17,16 @@ provider = "deepseek"
 upstream_model = "deepseek-v4-flash"
 in_usd_per_mtok = 0.14   # verified 2026-07-14 (deepseek-v4-flash non-thinking); deepseek-chat alias deprecates 2026-07-24
 out_usd_per_mtok = 0.28
-fallback = ["glm-4.6"]
+fallback = ["glm-4.5-flash"]
 
-[models."glm-4.6"]
+[models."glm-4.5-flash"]
 provider = "glm"
-upstream_model = "glm-4.6"
-in_usd_per_mtok = 0.60   # glm-4.6 flagship; price approximate, confirm at smoke
-out_usd_per_mtok = 2.20
+upstream_model = "glm-4.5-flash"
+# glm-4.6 on this endpoint returns 1113 "余额不足" (no balance / no resource pack)
+# — verified by the M1 smoke on 2026-07-26, matching the M2c finding. glm-4.5-flash
+# is served on the same endpoint. Free tier: priced at 0 until a paid plan is added.
+in_usd_per_mtok = 0.0
+out_usd_per_mtok = 0.0
 fallback = []
 
 [policy]

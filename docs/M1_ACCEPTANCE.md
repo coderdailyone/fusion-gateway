@@ -47,3 +47,21 @@ note it, its cause, and the fix.
 After 7 clean days: M1 is done. If an incident fired, fix it, reset the clock,
 and restart the week. Budget consumed over the window must stay under the M1 cap
 and reconcile against the provider's own billing.
+
+## Smoke executed 2026-07-26 (the human-gated step, finally run)
+
+Ran `scripts/smoke.py` against a locally-started gateway with real provider keys.
+
+| model | returned | status | latency |
+|---|---|---|---|
+| deepseek-chat | deepseek-chat | 200 | 812 ms |
+| glm-4.5-flash | glm-4.5-flash | 200 | 1019 ms |
+
+Ledger `consumed_usd` delta: **$0.000006** — cost metering, the preflight-settle
+ledger, and `/admin/status` verified end to end.
+
+**The smoke caught a config defect that would have broken the deploy:** `glm-4.6`
+on `open.bigmodel.cn/api/paas/v4` returns error `1113` (no balance / no resource
+pack), surfacing as `502 upstream_exhausted`. This reproduces the M2c finding.
+`configs/gateway.toml` now serves **glm-4.5-flash**, which works on the same
+endpoint and is priced at 0 pending a paid plan.
