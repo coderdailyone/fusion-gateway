@@ -10,7 +10,7 @@ class ConfigError(Exception): pass
 
 @dataclass(frozen=True)
 class ProviderCfg:
-    name: str; base_url: str; api_key_env: str
+    name: str; base_url: str; api_key_env: str; wire: str = "openai"
 
 @dataclass(frozen=True)
 class ModelCfg:
@@ -26,8 +26,12 @@ class Config:
 
 def load_config(path: Path) -> Config:
     data = tomllib.loads(Path(path).read_text())
-    providers = {n: ProviderCfg(n, p["base_url"], p["api_key_env"])
-                 for n, p in data["providers"].items()}
+    providers = {}
+    for n, p in data["providers"].items():
+        wire = p.get("wire", "openai")
+        if wire not in ("openai", "anthropic"):
+            raise ConfigError(f"provider {n}: unknown wire {wire!r}")
+        providers[n] = ProviderCfg(n, p["base_url"], p["api_key_env"], wire)
     models: dict[str, ModelCfg] = {}
     for n, m in data["models"].items():
         if m["provider"] not in providers:

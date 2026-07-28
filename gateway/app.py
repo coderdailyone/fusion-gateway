@@ -18,7 +18,7 @@ from gateway.db import Store, connect
 from gateway.events import EventLog
 from gateway.ledger import BudgetTripped, Ledger, estimate_tokens
 from gateway.policy import UnknownModel, plan_route
-from gateway.providers import ProviderAdapter, ProviderError, parse_stream_usage
+from gateway.providers import ProviderAdapter, ProviderError, make_adapter, parse_stream_usage
 
 logger = logging.getLogger("gateway.app")
 
@@ -132,7 +132,7 @@ def create_app(
     adapters: dict[str, ProviderAdapter] = {}
     for name, provider_cfg in cfg.providers.items():
         transport = (transports or {}).get(name)
-        adapters[name] = ProviderAdapter(provider_cfg, transport=transport)
+        adapters[name] = make_adapter(provider_cfg, transport=transport)
 
     _ensure_admin_sentinel(store, clock)
     _recover_orphans(store, clock)
