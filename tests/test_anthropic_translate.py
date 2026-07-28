@@ -215,6 +215,20 @@ def test_missing_or_garbage_usage_degrades_to_zero_tokens():
     assert garbage["usage"] == zero
 
 
+def test_empty_text_block_before_a_tool_use_still_yields_content_none():
+    # Regression guard for the `joined or None` formula. The obvious-looking
+    # `"".join(text_parts) if text_parts else None` returns "" here, because an
+    # empty text block makes text_parts truthy — and "" defeats the `content is
+    # None` check OpenAI clients use to detect a tool call.
+    out = from_anthropic_response(_resp(
+        [{"type": "text", "text": ""},
+         {"type": "tool_use", "id": "t1", "name": "x", "input": {}}],
+        stop_reason="tool_use"), "m")
+    message = out["choices"][0]["message"]
+    assert message["content"] is None
+    assert message["tool_calls"][0]["id"] == "t1"
+
+
 def test_unknown_stop_reason_falls_back_to_stop():
     for bad in (None, "overloaded", ["end_turn"]):
         out = from_anthropic_response(
