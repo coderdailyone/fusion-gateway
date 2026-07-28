@@ -131,3 +131,58 @@ field is worth re-checking before glm-5.2 carries prompt-cached traffic.
 `configs/pricing.toml`, still flagged `VERIFY` against Zhipu's published table.
 They drive the ledger and therefore the budget killswitch — confirm them before
 real traffic.
+
+## Deployed to production 2026-07-28
+
+`HOST=vps bash scripts/deploy.sh` — the M1 deploy, finally executed. Service is
+`active`, `enabled`, **0 restarts**, listening on `127.0.0.1:8800`.
+
+### Footprint (measured, not estimated)
+
+| | size |
+|---|---:|
+| venv (fastapi/uvicorn/httpx/tomli) | 36 MB |
+| source | ~1 MB |
+| SQLite ledger | 40 KB at 7 requests; ~1–2 KB/request marginal |
+| **total on host** | **36 MB** |
+
+Host has 41 GB free. `python3-venv` was already present.
+
+**The deploy script was shipping 1.07 GB.** `.gitignore` does not bind rsync:
+`runs/` (972 MB of frozen evaluation samples) and `evaluator/runs/` (45 MB) were
+git-ignored but not rsync-excluded — a 1000× payload of artifacts the production
+gateway has no use for. Fixed by adding them to the exclude list; payload is now
+983 KB. Verified after deploy: `/opt/fusion-gateway/runs` does not exist.
+
+`runs/secrets/.env` was never at risk — `--exclude '.env'` carries no slash, so
+rsync matches it at any depth (confirmed by dry run: 0 `.env` files transferred).
+The only `.env` on the host is the one deliberately placed there, mode 600.
+
+### Production smoke
+
+| model | returned | status | latency |
+|---|---|---|---|
+| deepseek-chat | deepseek-chat | 200 | 759 ms |
+| glm-4.5-flash | glm-4.5-flash | 200 | 666 ms |
+| glm-5.2 | glm-5.2 | 200 | 1707 ms |
+
+Ledger delta **$0.000017**. Streaming to glm-5.2 through production terminated
+with `data: [DONE]` and settled `usage_source='reported'` (9 in / 9 out). All 4
+ledger rows `settled`; none stranded.
+
+Auth verified: no token → 401, unknown token → 401, non-admin principal on
+`/admin/status` → 403.
+
+`systemctl restart` came back clean — `active`, healthy, ledger still 4/4
+settled, no orphan rows.
+
+### Day-1 log
+
+| Day | Requests | Cost (USD) | P95 latency | Fallbacks | Incidents |
+|----:|---------:|-----------:|------------:|----------:|-----------|
+| 1 | 4 (smoke) | 0.000017 | 1707 ms | 0 | none |
+
+**Still open before real traffic:** glm-5.2's prices (0.60/2.20) are unverified
+and drive the budget killswitch; the M1 cap is $5 and trips hard (503 on every
+request until `/admin/killswitch/release`); the bind is loopback-only, so
+external clients would need a reverse proxy and TLS that do not exist yet.
