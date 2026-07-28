@@ -352,7 +352,11 @@ def test_delta_for_an_unknown_block_index_is_ignored_not_fatal():
          "delta": {"type": "input_json_delta", "partial_json": "{}"}},
         {"type": "message_stop"},
     ])
-    assert isinstance(chunks, list)   # no exception raised
+    # No exception -- and, more to the point, no tool_calls chunk invented for a
+    # block that never opened: a fragment guessed onto slot 0 would corrupt
+    # whatever real tool call lands there.
+    assert not [tc for c in chunks if c["choices"]
+                for tc in c["choices"][0]["delta"].get("tool_calls", [])]
 
 
 def test_emitted_stream_is_parseable_by_the_existing_usage_parser():
@@ -406,3 +410,91 @@ def test_malformed_stream_events_degrade_instead_of_raising():
             for call in choice["delta"].get("tool_calls", []):
                 for key in ("name", "arguments"):
                     assert isinstance(call["function"].get(key, ""), str)
+
+
+def test_infinite_token_counts_degrade_to_zero_on_both_paths():
+    # json.loads accepts 1e400 (and Infinity) and hands back float("inf"), which
+    # is well-formed JSON as far as iter_sse_data is concerned -- so it reaches
+    # the counter, where int(inf) raises OverflowError. That is a sibling of
+    # ValueError, not a subclass, so an except tuple listing only TypeError and
+    # ValueError misses it. Mid-stream that aborts the response and takes the
+    # usage chunk, and therefore the bill, with it.
+    wire = (b'data: {"type": "message_start", "message":'
+            b' {"usage": {"input_tokens": 1e400}}}\n\n')
+    event, = iter_sse_data(wire)
+    assert event["message"]["usage"]["input_tokens"] == float("inf")
+
+    t = StreamTranslator("m")
+    chunks = _drain(t, [event, {"type": "message_delta",
+                                "usage": {"output_tokens": float("-inf")}}])
+    assert (t.input_tokens, t.output_tokens) == (0, 0)
+    assert chunks[-1]["usage"] == {"prompt_tokens": 0, "completion_tokens": 0,
+                                   "total_tokens": 0}
+
+    # Both directions share _token_count, so the parity has to stay pinned:
+    # the same garbage must cost the same nothing on the non-streaming path.
+    non_streaming = from_anthropic_response(
+        {"content": [{"type": "text", "text": "x"}],
+         "usage": {"input_tokens": 1e400, "output_tokens": float("nan")}}, "m")
+    assert non_streaming["usage"] == {"prompt_tokens": 0, "completion_tokens": 0,
+                                      "total_tokens": 0}
+
+
+def test_feed_ignores_an_event_that_is_not_a_dict():
+    # iter_sse_data only yields dicts today, so this is the outermost shape hole
+    # rather than a live crash -- but feed() is the untrusted-input boundary and
+    # should not depend on its caller for that.
+    t = StreamTranslator("m")
+    for junk in ([], "x", None, 5, ["message_start"]):
+        assert t.feed(junk) == []
+    assert (t.input_tokens, t.output_tokens, t.thinking_blocks) == (0, 0, 0)
+
+
+def test_two_tool_blocks_map_onto_dense_openai_indices_without_cross_talk():
+    # Anthropic numbers content blocks across the whole message -- a text block
+    # takes 0 here, and the tool blocks land on 1 and 3 -- while OpenAI numbers
+    # tool_calls densely from 0. The fragments interleave, so it is the mapping,
+    # not arrival order, that keeps each argument string whole.
+    t = StreamTranslator("m")
+    chunks = _drain(t, [
+        {"type": "message_start", "message": {"usage": {"input_tokens": 4}}},
+        {"type": "content_block_start", "index": 0,
+         "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "text_delta", "text": "sure"}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "content_block_start", "index": 1,
+         "content_block": {"type": "tool_use", "id": "toolu_a", "name": "search"}},
+        {"type": "content_block_start", "index": 3,
+         "content_block": {"type": "tool_use", "id": "toolu_b", "name": "fetch"}},
+        {"type": "content_block_delta", "index": 3,
+         "delta": {"type": "input_json_delta", "partial_json": '{"url":'}},
+        {"type": "content_block_delta", "index": 1,
+         "delta": {"type": "input_json_delta", "partial_json": '{"q": "cats"'}},
+        {"type": "content_block_delta", "index": 3,
+         "delta": {"type": "input_json_delta", "partial_json": ' "u"}'}},
+        {"type": "content_block_delta", "index": 1,
+         "delta": {"type": "input_json_delta", "partial_json": '}'}},
+        {"type": "content_block_stop", "index": 1},
+        {"type": "content_block_stop", "index": 3},
+        {"type": "message_delta", "delta": {"stop_reason": "tool_use"},
+         "usage": {"output_tokens": 7}},
+        {"type": "message_stop"},
+    ])
+    calls = [tc for c in chunks if c["choices"]
+             for tc in c["choices"][0]["delta"].get("tool_calls", [])]
+    openings = [tc for tc in calls if "id" in tc]
+    fragments = [tc for tc in calls if "id" not in tc]
+
+    # Anthropic 1 -> OpenAI 0, Anthropic 3 -> OpenAI 1, in block-open order.
+    assert [(tc["index"], tc["id"], tc["function"]["name"]) for tc in openings] \
+        == [(0, "toolu_a", "search"), (1, "toolu_b", "fetch")]
+    # A client reads name/id once; repeating them on a fragment corrupts the call.
+    assert fragments and all("name" not in tc["function"] for tc in fragments)
+
+    reassembled: dict[int, str] = {}
+    for tc in calls:
+        reassembled[tc["index"]] = (reassembled.get(tc["index"], "")
+                                    + tc["function"].get("arguments", ""))
+    assert json.loads(reassembled[0]) == {"q": "cats"}
+    assert json.loads(reassembled[1]) == {"url": "u"}

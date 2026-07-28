@@ -137,10 +137,14 @@ def _token_count(value: Any) -> int:
     """Coerce one upstream usage number to a non-negative int.
 
     The result feeds the ledger's settle(), so a garbage or absent count must
-    become 0 rather than raise — a mis-typed field should not cost a request."""
+    become 0 rather than raise — a mis-typed field should not cost a request.
+
+    OverflowError is in the tuple because `json.loads` accepts `1e400` and
+    `Infinity` and returns `float("inf")`, which `int()` refuses to convert; it
+    is a sibling of ValueError, not a subclass, so it needs naming."""
     try:
         return max(0, int(value or 0))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
 
 
@@ -283,6 +287,8 @@ class StreamTranslator:
         }
 
     def feed(self, event: dict) -> list[dict]:
+        if not isinstance(event, dict):
+            return []       # untrusted-input boundary: don't rely on the caller
         etype = event.get("type")
         out: list[dict] = []
 
