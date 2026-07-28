@@ -35,13 +35,97 @@ _DOCTEST_RE = re.compile(r"^\s*>>>\s*(.+?)\s*$\n^\s*(.+?)\s*$", re.M)
 _MCQ_DECLARED = re.compile(r"(?i:answer\s*(?:is|:))\s*\(?([A-J])\)?")
 
 
+_TERMINATORS = ('"""', "'''")
+
+# Characters that can only continue the expression on their left (comparison,
+# arithmetic, attribute access, ...). A tail starting with one of these is part
+# of the call, never an expected value printed beside it.
+_CONTINUATION = set("+-*/%<>=!&|^@,.:)]}~")
+
+
+def _is_expression(text: str) -> bool:
+    """True when `text` on its own is a complete Python expression."""
+    try:
+        compile(text, "<doctest>", "eval")
+    except Exception:
+        return False
+    return True
+
+
+def _tail_after_call(expr: str) -> str | None:
+    """Text following the first top-level balanced bracket group in `expr`."""
+    depth = 0
+    started = False
+    quote: str | None = None
+    i = 0
+    while i < len(expr):
+        ch = expr[i]
+        if quote is not None:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch in "([{":
+            depth += 1
+            started = True
+        elif ch in ")]}":
+            depth -= 1
+            if started and depth == 0:
+                return expr[i + 1:]
+        i += 1
+    return None
+
+
+def _has_inline_expected(call: str) -> bool:
+    """True when a ">>>" line carries its expected value on the SAME line.
+
+    HumanEval/116 writes `>>> sort_array([1, 0, 2, 3, 4]) [0, 1, 2, 3, 4]`.
+    Python reads that as a subscript, so it executes and yields garbage rather
+    than the comparison the author meant. The tell is a whitespace-separated
+    tail that is itself a complete value expression -- `== 0` and `# comment`
+    (the only other tails in the real suite) are not.
+    """
+    tail = _tail_after_call(call)
+    if tail is None or not tail[:1].isspace():
+        return False                      # `f(x)`, `f(x)[0]`, `f(x).lower()`
+    rest = tail.strip()
+    if not rest or rest[0] in _CONTINUATION:
+        return False
+    return _is_expression(rest)
+
+
 def extract_doctests(problem: str) -> list[tuple[str, str]]:
-    """Return (call_expression, expected_repr) pairs from a problem statement."""
+    """Return (call_expression, expected_repr) pairs from a problem statement.
+
+    Only cases we can honestly execute are returned. The regex pairs a ">>>"
+    line with the line below it, and real HumanEval docstrings break that
+    assumption in four ways -- each is SKIPPED rather than turned into a bogus
+    expectation that fails correct code:
+
+      * the example is the last line of the docstring, so the line below is the
+        closing `\"\"\"` (HumanEval/108, /128, /156, /162);
+      * the line below is blank;
+      * the expected value spans several lines and would be truncated to its
+        first line (HumanEval/113) -- detected because the truncation is not a
+        complete expression. Multi-line expectations are deliberately NOT
+        supported; skipping is the honest outcome;
+      * call and expected share one line (HumanEval/116).
+    """
     out: list[tuple[str, str]] = []
-    for call, expected in _DOCTEST_RE.findall(problem or ""):
+    for raw_call, raw_expected in _DOCTEST_RE.findall(problem or ""):
+        call, expected = raw_call.strip(), raw_expected.strip()
         if expected.startswith(">>>"):      # a call with no shown output
             continue
-        out.append((call.strip(), expected.strip()))
+        if not expected or expected in _TERMINATORS:
+            continue
+        if not _is_expression(expected):   # truncated multi-line expectation
+            continue
+        if _has_inline_expected(call):
+            continue
+        out.append((call, expected))
     return out
 
 
@@ -61,7 +145,13 @@ def doctest_signature(task, text: str, runner) -> str | None:
     for call, expected in cases:
         lines.append(f"print(repr({call}))")
     program = "\n".join(lines)
-    result = runner(program, stdin="", timeout_s=8.0, mem_mb=512, cpu_s=8)
+    try:
+        result = runner(program, stdin="", timeout_s=8.0, mem_mb=512, cpu_s=8)
+    except Exception:
+        # A multi-hour paid batch must not die because Popen hit EAGAIN/EMFILE
+        # under load. An unrunnable sample is indistinguishable from a failing
+        # one for voting purposes, so record it as such and keep going.
+        return "FAIL:exec"
     if getattr(result, "status", "") != "ok":
         return "FAIL:exec"
     got = [ln.strip() for ln in (result.stdout or "").splitlines() if ln.strip()]
@@ -79,7 +169,16 @@ def _same(got: str, want: str) -> bool:
 
 
 def ballot_key(task, text: str, runner=None) -> str | None:
-    """Comparable key for one sample. None => spoiled ballot (dropped from tally)."""
+    """Comparable key for one sample. None => spoiled ballot (dropped from tally).
+
+    `runner` is OPTIONAL for mcq/math but MANDATORY for code: only 45.7% of
+    HumanEval problems (and no livecodebench problem) carries ">>>" examples, so
+    the raw-source fallback is already the majority path for code. A forgotten
+    runner would quietly turn the whole code tier into text plurality --
+    all-singleton tallies, universal ties, a score decided by ballot order --
+    with no error and no log line. In a paid one-shot run that is unrecoverable,
+    so it raises instead.
+    """
     if task.source in _MCQ:
         from evaluator.official.mmlu_extract import extract_answer
 
@@ -91,6 +190,11 @@ def ballot_key(task, text: str, runner=None) -> str | None:
 
         return _extract_answer(text or "")
     if task.source in _CODE:
+        if runner is None:
+            raise ValueError(
+                f"ballot_key: {task.source} task {task.id!r} needs a code runner "
+                "-- pass runner=evaluator.sandbox.run_code. With runner=None "
+                "every code ballot silently degrades to raw-text plurality.")
         sig = doctest_signature(task, text or "", runner)
         if sig is not None:
             return sig
