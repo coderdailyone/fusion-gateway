@@ -1,4 +1,4 @@
-import httpx, json, pytest
+import httpx, json
 from fastapi.testclient import TestClient
 from gateway.app import create_app
 from tests.helpers import FakeClock
@@ -58,11 +58,11 @@ def handler(req):
         "usage": {"prompt_tokens": 3, "completion_tokens": 4}})
 
 
-def make_client(tmp_path, monkeypatch, h=handler):
+def make_client(tmp_path, monkeypatch, h=handler, cfg=CFG):
     monkeypatch.setenv("GATEWAY_TOKENS", "prism:tokA,admin:tokB")
     monkeypatch.setenv("P_KEY", "sk-p")
     p = tmp_path / "g.toml"
-    p.write_text(CFG)
+    p.write_text(cfg)
     app = create_app(p, tmp_path / "g.sqlite", clock=FakeClock(),
                      transports={"p": httpx.MockTransport(h)})
     return TestClient(app)
@@ -73,6 +73,51 @@ def H(tok="tokA"):
 
 
 BODY = {"model": "auto", "messages": [{"role": "user", "content": "hi"}]}
+
+# A cap calibrated (empirically, against this exact panel/fuser/mock shape --
+# see the fix-round-1 section of task-5-report.md for the derivation) to let
+# both candidates and both reviews settle -- 2.8e-05 actual -- while the
+# fuser's OWN preflight estimate (~0.000206, dominated by build_fusion_prompt's
+# longer text) pushes consumed over a cap of 0.00022. Too low and gather_panel
+# itself trips first (already covered); too high (>= 0.000234) and nothing
+# trips at all. max_tokens=1 on the request and a small review_max_tokens
+# keep the candidate/review preflight ESTIMATES (as opposed to their actual
+# settled cost) from swamping this budget before the fuser is ever reached.
+BUDGET_CFG = """
+[budget]
+active = "T"
+[budgets.T]
+cap_usd = 0.00022
+[providers.p]
+base_url = "https://example.invalid"
+api_key_env = "P_KEY"
+[models."a"]
+provider = "p"
+upstream_model = "a"
+in_usd_per_mtok = 1.0
+out_usd_per_mtok = 1.0
+fallback = []
+[models."b"]
+provider = "p"
+upstream_model = "b"
+in_usd_per_mtok = 1.0
+out_usd_per_mtok = 1.0
+fallback = []
+[fusion]
+model = "fusion"
+panel = ["a", "b"]
+quorum = ["a", "b"]
+reviewers = ["a", "b"]
+fuser = "b"
+review_max_tokens = 5
+stage_timeout_s = 5
+[policy]
+version = "static-v0"
+default_model = "fusion"
+"""
+
+BUDGET_BODY = {"model": "auto", "messages": [{"role": "user", "content": "hi"}],
+               "max_tokens": 1}
 
 
 def test_auto_takes_the_fusion_path(tmp_path, monkeypatch):
@@ -136,6 +181,18 @@ def test_a_lone_survivor_is_returned_verbatim(tmp_path, monkeypatch):
     assert r.status_code == 200
     assert r.json()["choices"][0]["message"]["content"] == "only b"
     assert r.json()["fusion"]["degraded"] is True
+    rid = r.headers["x-fusion-trace-id"]
+    import sqlite3
+    conn = sqlite3.connect(tmp_path / "g.sqlite")
+    rows = conn.execute("SELECT model FROM ledger WHERE request_id=?", (rid,)).fetchall()
+    # Only the two candidate calls: fewer than 2 candidates means
+    # _cross_review's own guard skips review entirely, and _finish_fusion's
+    # "<2 candidates" rung returns the survivor WITHOUT ever calling the
+    # fuser -- the 500 the mock above wires up for the fuser prompt is dead
+    # code on this path. A row count of 2 is what tells "no fuser call was
+    # made" apart from "the fuser was called and failed" (test below), which
+    # would show up here as 3 rows instead.
+    assert len(rows) == 2
 
 
 def test_a_dead_fuser_falls_back_to_the_best_candidate(tmp_path, monkeypatch):
@@ -174,3 +231,160 @@ def test_streaming_fusion_emits_keepalives_then_the_fuser_stream(tmp_path, monke
             continue
         if line.startswith("data: ") and line[6:].strip() != "[DONE]":
             json.loads(line[6:])       # must be valid JSON, or this raises
+
+
+def test_streaming_fusion_settles_every_ledger_row_including_the_fuser(tmp_path, monkeypatch):
+    """The fuser's row is the one call app.py bills by hand instead of
+    through call_model -- confirm it actually reaches 'settled' and isn't
+    quietly left stranded in 'preflight' by some future refactor."""
+    c = make_client(tmp_path, monkeypatch)
+    with c.stream("POST", "/v1/chat/completions",
+                  json={**BODY, "stream": True}, headers=H()) as r:
+        assert r.status_code == 200
+        rid = r.headers["x-fusion-trace-id"]
+        raw = b"".join(r.iter_bytes()).decode()
+    assert "FUSED ANSWER" in raw
+    import sqlite3
+    conn = sqlite3.connect(tmp_path / "g.sqlite")
+    rows = conn.execute(
+        "SELECT model, state, usage_source FROM ledger WHERE request_id=? ORDER BY id",
+        (rid,)).fetchall()
+    assert len(rows) == 5                              # 2 candidates + 2 reviews + 1 fuser
+    assert all(state == "settled" for _, state, _ in rows), rows
+    # The fuser call specifically: 'reported' (not just 'settled') pins that
+    # the explicit settle() in the happy path actually ran, rather than the
+    # cancellation-safety-net's estimate quietly papering over a bug that
+    # skipped it.
+    assert rows[-1] == ("b", "settled", "reported")
+
+
+def test_streaming_dead_fuser_falls_back_to_the_best_candidate(tmp_path, monkeypatch):
+    """Mirrors test_a_dead_fuser_falls_back_to_the_best_candidate, but for
+    the streaming path: the fuser 500s before its first byte, and the
+    client -- which already has an open stream -- must get a valid chunk
+    stream carrying the fallback answer, not an error chunk."""
+    def h(req):
+        body = json.loads(req.content)
+        prompt = body["messages"][-1]["content"]
+        if "Produce the single best final answer" in prompt:
+            return httpx.Response(500, json={})
+        if "VERDICT" in prompt:
+            return httpx.Response(200, json={
+                "choices": [{"message": {"content": "VERDICT a correct ok\nVERDICT b correct ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": f"answer from {body['model']}"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+    c = make_client(tmp_path, monkeypatch, h=h)
+    with c.stream("POST", "/v1/chat/completions",
+                  json={**BODY, "stream": True}, headers=H()) as r:
+        assert r.status_code == 200
+        raw = b"".join(r.iter_bytes()).decode()
+    assert ": fusion fusing" in raw        # the panel succeeded before the fuser died
+    assert raw.rstrip().endswith("data: [DONE]")
+    contents = []
+    for line in raw.splitlines():
+        if line.startswith(": ") or not line.startswith("data: "):
+            continue
+        payload = line[6:].strip()
+        if payload == "[DONE]":
+            continue
+        obj = json.loads(payload)
+        assert "error" not in obj, f"fuser death leaked as an error chunk: {obj}"
+        content = obj["choices"][0]["delta"].get("content")
+        if content:
+            contents.append(content)
+    assert contents == ["answer from a"]
+
+
+def test_streaming_empty_fuser_stream_falls_back_to_the_best_candidate(tmp_path, monkeypatch):
+    """The fuser answers 200 with a genuinely empty body -- no bytes at all,
+    distinct from an upstream error. Without an explicit `first_byte` guard
+    after the read loop this falls through to ledger.settle + 'succeeded',
+    charging the caller for a stream that decodes to zero chunks and no
+    [DONE] under a real SSEDecoder. The gateway already holds the right
+    answer via best_candidate and must serve it instead."""
+    def h(req):
+        body = json.loads(req.content)
+        prompt = body["messages"][-1]["content"]
+        if "Produce the single best final answer" in prompt:
+            return httpx.Response(200, content=b"",
+                                  headers={"content-type": "text/event-stream"})
+        if "VERDICT" in prompt:
+            return httpx.Response(200, json={
+                "choices": [{"message": {"content": "VERDICT a correct ok\nVERDICT b correct ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": f"answer from {body['model']}"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+    c = make_client(tmp_path, monkeypatch, h=h)
+    with c.stream("POST", "/v1/chat/completions",
+                  json={**BODY, "stream": True}, headers=H()) as r:
+        assert r.status_code == 200
+        rid = r.headers["x-fusion-trace-id"]
+        raw = b"".join(r.iter_bytes()).decode()
+    assert ": fusion fusing" in raw
+    assert raw.rstrip().endswith("data: [DONE]")
+    contents = []
+    for line in raw.splitlines():
+        if line.startswith(": ") or not line.startswith("data: "):
+            continue
+        payload = line[6:].strip()
+        if payload == "[DONE]":
+            continue
+        obj = json.loads(payload)
+        assert "error" not in obj, f"empty fuser body billed silently: {obj}"
+        content = obj["choices"][0]["delta"].get("content")
+        if content:
+            contents.append(content)
+    assert contents == ["answer from a"]
+    import sqlite3
+    conn = sqlite3.connect(tmp_path / "g.sqlite")
+    rows = conn.execute("SELECT model, state FROM ledger WHERE request_id=? ORDER BY id",
+                        (rid,)).fetchall()
+    assert len(rows) == 5
+    # The fuser's own row must be fail()ed -- never settled as a paid
+    # success, and never left in 'preflight'.
+    assert rows[-1] == ("b", "failed")
+
+
+def test_non_streaming_budget_trip_at_the_fuser_returns_503_not_500(tmp_path, monkeypatch):
+    """The panel succeeds (2 candidates + 2 reviews settle under the cap);
+    only the fuser's OWN preflight -- inside call_model, called bare from
+    _finish_fusion -- crosses it. Before the fix this propagated out of the
+    handler as an unhandled BudgetTripped -> gateway 500, with the
+    `requests` row stranded 'open'."""
+    c = make_client(tmp_path, monkeypatch, cfg=BUDGET_CFG)
+    r = c.post("/v1/chat/completions", json=BUDGET_BODY, headers=H())
+    assert r.status_code == 503
+    assert r.json()["error"]["type"] == "budget_exhausted"
+    import sqlite3
+    conn = sqlite3.connect(tmp_path / "g.sqlite")
+    rows = conn.execute("SELECT model, state FROM ledger").fetchall()
+    assert len(rows) == 4                       # panel settled; no stray fuser row
+    assert all(state == "settled" for _, state in rows), rows
+    status = conn.execute(
+        "SELECT status FROM requests WHERE id != 'admin'").fetchone()
+    assert status[0] == "failed"                # never left 'open'
+
+
+def test_streaming_budget_trip_at_the_fuser_emits_an_error_not_a_crash(tmp_path, monkeypatch):
+    """Same budget shape as the non-streaming test above, but the client
+    already has an open SSE stream by the time the fuser's preflight trips:
+    status is 200 (headers are already committed) and the trip must surface
+    as a single well-formed error data line, not an unhandled exception that
+    kills the connection mid-stream."""
+    c = make_client(tmp_path, monkeypatch, cfg=BUDGET_CFG)
+    with c.stream("POST", "/v1/chat/completions",
+                  json={**BUDGET_BODY, "stream": True}, headers=H()) as r:
+        assert r.status_code == 200
+        raw = b"".join(r.iter_bytes()).decode()
+    assert ": fusion fusing" in raw             # the panel succeeded first
+    data_lines = [l for l in raw.splitlines() if l.startswith("data: ")]
+    assert len(data_lines) == 1
+    assert json.loads(data_lines[0][6:])["error"]["type"] == "budget_exhausted"
+    import sqlite3
+    conn = sqlite3.connect(tmp_path / "g.sqlite")
+    rows = conn.execute("SELECT model, state FROM ledger").fetchall()
+    assert len(rows) == 4
+    assert all(state == "settled" for _, state in rows), rows

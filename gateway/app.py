@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -18,8 +19,7 @@ from gateway.config import load_config
 from gateway.db import Store, connect
 from gateway.events import EventLog
 from gateway.fusion import (
-    PanelResult, best_candidate, call_model, fuser_body, gather_panel,
-    openai_response,
+    best_candidate, call_model, fuser_body, gather_panel, openai_response,
 )
 from gateway.ledger import BudgetTripped, Ledger, estimate_tokens
 from gateway.policy import UnknownModel, plan_route
@@ -212,8 +212,20 @@ def create_app(
                 return JSONResponse(status_code=503,
                                     content={"error": {"type": "budget_exhausted"}})
 
-            text, source = await _finish_fusion(panel, body, fcfg, common,
-                                                request_id)
+            try:
+                text, source = await _finish_fusion(panel, body, fcfg, common,
+                                                    request_id)
+            except BudgetTripped:
+                # The fuser's own preflight (inside call_model) tripped the
+                # budget after the panel already spent -- e.g. a killswitch
+                # trip mid-panel, or a concurrent request crossing the cap in
+                # the window between gather_panel and this preflight. Without
+                # this catch it propagated out of the handler as a gateway
+                # 500 with the `requests` row left 'open'.
+                events.append(request_id, "budget.tripped", {"model": fcfg.fuser})
+                _finish_request(store, request_id, "failed", clock)
+                return JSONResponse(status_code=503,
+                                    content={"error": {"type": "budget_exhausted"}})
             if text is None:
                 _finish_request(store, request_id, "failed", clock)
                 return JSONResponse(status_code=502,
@@ -260,53 +272,108 @@ def create_app(
             events.append(request_id, "call.attempt",
                           {"model": fcfg.fuser, "stage": "fuser"})
             start = clock.now()
+            deadline = time.monotonic() + fcfg.stage_timeout_s
             accumulated = bytearray()
             first_byte = False
+            resolved = False   # True once this row has been settle()d or fail()d.
+
+            async def _fuser_gave_nothing(kind):
+                """The fuser produced zero bytes -- a pre-first-byte error, a
+                pre-first-byte timeout, or a 2xx with an empty body all land
+                here. Fail its ledger row and fall back to the best
+                candidate, rendered through _as_chunks since the client
+                already has an open stream and must still get one."""
+                nonlocal resolved
+                resolved = True
+                ledger.fail(entry_id)
+                events.append(request_id, "call.failed",
+                              {"model": fcfg.fuser, "stage": "fuser",
+                               "kind": kind})
+                fallback = best_candidate(fcfg, panel)
+                if fallback is None:
+                    _finish_request(store, request_id, "failed", clock)
+                    yield b'data: {"error": {"type": "upstream_exhausted"}}\n\n'
+                    return
+                events.append(request_id, "fusion.degraded",
+                              {"rung": "fuser_failed", "model": fallback[0]})
+                _finish_request(store, request_id, "succeeded", clock)
+                for piece in _as_chunks(fallback[1], fcfg.model):
+                    yield piece
+
             try:
-                async for chunk in adapter.chat_stream(model_cfg.upstream_model, fbody):
-                    first_byte = True
-                    accumulated.extend(chunk)
-                    yield chunk
-            except Exception:
-                if not first_byte:
-                    ledger.fail(entry_id)
-                    events.append(request_id, "call.failed",
-                                  {"model": fcfg.fuser, "stage": "fuser",
-                                   "kind": "unknown"})
-                    # The fuser never spoke: fall back to the best candidate.
-                    fallback = best_candidate(fcfg, panel)
-                    if fallback is None:
-                        _finish_request(store, request_id, "failed", clock)
-                        yield b'data: {"error": {"type": "upstream_exhausted"}}\n\n'
+                try:
+                    stream_iter = adapter.chat_stream(
+                        model_cfg.upstream_model, fbody).__aiter__()
+                    while True:
+                        remaining = max(0.0, deadline - time.monotonic())
+                        try:
+                            # stage_timeout_s bounds stages 1-2 already; bound
+                            # the fuser's own stream the same way -- per
+                            # chunk, not for the whole call, so a fuser that
+                            # is genuinely still producing output at the
+                            # deadline isn't cut off mid-token, only one that
+                            # goes quiet is.
+                            chunk = await asyncio.wait_for(
+                                stream_iter.__anext__(), timeout=remaining)
+                        except StopAsyncIteration:
+                            break
+                        first_byte = True
+                        accumulated.extend(chunk)
+                        yield chunk
+                except Exception:
+                    if not first_byte:
+                        async for piece in _fuser_gave_nothing("unknown"):
+                            yield piece
                         return
-                    events.append(request_id, "fusion.degraded",
-                                  {"rung": "fuser_failed", "model": fallback[0]})
-                    _finish_request(store, request_id, "succeeded", clock)
-                    for piece in _as_chunks(fallback[1], fcfg.model):
+                    logger.exception("fusion stream failed request_id=%s", request_id)
+                    resolved = True
+                    ledger.settle(entry_id, est_in, max(len(accumulated) // 4, 0),
+                                  "estimated",
+                                  int((clock.now() - start).total_seconds() * 1000),
+                                  model_cfg.in_usd_per_mtok, model_cfg.out_usd_per_mtok)
+                    _finish_request(store, request_id, "failed", clock)
+                    yield b'data: {"error": {"type": "stream_failed"}}\n\n'
+                    return
+
+                if not first_byte:
+                    # A 2xx that yielded no bytes: nothing reached the client,
+                    # so it's still safe to fall back (mirrors the
+                    # single-model streaming loop's `empty_stream` handling).
+                    async for piece in _fuser_gave_nothing("empty_stream"):
                         yield piece
                     return
-                logger.exception("fusion stream failed request_id=%s", request_id)
-                ledger.settle(entry_id, est_in, max(len(accumulated) // 4, 0),
-                              "estimated",
-                              int((clock.now() - start).total_seconds() * 1000),
-                              model_cfg.in_usd_per_mtok, model_cfg.out_usd_per_mtok)
-                _finish_request(store, request_id, "failed", clock)
-                yield b'data: {"error": {"type": "stream_failed"}}\n\n'
-                return
 
-            latency_ms = int((clock.now() - start).total_seconds() * 1000)
-            raw = bytes(accumulated)
-            usage = parse_stream_usage(raw)
-            if usage and "prompt_tokens" in usage and "completion_tokens" in usage:
-                in_tok, out_tok, src = (usage["prompt_tokens"],
-                                        usage["completion_tokens"], "reported")
-            else:
-                in_tok, out_tok, src = est_in, max(len(raw) // 4, 0), "estimated"
-            ledger.settle(entry_id, in_tok, out_tok, src, latency_ms,
-                          model_cfg.in_usd_per_mtok, model_cfg.out_usd_per_mtok)
-            events.append(request_id, "fusion.fused",
-                          {"fuser": fcfg.fuser, "path": panel.path, "source": "fuser"})
-            _finish_request(store, request_id, "succeeded", clock)
+                latency_ms = int((clock.now() - start).total_seconds() * 1000)
+                raw = bytes(accumulated)
+                usage = parse_stream_usage(raw)
+                if usage and "prompt_tokens" in usage and "completion_tokens" in usage:
+                    in_tok, out_tok, src = (usage["prompt_tokens"],
+                                            usage["completion_tokens"], "reported")
+                else:
+                    in_tok, out_tok, src = est_in, max(len(raw) // 4, 0), "estimated"
+                resolved = True
+                ledger.settle(entry_id, in_tok, out_tok, src, latency_ms,
+                              model_cfg.in_usd_per_mtok, model_cfg.out_usd_per_mtok)
+                events.append(request_id, "fusion.fused",
+                              {"fuser": fcfg.fuser, "path": panel.path, "source": "fuser"})
+                _finish_request(store, request_id, "succeeded", clock)
+            finally:
+                if not resolved:
+                    # Reached only via a client disconnect / server shutdown:
+                    # asyncio.CancelledError and GeneratorExit are
+                    # BaseException, not Exception, so they skip every
+                    # `except Exception` above and land here instead. The
+                    # upstream call may already be billing, so settle at the
+                    # preflight estimate -- same treatment call_model gives a
+                    # cancelled leg in fusion.py -- rather than leaving the
+                    # row in 'preflight' (a CONSUMING_STATE only a restart
+                    # clears) or fail()ing it (which would post $0 for work
+                    # that may already be billed). `resolved` guards every
+                    # other exit path above, so this can fire at most once.
+                    ledger.settle(entry_id, est_in, max(len(accumulated) // 4, 0),
+                                  "estimated",
+                                  int((clock.now() - start).total_seconds() * 1000),
+                                  model_cfg.in_usd_per_mtok, model_cfg.out_usd_per_mtok)
 
         return StreamingResponse(gen(), media_type="text/event-stream",
                                  headers={"x-fusion-trace-id": request_id})
@@ -324,10 +391,24 @@ def create_app(
                           {"rung": "single_candidate", "model": fallback[0]})
             return fallback[1], "candidate"
 
-        text = await call_model(model_name=fcfg.fuser,
-                                body=fuser_body(fcfg, panel, body),
-                                kind="fuser",
-                                **{k: v for k, v in common.items() if k != "fcfg"})
+        try:
+            # stage_timeout_s bounds stages 1-2 (gather_panel) already;
+            # without a bound here the fuser call falls back to the
+            # adapter's 120s httpx default regardless of what the config
+            # says. call_model's own CancelledError handling (settle at the
+            # preflight estimate, then re-raise) is exactly what
+            # asyncio.wait_for's cancel-on-timeout triggers, so the ledger
+            # row is never left in 'preflight' by this timeout.
+            text = await asyncio.wait_for(
+                call_model(model_name=fcfg.fuser,
+                          body=fuser_body(fcfg, panel, body),
+                          kind="fuser",
+                          **{k: v for k, v in common.items() if k != "fcfg"}),
+                timeout=fcfg.stage_timeout_s)
+        except asyncio.TimeoutError:
+            events.append(request_id, "call.failed",
+                          {"model": fcfg.fuser, "stage": "fuser", "kind": "timeout"})
+            text = None
         if text:
             return text, "fuser"
         fallback = best_candidate(fcfg, panel)
