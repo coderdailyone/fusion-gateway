@@ -88,6 +88,13 @@ async def test_quorum_agreement_short_circuits_and_cancels_the_slow_leg(tmp_path
     panel = await gather_panel(body=BODY, **env)
     assert panel.path == "quorum"
     assert set(panel.candidates) == {"a", "b"}     # s never contributed
+    # Fix round 2 (coordinator review), finding 2: nothing anywhere asserted
+    # `degraded is False` on a healthy run -- both quorum members answered
+    # and agreed, so this is the one case that must NOT be flagged degraded.
+    # Mutation-tested: hardcoding `degraded=True` at both PanelResult
+    # construction sites in gather_panel passed all 23 pre-fix tests; this
+    # assertion is what catches it (see task-4-report.md, Fix round 1).
+    assert not panel.degraded
     rows = store.conn.execute(
         "SELECT model, state, usage_source FROM ledger ORDER BY id").fetchall()
     states = {(r["model"], r["state"]) for r in rows}
@@ -532,21 +539,92 @@ async def test_a_slow_candidate_past_the_stage_timeout_is_dropped(tmp_path):
                      reviewers=("a", "b"), fuser="b",
                      review_max_tokens=512, stage_timeout_s=0.05)
     ad = FakeAdapter(agree_script(), delays={"a": 1.0})
-    env, _ = make_env(tmp_path, ad)
+    env, store = make_env(tmp_path, ad)
     env["fcfg"] = fcfg
     panel = await gather_panel(body=BODY, **env)
     assert "a" not in panel.candidates
+    # Fix round 2 (coordinator review), finding 3: the dropped candidate's
+    # ledger row must still settle correctly -- not left in 'preflight', not
+    # wrongly `fail`ed (that would post $0 for work the upstream may already
+    # be billing). This is the same invariant
+    # `test_timed_out_quorum_member_leaves_no_running_task` pins from the
+    # "no leftover running task" angle; this asserts the ledger-row angle
+    # directly for the same scenario.
+    rows = store.conn.execute(
+        "SELECT model, state, usage_source FROM ledger WHERE model='a'").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["state"] == "settled"
+    assert rows[0]["usage_source"] == "estimated"
 
 
 @pytest.mark.anyio
 async def test_budget_tripped_propagates_and_strands_nothing(tmp_path):
-    ad = FakeAdapter(agree_script())
-    env, store = make_env(tmp_path, ad)
-    env["ledger"].trip()
+    """Fix round 2 (coordinator review), finding 1 (CRITICAL).
+
+    The original version of this test called `env["ledger"].trip()` BEFORE
+    `gather_panel` ran at all, so EVERY panel member's `ledger.preflight`
+    raises on its very first call -- no ledger row is ever inserted, for
+    anyone. `assert not any(state == 'preflight')` was then vacuously true
+    whether or not `gather_panel`'s `finally: await cancel_remaining()`
+    cleanup ran, since there was never a row (or a running task) to strand
+    in the first place. It only proved `BudgetTripped` propagates, which is
+    trivial -- `call_model` never catches it. Mutation-tested: deleting the
+    `finally: await cancel_remaining()` block from `gather_panel` left this
+    test green (see task-4-report.md, Fix round 1).
+
+    This version trips the budget genuinely MID-FLIGHT, the same shape as
+    `test_budget_trip_mid_review_leaves_no_running_task_or_preflight_row`
+    but at the CANDIDATE stage instead of the review stage: "a" is
+    deliberately slow (10s, far past `stage_timeout_s`), so `collect()`'s
+    `asyncio.wait_for(asyncio.shield(tasks["a"]), ...)` abandons waiting on
+    it via a genuine TIMEOUT -- `shield` means task "a" itself keeps
+    running in the background exactly as the module docstring describes.
+    `collect()` then moves on to quorum member "b"; the cap is sized to
+    admit exactly one candidate's preflight estimate (all three panel
+    members preflight the same `BODY`, so their estimates are identical),
+    so "b"'s preflight trips the budget while "a" is still asleep in the
+    background -- a genuine sibling-in-flight scenario, not a vacuous one.
+    """
+    in_tok, out_tok = estimate_tokens(BODY["messages"], BODY.get("max_tokens"))
+    candidate_cost = in_tok * 1.0 / 1e6 + out_tok * 1.0 / 1e6
+    cap = 1.5 * candidate_cost  # room for exactly one candidate's preflight
+
+    fcfg = FusionCfg(model="fusion", panel=("a", "b", "s"), quorum=("a", "b"),
+                     reviewers=("a", "b"), fuser="b",
+                     review_max_tokens=512, stage_timeout_s=0.05)
+    ad = FakeAdapter(agree_script(), delays={"a": 10})
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    store = Store(connect(tmp_path / "g.sqlite"))
+    clock = FakeClock()
+    store.conn.execute(
+        "INSERT INTO requests VALUES ('r1','t','prism','fusion','open',NULL)")
+    store.conn.commit()
+    real_ledger = Ledger(store, clock, cap_usd=cap, budget_name="T")
+    env = dict(fcfg=fcfg, cfg=FakeCfg(), adapters={"p": ad},
+               ledger=real_ledger, events=EventLog(store, clock), clock=clock,
+               request_id="r1")
+
+    before = asyncio.all_tasks() - {asyncio.current_task()}
     with pytest.raises(BudgetTripped):
         await gather_panel(body=BODY, **env)
-    rows = store.conn.execute("SELECT state FROM ledger").fetchall()
-    assert not any(r["state"] == "preflight" for r in rows)
+    after = asyncio.all_tasks() - {asyncio.current_task()}
+    leftover = after - before
+
+    assert not any(not t.done() for t in leftover), (
+        "gather_panel raised BudgetTripped with a candidate task still running")
+    rows = store.conn.execute(
+        "SELECT model, state, usage_source FROM ledger").fetchall()
+    assert not any(r["state"] == "preflight" for r in rows), (
+        f"a ledger row was left in preflight: {[dict(r) for r in rows]}")
+    # "a" is the sibling genuinely in flight when the trip landed on "b": it
+    # must be SETTLED with the preflight estimate (call_model's
+    # CancelledError branch), never left running past this function's
+    # return and never `fail`ed (fail() would post $0 for work the upstream
+    # may already be billing).
+    a_rows = [r for r in rows if r["model"] == "a"]
+    assert len(a_rows) == 1
+    assert a_rows[0]["state"] == "settled"
+    assert a_rows[0]["usage_source"] == "estimated"
 
 
 @pytest.mark.anyio
