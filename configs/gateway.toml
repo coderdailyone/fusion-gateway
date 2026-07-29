@@ -65,6 +65,33 @@ in_usd_per_mtok = 0.60
 out_usd_per_mtok = 2.50
 fallback = ["deepseek-chat"]
 
+[fusion]
+# Wired 2026-07-29 (M8). The panel and fuser are exactly what M5 measured at
+# 0.8901 on the 1063-task standard tier -- see docs/M5_FUSION_REPORT.md, and
+# note the win over the best single member was +1.1pt at p = 0.176, i.e. not
+# significant, and was measured on benchmark tasks rather than chat.
+model = "fusion"
+panel = ["deepseek-chat", "glm-5.2", "kimi-k3"]
+# If these two review each other "correct" AND their answers agree in
+# substance, M5's own majority-copy rule means the fuser must copy that
+# answer, which is lossless -- kimi-k3 cannot change the outcome, so it is
+# cancelled. But mutual "correct" verdicts do not require identical text: two
+# DIFFERING answers can each be judged correct by the other, and the
+# majority-copy rule only fires on identical text, so that case instead takes
+# the fuser's "resolve the objections" branch, where the discarded kimi-k3
+# answer genuinely could have changed the result. Cancelling kimi-k3 on the
+# quorum signal alone is therefore a deliberate quality-for-latency trade in
+# the differing-answer case, not a lossless win -- it is what turns ~73s into
+# ~15s on the common path.
+quorum = ["deepseek-chat", "glm-5.2"]
+# kimi-k3 is deliberately NOT a reviewer: it is a ~34s reasoning model and
+# would dominate the review stage. It remains a candidate, so its answer still
+# reaches the fuser on the full path.
+reviewers = ["deepseek-chat", "glm-5.2"]
+fuser = "glm-5.2"
+review_max_tokens = 512
+stage_timeout_s = 120
+
 [policy]
 version = "static-v0"
-default_model = "deepseek-chat"
+default_model = "fusion"

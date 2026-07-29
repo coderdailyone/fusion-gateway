@@ -2,9 +2,18 @@
 
 Every panel member's candidate call is launched at t=0. Only the QUORUM is
 awaited. If the quorum members review each other as correct, that is
-consensus -- and M5's fusion prompt requires the fuser to COPY a majority
-answer verbatim, so the slow leg provably cannot change the outcome and is
-cancelled. Otherwise the slow leg (running since t=0) is awaited and folded in.
+consensus, and the slow leg is cancelled. This is lossless when the two
+quorum answers also agree in substance: M5's fusion prompt requires the fuser
+to COPY that shared answer verbatim, so the slow leg provably cannot change
+it. But "each other correct" does not require identical text -- two
+DIFFERING answers can each be judged correct by the other, in which case the
+majority-copy rule never fires and the fuser instead resolves the specific
+objections raised, a branch the slow leg genuinely could have swung.
+`is_consensus` reads only the review verdicts, never the candidate texts, so
+it cannot tell the two cases apart; cancelling on it is a deliberate
+quality-for-latency trade in the differing-answer case, not a proven no-op.
+Otherwise (no consensus) the slow leg (running since t=0) is awaited and
+folded in.
 
 This module talks to upstreams only through the adapters `app.py` already
 built, and bills through the existing ledger: one row per upstream call, all

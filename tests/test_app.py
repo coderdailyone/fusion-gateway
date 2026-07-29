@@ -20,7 +20,7 @@ def make_client(tmp_path, monkeypatch, deepseek=ok_handler, glm=ok_handler):
     return TestClient(app)
 
 def H(tok="tokA"): return {"Authorization": f"Bearer {tok}"}
-BODY = {"model": "auto", "messages": [{"role": "user", "content": "hello"}]}
+BODY = {"model": "deepseek-chat", "messages": [{"role": "user", "content": "hello"}]}
 
 def test_auth_required(tmp_path, monkeypatch):
     c = make_client(tmp_path, monkeypatch)

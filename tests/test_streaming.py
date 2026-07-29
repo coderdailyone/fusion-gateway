@@ -8,7 +8,7 @@ SSE = (b'data: {"choices":[{"delta":{"content":"h"}}]}\n\n'
 def stream_handler(req):
     return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=SSE)
 
-BODY = {"model": "auto", "stream": True, "messages": [{"role":"user","content":"hi"}]}
+BODY = {"model": "deepseek-chat", "stream": True, "messages": [{"role":"user","content":"hi"}]}
 
 def test_stream_passthrough_and_settle(tmp_path, monkeypatch):
     c = make_client(tmp_path, monkeypatch, deepseek=stream_handler)

@@ -8,7 +8,9 @@ def test_loads_models_and_providers():
     cfg = load_config(GOOD)
     assert cfg.models["deepseek-chat"].fallback == ("glm-4.5-flash",)
     assert cfg.providers["glm"].api_key_env == "GLM_API_KEY"
-    assert cfg.default_model in cfg.models
+    # default_model names the fusion pseudo-model, which is deliberately not
+    # a [models] entry; load_config admits it explicitly.
+    assert cfg.default_model == cfg.fusion.model
     # M1 runs deliberately uncapped: cap_usd is omitted, which loads as None.
     assert cfg.budget_caps[cfg.active_budget] is None
 

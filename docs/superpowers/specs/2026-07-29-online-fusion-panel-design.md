@@ -68,9 +68,16 @@ The fix comes out of M5's own fusion prompt, which says:
 
 With three candidates a majority is two. **So when deepseek-chat and glm-5.2
 agree and neither review objects, the fuser is required to copy that answer —
-kimi-k3 cannot change the outcome.** Waiting for it is provably wasted time,
-not a quality/speed trade. M5 measured 79% unanimity on mmlu_pro, so most
-requests take this path.
+kimi-k3 cannot change the outcome.** That is lossless when the two quorum
+answers agree in substance. But the review verdict alone doesn't guarantee
+that: deepseek-chat and glm-5.2 can give *different* answers and each judge
+the other's "correct" without the text matching, and the majority-copy rule
+only fires on identical text — so that case instead takes the fuser's
+"resolve the specific objections raised" branch, where kimi-k3's discarded
+answer genuinely could have changed the result. Cancelling kimi-k3 on the
+quorum-consensus signal is therefore a deliberate quality-for-latency trade in
+the differing-answer case, not provably wasted time in general. M5 measured
+79% unanimity on mmlu_pro, so most requests take this path.
 
 ```
 t=0     deepseek-chat ∥ glm-5.2  (quorum candidates)
