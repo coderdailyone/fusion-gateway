@@ -478,3 +478,85 @@ def test_extract_text_is_defensive_about_malformed_upstream_responses():
     parts = [{"type": "text", "text": "hi"}, "skip-me",
              {"type": "text", "text": "there"}]
     assert _extract_text({"choices": [{"message": {"content": parts}}]}) == "hi\nthere"
+
+
+# -- Task 4: the degradation ladder -----------------------------------------
+
+@pytest.mark.anyio
+async def test_one_dead_panel_member_does_not_stop_fusion(tmp_path):
+    ad = FakeAdapter(agree_script(), errors={"a"})
+    env, _ = make_env(tmp_path, ad)
+    panel = await gather_panel(body=BODY, **env)
+    assert "a" not in panel.candidates and panel.degraded
+
+
+@pytest.mark.anyio
+async def test_a_single_surviving_candidate_yields_no_reviews(tmp_path):
+    # Fewer than 2 candidates: there is nothing to cross-review and nothing to
+    # fuse. app.py returns the survivor verbatim (Task 5).
+    ad = FakeAdapter(agree_script(), errors={"a", "s"})
+    env, _ = make_env(tmp_path, ad)
+    panel = await gather_panel(body=BODY, **env)
+    assert set(panel.candidates) == {"b"} and panel.reviews == {}
+    assert panel.degraded
+
+
+@pytest.mark.anyio
+async def test_zero_candidates_returns_an_empty_panel(tmp_path):
+    ad = FakeAdapter(agree_script(), errors={"a", "b", "s"})
+    env, _ = make_env(tmp_path, ad)
+    panel = await gather_panel(body=BODY, **env)
+    assert panel.candidates == {} and panel.degraded
+
+
+@pytest.mark.anyio
+async def test_all_reviews_failing_still_fuses(tmp_path):
+    # Reviews are evidence, not a precondition. The fusion prompt already
+    # renders "(no reviews available)".
+    def script(payload):
+        prompt = payload["messages"][0]["content"]
+        if "VERDICT" in prompt:
+            raise RuntimeError("reviewer exploded")
+        return "an answer"
+
+    ad = FakeAdapter({"a": script, "b": script, "s": script})
+    env, _ = make_env(tmp_path, ad)
+    panel = await gather_panel(body=BODY, **env)
+    assert panel.reviews == {} and panel.path == "full"
+    assert len(panel.candidates) >= 2
+
+
+@pytest.mark.anyio
+async def test_a_slow_candidate_past_the_stage_timeout_is_dropped(tmp_path):
+    fcfg = FusionCfg(model="fusion", panel=("a", "b", "s"), quorum=("a", "b"),
+                     reviewers=("a", "b"), fuser="b",
+                     review_max_tokens=512, stage_timeout_s=0.05)
+    ad = FakeAdapter(agree_script(), delays={"a": 1.0})
+    env, _ = make_env(tmp_path, ad)
+    env["fcfg"] = fcfg
+    panel = await gather_panel(body=BODY, **env)
+    assert "a" not in panel.candidates
+
+
+@pytest.mark.anyio
+async def test_budget_tripped_propagates_and_strands_nothing(tmp_path):
+    ad = FakeAdapter(agree_script())
+    env, store = make_env(tmp_path, ad)
+    env["ledger"].trip()
+    with pytest.raises(BudgetTripped):
+        await gather_panel(body=BODY, **env)
+    rows = store.conn.execute("SELECT state FROM ledger").fetchall()
+    assert not any(r["state"] == "preflight" for r in rows)
+
+
+@pytest.mark.anyio
+async def test_no_ledger_row_is_ever_left_in_preflight(tmp_path):
+    # The invariant that matters most: 'preflight' is a CONSUMING_STATE cleared
+    # only by _recover_orphans at startup, so a stranded row holds budget
+    # forever. Exercise every path and assert none strands.
+    for errors, delays in (((), {"s": 3}), (("a",), {}), (("a", "b", "s"), {})):
+        ad = FakeAdapter(agree_script(), delays=delays, errors=errors)
+        env, store = make_env(tmp_path / f"{errors}{delays}", ad)
+        await gather_panel(body=BODY, **env)
+        rows = store.conn.execute("SELECT state FROM ledger").fetchall()
+        assert not any(r["state"] == "preflight" for r in rows), (errors, delays)
