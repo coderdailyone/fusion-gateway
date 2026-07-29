@@ -91,6 +91,12 @@ def load_config(path: Path) -> Config:
             raise ConfigError("fusion.quorum must be a subset of fusion.panel")
         if not set(reviewers) <= set(panel):
             raise ConfigError("fusion.reviewers must be a subset of fusion.panel")
+        if not set(quorum) <= set(reviewers):
+            # is_consensus() requires every candidate to also be a reviewer of
+            # the others; a quorum member missing from reviewers can never be
+            # judged, so consensus -- and the whole quorum short-circuit --
+            # would be silently unreachable forever.
+            raise ConfigError("fusion.quorum must be a subset of fusion.reviewers")
 
         review_max_tokens = int(f.get("review_max_tokens", 512))
         stage_timeout_s = float(f.get("stage_timeout_s", 120))

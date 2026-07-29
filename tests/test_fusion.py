@@ -4,11 +4,11 @@ import pytest
 from gateway.config import FusionCfg, ModelCfg, ProviderCfg
 from gateway.db import connect, Store
 from gateway.events import EventLog
-from gateway.ledger import Ledger
-from gateway.fusion_prompts import Verdict
+from gateway.ledger import BudgetTripped, Ledger, estimate_tokens
+from gateway.fusion_prompts import Verdict, build_review_prompt, render_conversation
 from gateway.fusion import (
     PanelResult, gather_panel, is_consensus, fuser_body, best_candidate,
-    openai_response,
+    openai_response, call_model, _extract_text,
 )
 from gateway.providers import ProviderError
 from tests.helpers import FakeClock
@@ -128,15 +128,130 @@ async def test_a_wrong_verdict_forces_the_full_path_even_if_answers_match(tmp_pa
 
 @pytest.mark.anyio
 async def test_slow_leg_starts_at_t0_not_after_the_quorum(tmp_path):
-    # The whole latency argument rests on this. If the slow leg were launched
-    # after the quorum decided, the full path would cost quorum + slow instead
-    # of max(quorum, slow).
-    ad = FakeAdapter(agree_script(), delays={"a": 0.2, "b": 0.2, "s": 0.2})
+    # Fix round 1, finding 4: the original version of this test used
+    # agree_script(), which takes the quorum ("consensus") path. On that path
+    # the slow leg's task is cancelled without ever being awaited, so WHEN it
+    # was launched cannot affect wall-clock either way -- the test could not
+    # tell a correct t=0 launch apart from a deliberately serial
+    # implementation that creates the slow task only after the quorum
+    # decides. Measured directly (3 runs each, agree_script, 0.2s delay):
+    #   real:   0.4493s, 0.4522s, 0.4531s
+    #   serial: 0.4369s, 0.4357s, 0.4350s
+    # Both comfortably pass the old `< 0.55` assertion, and serial is if
+    # anything FASTER (it skips launching the slow leg's task at all on this
+    # path) -- proof the old test could not tell a correct implementation
+    # from a broken one.
+    #
+    # This version uses a DISAGREEING script instead, so the full path runs
+    # and the slow leg is genuinely folded in and awaited -- only here does
+    # its start time matter. Measured in this environment, 5 runs each, same
+    # 0.2s delay on every panel member:
+    #   real   (all three launched at t=0):              0.6656s - 0.6706s
+    #   serial (slow leg launched only after the quorum
+    #           decides, i.e. candidates + review, THEN
+    #           slow leg + a second review round):        0.8626s - 0.8729s
+    # The ~0.2s gap is the whole latency argument for this milestone. The
+    # threshold below sits in the middle of it with margin both ways: a
+    # regression back to "launch the slow leg only when needed" would push
+    # this comfortably past 0.8s.
+    def disagree_script():
+        def script(payload):
+            prompt = payload["messages"][0]["content"]
+            if "VERDICT" in prompt:
+                targets = [n for n in ("a", "b", "s") if f"Candidate {n}" in prompt]
+                return "\n".join(f"VERDICT {t} wrong nope" for t in targets)
+            return "an answer"
+        return {"a": script, "b": script, "s": script}
+
+    ad = FakeAdapter(disagree_script(), delays={"a": 0.2, "b": 0.2, "s": 0.2})
     env, _ = make_env(tmp_path, ad)
     started = time.monotonic()
-    await gather_panel(body=BODY, **env)
-    # a, b and s all ran concurrently, then one review round: ~0.4s, not ~0.6s.
-    assert time.monotonic() - started < 0.55
+    panel = await gather_panel(body=BODY, **env)
+    elapsed = time.monotonic() - started
+    assert panel.path == "full"          # disagreement -- the slow leg was actually used
+    assert elapsed < 0.8, f"took {elapsed:.3f}s; see comment above for measured real/serial"
+
+
+class _ReviewOnlyDelayAdapter:
+    """Candidate calls (no "VERDICT" in the prompt) resolve instantly; review
+    calls sleep `delay`. Isolates the review stage's own timeout behaviour
+    from the candidate stage's, which FakeAdapter's flat per-model delay
+    cannot do (a reviewer's candidate call and its review call share an
+    upstream_model)."""
+    def __init__(self, delay):
+        self.delay = delay
+        self.calls = []
+
+    async def chat(self, upstream_model, payload):
+        self.calls.append((upstream_model, payload))
+        prompt = payload["messages"][0]["content"]
+        if "VERDICT" in prompt:
+            await asyncio.sleep(self.delay)
+            targets = [n for n in ("a", "b", "s") if f"Candidate {n}" in prompt]
+            text = "\n".join(f"VERDICT {t} wrong nope" for t in targets)
+        else:
+            text = "an answer"
+        return {"choices": [{"message": {"content": text}}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 4}}
+
+
+@pytest.mark.anyio
+async def test_review_stage_is_bounded_by_stage_timeout_s(tmp_path):
+    """Fix round 1, finding 2. The review stage previously had no timeout at
+    all -- `_cross_review`'s bare `asyncio.gather(...)` just awaited however
+    long the reviewers' upstream calls took, bounded only by httpx's 120s
+    default, paid TWICE on the full path (once for the quorum's review round,
+    once more after the slow leg joins).
+
+    Measured in this environment with stage_timeout_s=0.05 and a 1.0s review
+    upstream (candidates resolve instantly; the disagreeing script forces
+    both review rounds to run), 3 runs each:
+      before this fix: 2.0748s, 2.0809s, 2.0767s  (~2x the 1.0s review delay,
+                                                     i.e. fully unbounded)
+      after:           0.1718s, 0.1670s, 0.1639s  (~2x the 0.05s budget, as
+                                                     expected for two rounds)
+    """
+    fcfg = FusionCfg(model="fusion", panel=("a", "b", "s"), quorum=("a", "b"),
+                     reviewers=("a", "b"), fuser="b",
+                     review_max_tokens=512, stage_timeout_s=0.05)
+    ad = _ReviewOnlyDelayAdapter(delay=1.0)
+    env, _ = make_env(tmp_path, ad, fcfg=fcfg)
+    started = time.monotonic()
+    panel = await gather_panel(body=BODY, **env)
+    elapsed = time.monotonic() - started
+    assert panel.path == "full"
+    assert elapsed < 0.5, (
+        f"took {elapsed:.3f}s; review stage should be bounded near "
+        f"2x stage_timeout_s (0.05s), not the review upstream's 1.0s delay")
+
+
+@pytest.mark.anyio
+async def test_stage_timeout_bounds_the_whole_stage_not_each_member(tmp_path):
+    """Fix round 1, finding 3. `collect()` used to give each member its own
+    fresh `stage_timeout_s`, so the deadline accumulated: three hanging
+    quorum members under one `collect()` call cost ~3x the configured
+    budget, not ~1x.
+
+    Measured in this environment with stage_timeout_s=0.3 and three quorum
+    members that never respond (5s each), 1 run each (both are
+    deterministic -- the whole point is that hung members contribute nothing
+    but the timeout itself):
+      before this fix: 0.930s  (~3.1x the 0.3s budget)
+      after:           0.327s  (~1.1x the 0.3s budget)
+    """
+    fcfg = FusionCfg(model="fusion", panel=("a", "b", "s"), quorum=("a", "b", "s"),
+                     reviewers=("a", "b", "s"), fuser="b",
+                     review_max_tokens=512, stage_timeout_s=0.3)
+    ad = FakeAdapter(agree_script(), delays={"a": 5, "b": 5, "s": 5})
+    env, _ = make_env(tmp_path, ad, fcfg=fcfg)
+    started = time.monotonic()
+    panel = await gather_panel(body=BODY, **env)
+    elapsed = time.monotonic() - started
+    assert panel.degraded and not panel.candidates    # all three hung
+    assert elapsed < 0.6, (
+        f"took {elapsed:.3f}s; stage_timeout_s=0.3 should bound the WHOLE "
+        f"collect() call, not restart per member (which would cost ~0.9s "
+        f"for three hanging members)")
 
 
 @pytest.mark.anyio
@@ -174,6 +289,85 @@ async def test_timed_out_quorum_member_leaves_no_running_task(tmp_path):
     assert a_rows[0]["usage_source"] == "estimated"
 
 
+@pytest.mark.anyio
+async def test_budget_trip_mid_review_leaves_no_running_task_or_preflight_row(tmp_path):
+    """Fix round 1, finding 1 (CRITICAL).
+
+    The old `_cross_review` fanned reviewers out with a bare
+    `asyncio.gather(*(one(r) for r in reviewers))`, default
+    `return_exceptions=False`. `ledger.preflight` can raise `BudgetTripped`
+    for ANY reviewer independently (each reviewer's call is its own ledger
+    row). If a sibling reviewer is still in flight when one of them trips the
+    budget, gather() propagates immediately without cancelling or awaiting
+    that sibling -- its task is invisible to gather_panel's own `tasks` dict
+    (that only tracks panel-level CANDIDATE tasks, never review tasks), so it
+    is orphaned: still running, holding an upstream connection, its ledger
+    row stuck in 'preflight' (a CONSUMING_STATE) for as long as the upstream
+    call takes -- exactly when the budget accounting matters most.
+
+    This test uses the REAL `Ledger` (not a stub) with a cap computed to fit
+    every candidate call plus exactly one review call's preflight, but not a
+    second: reviewer "a" is deliberately slow so its review task is still in
+    flight when reviewer "b"'s preflight is checked immediately afterward and
+    trips. Costs are computed with the same `estimate_tokens`/
+    `build_review_prompt` calls production code uses, rather than hardcoded,
+    so the cap tracks the real formula.
+    """
+    text = "4"
+    tight_body = {"messages": [{"role": "user", "content": "2+2?"}],
+                  "max_tokens": 50}  # keeps candidate estimates comparable to
+                                     # review estimates (no default 1024 out)
+
+    # Cost of one candidate call once SETTLED (FakeAdapter always reports a
+    # fixed usage of 3 prompt / 4 completion tokens, price $1/Mtok each way).
+    candidate_settled_cost = 3 * 1.0 / 1e6 + 4 * 1.0 / 1e6
+    # All three panel members (a, b, s) launch at t=0 and settle, whether or
+    # not they end up in the quorum's `candidates` dict.
+    three_candidates_settled = 3 * candidate_settled_cost
+
+    # Cost of one reviewer's preflight ESTIMATE -- identical for "a" and "b"
+    # here since each reviews exactly one same-length candidate ("4").
+    conversation = render_conversation(tight_body["messages"])
+    candidates_preview = {"a": text, "b": text}
+    review_costs = set()
+    for reviewer in ("a", "b"):
+        prompt = build_review_prompt(conversation, candidates_preview, reviewer)
+        in_tok, out_tok = estimate_tokens(
+            [{"role": "user", "content": prompt}], FCFG.review_max_tokens)
+        review_costs.add(in_tok * 1.0 / 1e6 + out_tok * 1.0 / 1e6)
+    assert len(review_costs) == 1, "test assumption: both reviewers cost the same"
+    review_cost = review_costs.pop()
+
+    # Comfortably survives the candidate stage (settled cost is tiny), then
+    # fits exactly 1.5 review calls: the first reviewer's preflight succeeds,
+    # the second's does not.
+    cap = three_candidates_settled + 1.5 * review_cost
+
+    ad = FakeAdapter(agree_script(text), delays={"a": 0.3})
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    store = Store(connect(tmp_path / "g.sqlite"))
+    clock = FakeClock()
+    store.conn.execute(
+        "INSERT INTO requests VALUES ('r1','t','prism','fusion','open',NULL)")
+    store.conn.commit()
+    real_ledger = Ledger(store, clock, cap_usd=cap, budget_name="T")
+    env = dict(fcfg=FCFG, cfg=FakeCfg(), adapters={"p": ad},
+               ledger=real_ledger, events=EventLog(store, clock), clock=clock,
+               request_id="r1")
+
+    before = asyncio.all_tasks() - {asyncio.current_task()}
+    with pytest.raises(BudgetTripped):
+        await gather_panel(body=tight_body, **env)
+    after = asyncio.all_tasks() - {asyncio.current_task()}
+    leftover = after - before
+
+    assert not any(not t.done() for t in leftover), (
+        "gather_panel raised BudgetTripped with a review task still running")
+    rows = store.conn.execute("SELECT model, state FROM ledger").fetchall()
+    assert not any(r["state"] == "preflight" for r in rows), (
+        f"a ledger row was left in preflight: {[dict(r) for r in rows]}")
+
+
 def test_is_consensus_requires_every_pairwise_correct():
     c = {"a": "x", "b": "x"}
     assert is_consensus(c, {"a": {"b": Verdict("correct", "")},
@@ -193,6 +387,9 @@ def test_fuser_body_drops_client_tools_and_messages():
             "temperature": 0.3, "stream": True, "user": "someone"}
     out = fuser_body(FCFG, panel, body)
     assert "tools" not in out and "user" not in out
+    # Fix round 1, finding 9: a leaked `stream` key would make the fuser call
+    # itself streaming, which nothing downstream of gather_panel expects.
+    assert "stream" not in out
     assert len(out["messages"]) == 1 and out["messages"][0]["role"] == "user"
     assert "Candidate a" in out["messages"][0]["content"]
     assert out["max_tokens"] == 99 and out["temperature"] == 0.3
@@ -204,9 +401,80 @@ def test_best_candidate_prefers_panel_order():
     assert best_candidate(FCFG, PanelResult("Q", {}, {}, "full", True)) is None
 
 
+def test_best_candidate_skips_falsy_entries_in_the_sorted_fallback():
+    # Fix round 1, finding 8. Neither key is in FCFG.panel, so the first loop
+    # (configured panel order) finds nothing and falls through to the second
+    # loop (sorted candidate names). That second loop used to `return m,
+    # panel.candidates[m]` unconditionally, unlike the first -- so it could
+    # hand back an empty answer. "x" sorts before "y"; without the fix this
+    # would incorrectly return ("x", "").
+    panel = PanelResult("Q", {"x": "", "y": "answer"}, {}, "full", True)
+    assert best_candidate(FCFG, panel) == ("y", "answer")
+
+
 def test_openai_response_is_well_formed():
     r = openai_response("hi", "fusion", {"path": "quorum"})
     assert r["object"] == "chat.completion"
     assert r["choices"][0]["message"] == {"role": "assistant", "content": "hi"}
     assert r["choices"][0]["finish_reason"] == "stop"
     assert r["model"] == "fusion" and r["fusion"]["path"] == "quorum"
+
+
+# -- Fix round 1, finding 7: the money paths in call_model had no coverage --
+
+@pytest.mark.anyio
+async def test_call_model_provider_error_fails_never_settles(tmp_path):
+    """A ProviderError (upstream 4xx/5xx, timeout, network) must `fail` the
+    ledger row, not settle it -- no usage was billed by the upstream, so
+    settling would fabricate a cost."""
+    ad = FakeAdapter({}, errors={"a"})
+    env, store = make_env(tmp_path, ad)
+    text = await call_model(model_name="a", body=BODY, cfg=env["cfg"],
+                            adapters=env["adapters"], ledger=env["ledger"],
+                            events=env["events"], clock=env["clock"],
+                            request_id=env["request_id"], kind="candidate")
+    assert text is None
+    rows = store.conn.execute("SELECT model, state FROM ledger").fetchall()
+    assert [(r["model"], r["state"]) for r in rows] == [("a", "failed")]
+
+    kinds = [e.kind for e in env["events"].trace("r1")]
+    assert "call.failed" in kinds
+
+
+class _BrokenAdapter:
+    """Raises something that is neither ProviderError nor CancelledError --
+    e.g. a translator bug, a JSON-decode error on a malformed 200, or any
+    other upstream-adjacent surprise call_model's generic `except Exception`
+    net is there to catch."""
+    async def chat(self, upstream_model, payload):
+        raise RuntimeError("translator exploded")
+
+
+@pytest.mark.anyio
+async def test_call_model_unexpected_exception_fails_not_500s(tmp_path):
+    env, store = make_env(tmp_path, FakeAdapter({}))
+    env["adapters"] = {"p": _BrokenAdapter()}
+    text = await call_model(model_name="a", body=BODY, cfg=env["cfg"],
+                            adapters=env["adapters"], ledger=env["ledger"],
+                            events=env["events"], clock=env["clock"],
+                            request_id=env["request_id"], kind="candidate")
+    assert text is None
+    rows = store.conn.execute("SELECT model, state FROM ledger").fetchall()
+    assert [(r["model"], r["state"]) for r in rows] == [("a", "failed")]
+
+
+def test_extract_text_is_defensive_about_malformed_upstream_responses():
+    """The response is upstream-controlled; a raw index/key access would let
+    a malformed 200 500 the gateway. Every shape here must degrade to ''."""
+    assert _extract_text({"choices": [{"message": {"content": "hi"}}]}) == "hi"
+    assert _extract_text(None) == ""                       # TypeError
+    assert _extract_text("not even a dict") == ""           # TypeError
+    assert _extract_text({}) == ""                          # KeyError: choices
+    assert _extract_text({"choices": []}) == ""             # IndexError
+    assert _extract_text({"choices": [{}]}) == ""           # KeyError: message
+    assert _extract_text({"choices": [{"message": {}}]}) == ""       # KeyError: content
+    assert _extract_text({"choices": [{"message": {"content": 123}}]}) == ""  # not str/list
+    # OpenAI content-parts form, with a stray non-dict entry that must be skipped.
+    parts = [{"type": "text", "text": "hi"}, "skip-me",
+             {"type": "text", "text": "there"}]
+    assert _extract_text({"choices": [{"message": {"content": parts}}]}) == "hi\nthere"

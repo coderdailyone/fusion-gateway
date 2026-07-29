@@ -175,6 +175,15 @@ def test_reviewers_must_be_a_list(tmp_path):
         load_config(write(tmp_path, text))
 
 
+# Fix round 1, finding 6: a quorum member missing from reviewers can never be
+# judged, so is_consensus() can never fire for it -- the short-circuit this
+# whole milestone is built around would be silently dead on arrival.
+def test_quorum_must_be_a_subset_of_reviewers(tmp_path):
+    text = BASE.replace('reviewers = ["a", "b"]', 'reviewers = ["a"]')
+    with pytest.raises(ConfigError):    # quorum names "b", not in reviewers
+        load_config(write(tmp_path, text))
+
+
 # Finding 5: defaults are applied when keys are omitted
 def test_defaults_are_applied_when_omitted(tmp_path):
     text = BASE.replace('review_max_tokens = 512\nstage_timeout_s = 120\n', '')

@@ -159,7 +159,24 @@ def is_consensus(candidates: dict[str, str],
 
 async def _cross_review(*, candidates, fcfg, cfg, adapters, ledger, events,
                         clock, request_id, conversation):
-    """Each configured reviewer that produced a candidate judges the others."""
+    """Each configured reviewer that produced a candidate judges the others.
+
+    Bounded by one `stage_timeout_s` deadline for the WHOLE review stage
+    (fix round 1, finding 2 -- reviews previously had no bound at all beyond
+    httpx's 120s default, paid on top of the same unbounded candidate stage).
+    A reviewer that doesn't answer within the stage's remaining budget is
+    dropped, same treatment a slow candidate gets in `collect()`.
+
+    Each reviewer runs as an explicit task, not a bare `asyncio.gather(...)`
+    coroutine (fix round 1, finding 1 -- CRITICAL). `asyncio.gather` with its
+    default `return_exceptions=False` propagates the first sibling exception
+    immediately, without cancelling or awaiting the others. Since `ledger.
+    preflight` can raise `BudgetTripped` for ANY reviewer independently, that
+    left an orphaned running task and a ledger row stuck in `preflight` --
+    exactly at budget exhaustion, when the accounting matters most. The
+    `try/finally` below gives this stage the same "never return or raise
+    with a task still running" invariant `gather_panel` already has.
+    """
     reviewers = [r for r in fcfg.reviewers if r in candidates]
     if len(candidates) < 2 or not reviewers:
         return {}
@@ -167,7 +184,7 @@ async def _cross_review(*, candidates, fcfg, cfg, adapters, ledger, events,
     async def one(reviewer):
         targets = {m for m in candidates if m != reviewer}
         if not targets:
-            return reviewer, {}
+            return {}
         body = {"messages": [{"role": "user", "content":
                               build_review_prompt(conversation, candidates, reviewer)}],
                 "max_tokens": fcfg.review_max_tokens}
@@ -177,10 +194,68 @@ async def _cross_review(*, candidates, fcfg, cfg, adapters, ledger, events,
         parsed = parse_review(text, targets)
         events.append(request_id, "fusion.review",
                       {"reviewer": reviewer, "verdicts": len(parsed)})
-        return reviewer, parsed
+        return parsed
 
-    done = await asyncio.gather(*(one(r) for r in reviewers))
-    return {r: v for r, v in done if v}
+    deadline = time.monotonic() + fcfg.stage_timeout_s
+    tasks = {r: asyncio.create_task(one(r)) for r in reviewers}
+    try:
+        remaining = max(0.0, deadline - time.monotonic())
+        # FIRST_EXCEPTION, not the ALL_COMPLETED default: the moment any
+        # reviewer's call raises (BudgetTripped from ledger.preflight, most
+        # importantly), stop waiting on the others immediately rather than
+        # riding out their full delay before reacting -- they get cancelled
+        # below instead of awaited out. When nothing raises this behaves
+        # exactly like ALL_COMPLETED.
+        await asyncio.wait(tasks.values(), timeout=remaining,
+                          return_when=asyncio.FIRST_EXCEPTION)
+
+        results: dict[str, dict] = {}
+        pending: list[str] = []
+        first_exc: BaseException | None = None
+        for reviewer, task in tasks.items():
+            if not task.done():
+                pending.append(reviewer)
+                continue
+            # `.exception()` retrieves it even when we don't act on it below,
+            # so asyncio never logs "Task exception was never retrieved" for
+            # a sibling we're about to discard in favour of the first one.
+            exc = task.exception()
+            if exc is not None:
+                if first_exc is None:
+                    first_exc = exc
+                continue
+            verdicts = task.result()
+            if verdicts:
+                results[reviewer] = verdicts
+
+        if first_exc is not None:
+            # `pending` here means "abandoned because a sibling blew up", not
+            # "timed out" -- don't mislabel it as the latter. The finally
+            # below cancels and awaits every one of them before this
+            # propagates, so gather_panel never sees a leftover task.
+            raise first_exc
+
+        for reviewer in pending:
+            events.append(request_id, "fusion.degraded",
+                          {"rung": "review_timeout", "model": reviewer})
+        return results
+    finally:
+        for task in tasks.values():
+            if not task.done():
+                task.cancel()
+        for task in tasks.values():
+            try:
+                await task
+            except asyncio.CancelledError:
+                # Swallow only a CancelledError this cleanup itself caused
+                # (task.cancelled() is True). A CancelledError here whose
+                # task is NOT actually cancelled means something else
+                # cancelled the coroutine we are running in (this function's
+                # own caller), and that must propagate, not be absorbed.
+                if not task.cancelled():
+                    raise
+            except Exception:
+                pass
 
 
 async def gather_panel(*, fcfg, cfg, adapters, ledger, events, clock,
@@ -211,14 +286,24 @@ async def gather_panel(*, fcfg, cfg, adapters, ledger, events, clock,
     tasks = {m: asyncio.create_task(candidate(m)) for m in fcfg.panel}
 
     async def collect(names):
+        """Await `names` against ONE deadline for this whole stage call.
+
+        Fix round 1, finding 3: giving each member its own fresh
+        `stage_timeout_s` makes the deadline accumulate -- three hanging
+        members under one `collect()` call cost ~3x the configured budget
+        instead of ~1x. `deadline` is computed once, up front, and every
+        member's `wait_for` gets whatever of it remains.
+        """
+        deadline = time.monotonic() + fcfg.stage_timeout_s
         got = {}
         for m in names:
+            remaining = max(0.0, deadline - time.monotonic())
             try:
                 text = await asyncio.wait_for(asyncio.shield(tasks[m]),
-                                              timeout=fcfg.stage_timeout_s)
+                                              timeout=remaining)
             except asyncio.TimeoutError:
                 # `shield` means only this wait is abandoned here -- tasks[m]
-                # itself keeps running. That is fine: `_cancel_remaining` in
+                # itself keeps running. That is fine: `cancel_remaining` in
                 # the finally below sweeps up anything still not done before
                 # gather_panel returns, whether it eventually finishes,
                 # itself times out, or never gets awaited again.
@@ -244,7 +329,18 @@ async def gather_panel(*, fcfg, cfg, adapters, ledger, events, clock,
         for task in tasks.values():
             try:
                 await task
-            except BaseException:
+            except asyncio.CancelledError:
+                # Fix round 1, finding 5: swallow only a CancelledError this
+                # cleanup itself caused (task.cancelled() is True). If it is
+                # NOT actually cancelled, this CancelledError was injected by
+                # something cancelling gather_panel's own coroutine -- e.g.
+                # the request handler task -- while we happened to be
+                # awaiting an already-finished child task here. That must
+                # propagate so gather_panel itself ends up cancelled, not
+                # swallowed into a normal return.
+                if not task.cancelled():
+                    raise
+            except Exception:
                 pass
 
     try:
@@ -288,7 +384,8 @@ def best_candidate(fcfg, panel: PanelResult):
         if panel.candidates.get(m):
             return m, panel.candidates[m]
     for m in sorted(panel.candidates):
-        return m, panel.candidates[m]
+        if panel.candidates[m]:
+            return m, panel.candidates[m]
     return None
 
 
