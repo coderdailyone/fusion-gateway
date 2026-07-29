@@ -230,3 +230,56 @@ models:   deepseek-chat | glm-4.5-flash | glm-5.2 | kimi-k3
 public endpoint holding real provider credit has no automatic ceiling. nginx
 rate-limits to 10 r/s with burst 20 per IP; the only hard brake is
 `POST /admin/killswitch/trip`, reachable on the box.
+
+## M8 fusion live smoke 2026-07-29 — fusion is now the default path
+
+First real fused requests. `policy.default_model = "fusion"`, so `model: "auto"`
+is answered by the panel.
+
+| | wall clock | result |
+|---|---:|---|
+| non-streaming | **5.86 s** | `path: quorum`, answer correct (17×23 = 391) |
+| streaming | **6.44 s** | 12 valid `chat.completion.chunk`s, text `1\n2\n3\n4\n5`, `[DONE]` |
+
+Streaming emitted **2 SSE comment keepalives** (`: fusion panel`, `: fusion
+fusing`) during stages 1–2, then the fuser's stream — comments a conformant SDK
+skips, so no idle timeout fires during the silent panel phase.
+
+### Ledger — 6 rows per request under one `request_id`, none stranded
+
+```
+deepseek-chat  settled  reported   $0.00003122   <- candidate
+glm-5.2        settled  reported   $0.00025560   <- candidate
+kimi-k3        failed   -          -             <- 403, uncharged
+deepseek-chat  settled  reported   $0.00005180   <- review
+glm-5.2        settled  reported   $0.00014140   <- review
+glm-5.2        settled  reported   $0.00030720   <- fuser
+```
+
+**Zero rows in `preflight`.** Total for both requests: **$0.001175**. Events
+recorded: `fusion.started`, `fusion.candidate` ×3, `fusion.review` ×2,
+`fusion.consensus`, `fusion.fused`, plus the usual `call.*` — full trace per
+request.
+
+### What this smoke does NOT establish
+
+**kimi-k3's quota is still exhausted** (HTTP 403 `access_terminated_error`,
+re-probed today after a reported top-up; the error says quota refreshes next
+cycle and that continuing now needs "extra usage" specifically). So the panel
+ran as **two models**, and kimi's leg failed instantly instead of taking ~34 s.
+
+That means the measured 5.9 s / 6.4 s **does not validate the latency model**
+(~15 s quorum path, ~44 s full path) — the slow leg that model exists to avoid
+was never slow. It does validate that the degradation ladder works under a real
+upstream failure: kimi 403s, its row is `failed` and uncharged, and the request
+succeeds on the remaining two with `degraded: false` (correct — kimi is not a
+quorum member and is cancelled on that path anyway).
+
+Re-run this smoke once kimi-k3 has quota to measure the real latency split.
+
+### Also unverified
+
+Whether the fusion quality gain transfers from benchmarks to chat. There is no
+grader on production traffic, so this cannot be measured online. M5's +1.1 pt
+was on benchmark tasks at p = 0.176 — not significant. See the spec's "What we
+know, and what we do not".
