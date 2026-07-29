@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import timedelta
@@ -16,6 +17,10 @@ from gateway.clock import Clock, SystemClock
 from gateway.config import load_config
 from gateway.db import Store, connect
 from gateway.events import EventLog
+from gateway.fusion import (
+    PanelResult, best_candidate, call_model, fuser_body, gather_panel,
+    openai_response,
+)
 from gateway.ledger import BudgetTripped, Ledger, estimate_tokens
 from gateway.policy import UnknownModel, plan_route
 from gateway.providers import ProviderAdapter, ProviderError, make_adapter, parse_stream_usage
@@ -92,6 +97,22 @@ def _recover_orphans(store: Store, clock: Clock) -> None:
                 (rid,),
             )
         store.conn.commit()
+
+
+def _as_chunks(text: str, model: str) -> list[bytes]:
+    """Render a plain answer as a minimal OpenAI chunk stream.
+
+    Used when the fuser dies before its first byte and a candidate's answer is
+    served instead: the client already opened a stream, so it must receive one.
+    """
+    chunk = {"id": f"chatcmpl-{uuid.uuid4().hex}", "object": "chat.completion.chunk",
+             "created": int(time.time()), "model": model,
+             "choices": [{"index": 0, "delta": {"content": text},
+                          "finish_reason": None}]}
+    done = dict(chunk, choices=[{"index": 0, "delta": {}, "finish_reason": "stop"}])
+    return [f"data: {json.dumps(chunk)}\n\n".encode(),
+            f"data: {json.dumps(done)}\n\n".encode(),
+            b"data: [DONE]\n\n"]
 
 
 def create_app_from_env() -> FastAPI:
@@ -178,6 +199,144 @@ def create_app(
     async def list_models(principal: str = Depends(get_principal)):
         return {"data": [{"id": name} for name in cfg.models]}
 
+    async def _fusion_request(*, request_id, body, streaming, fcfg):
+        common = dict(fcfg=fcfg, cfg=cfg, adapters=adapters, ledger=ledger,
+                      events=events, clock=clock, request_id=request_id)
+
+        if not streaming:
+            try:
+                panel = await gather_panel(body=body, **common)
+            except BudgetTripped:
+                events.append(request_id, "budget.tripped", {"model": fcfg.model})
+                _finish_request(store, request_id, "failed", clock)
+                return JSONResponse(status_code=503,
+                                    content={"error": {"type": "budget_exhausted"}})
+
+            text, source = await _finish_fusion(panel, body, fcfg, common,
+                                                request_id)
+            if text is None:
+                _finish_request(store, request_id, "failed", clock)
+                return JSONResponse(status_code=502,
+                                    content={"error": {"type": "upstream_exhausted"}})
+            _finish_request(store, request_id, "succeeded", clock)
+            meta = {"path": panel.path, "panel": sorted(panel.candidates),
+                    "fuser": fcfg.fuser, "degraded": panel.degraded or source != "fuser",
+                    "answered_by": source}
+            events.append(request_id, "fusion.fused",
+                          {"fuser": fcfg.fuser, "path": panel.path, "source": source})
+            return JSONResponse(content=openai_response(text, fcfg.model, meta),
+                                headers={"x-fusion-trace-id": request_id})
+
+        async def gen():
+            # Stages 1-2 produce nothing visible and can take tens of seconds.
+            # SSE comment lines are the spec's keepalive and are skipped by
+            # conformant parsers (including the OpenAI SDKs), so an idle client
+            # timeout does not fire while the panel works.
+            yield b": fusion panel\n\n"
+            try:
+                panel = await gather_panel(body=body, **common)
+            except BudgetTripped:
+                events.append(request_id, "budget.tripped", {"model": fcfg.model})
+                _finish_request(store, request_id, "failed", clock)
+                yield b'data: {"error": {"type": "budget_exhausted"}}\n\n'
+                return
+            yield b": fusion fusing\n\n"
+
+            fbody = dict(fuser_body(fcfg, panel, body), stream=True)
+            model_cfg = cfg.models[fcfg.fuser]
+            adapter = adapters[model_cfg.provider]
+            est_in, est_out = estimate_tokens(fbody["messages"],
+                                              fbody.get("max_tokens"))
+            try:
+                entry_id = ledger.preflight(
+                    request_id, model_cfg.provider, fcfg.fuser, est_in, est_out,
+                    model_cfg.in_usd_per_mtok, model_cfg.out_usd_per_mtok)
+            except BudgetTripped:
+                events.append(request_id, "budget.tripped", {"model": fcfg.fuser})
+                _finish_request(store, request_id, "failed", clock)
+                yield b'data: {"error": {"type": "budget_exhausted"}}\n\n'
+                return
+
+            events.append(request_id, "call.attempt",
+                          {"model": fcfg.fuser, "stage": "fuser"})
+            start = clock.now()
+            accumulated = bytearray()
+            first_byte = False
+            try:
+                async for chunk in adapter.chat_stream(model_cfg.upstream_model, fbody):
+                    first_byte = True
+                    accumulated.extend(chunk)
+                    yield chunk
+            except Exception:
+                if not first_byte:
+                    ledger.fail(entry_id)
+                    events.append(request_id, "call.failed",
+                                  {"model": fcfg.fuser, "stage": "fuser",
+                                   "kind": "unknown"})
+                    # The fuser never spoke: fall back to the best candidate.
+                    fallback = best_candidate(fcfg, panel)
+                    if fallback is None:
+                        _finish_request(store, request_id, "failed", clock)
+                        yield b'data: {"error": {"type": "upstream_exhausted"}}\n\n'
+                        return
+                    events.append(request_id, "fusion.degraded",
+                                  {"rung": "fuser_failed", "model": fallback[0]})
+                    _finish_request(store, request_id, "succeeded", clock)
+                    for piece in _as_chunks(fallback[1], fcfg.model):
+                        yield piece
+                    return
+                logger.exception("fusion stream failed request_id=%s", request_id)
+                ledger.settle(entry_id, est_in, max(len(accumulated) // 4, 0),
+                              "estimated",
+                              int((clock.now() - start).total_seconds() * 1000),
+                              model_cfg.in_usd_per_mtok, model_cfg.out_usd_per_mtok)
+                _finish_request(store, request_id, "failed", clock)
+                yield b'data: {"error": {"type": "stream_failed"}}\n\n'
+                return
+
+            latency_ms = int((clock.now() - start).total_seconds() * 1000)
+            raw = bytes(accumulated)
+            usage = parse_stream_usage(raw)
+            if usage and "prompt_tokens" in usage and "completion_tokens" in usage:
+                in_tok, out_tok, src = (usage["prompt_tokens"],
+                                        usage["completion_tokens"], "reported")
+            else:
+                in_tok, out_tok, src = est_in, max(len(raw) // 4, 0), "estimated"
+            ledger.settle(entry_id, in_tok, out_tok, src, latency_ms,
+                          model_cfg.in_usd_per_mtok, model_cfg.out_usd_per_mtok)
+            events.append(request_id, "fusion.fused",
+                          {"fuser": fcfg.fuser, "path": panel.path, "source": "fuser"})
+            _finish_request(store, request_id, "succeeded", clock)
+
+        return StreamingResponse(gen(), media_type="text/event-stream",
+                                 headers={"x-fusion-trace-id": request_id})
+
+    async def _finish_fusion(panel, body, fcfg, common, request_id):
+        """Run the fuser. Returns (text, source) with source in
+        {"fuser", "candidate"}, or (None, "none") when nothing survived."""
+        if len(panel.candidates) < 2:
+            fallback = best_candidate(fcfg, panel)
+            if fallback is None:
+                events.append(request_id, "fusion.degraded",
+                              {"rung": "no_candidates"})
+                return None, "none"
+            events.append(request_id, "fusion.degraded",
+                          {"rung": "single_candidate", "model": fallback[0]})
+            return fallback[1], "candidate"
+
+        text = await call_model(model_name=fcfg.fuser,
+                                body=fuser_body(fcfg, panel, body),
+                                kind="fuser",
+                                **{k: v for k, v in common.items() if k != "fcfg"})
+        if text:
+            return text, "fuser"
+        fallback = best_candidate(fcfg, panel)
+        if fallback is None:
+            return None, "none"
+        events.append(request_id, "fusion.degraded",
+                      {"rung": "fuser_failed", "model": fallback[0]})
+        return fallback[1], "candidate"
+
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request, principal: str = Depends(get_principal)):
         body = await request.json()
@@ -188,6 +347,15 @@ def create_app(
         _insert_request(store, request_id, principal, requested_model, clock)
         events.append(request_id, "request.received",
                        {"model": requested_model, "client": principal})
+
+        fcfg = cfg.fusion
+        resolved = (cfg.default_model
+                    if requested_model in ("", "auto") else requested_model)
+        if fcfg is not None and resolved == fcfg.model:
+            return await _fusion_request(
+                request_id=request_id, body=body, streaming=streaming,
+                fcfg=fcfg,
+            )
 
         try:
             plan = plan_route(cfg, requested_model)
