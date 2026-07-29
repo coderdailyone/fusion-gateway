@@ -44,9 +44,15 @@ Three things follow, and the spec is honest about all of them:
 - Panel is **deepseek-chat + glm-5.2 + kimi-k3**, fuser is **glm-5.2** — the
   configuration M5 measured, unchanged. (kimi-k3's quota is exhausted; the user
   is topping it up. The design degrades safely until then.)
-- **Fusion is the default.** `policy.default_model` becomes `fusion`, so a
-  request that names no model gets fused. Naming a model explicitly
-  (`"deepseek-chat"`) still takes the single-model path unchanged.
+- **Fusion is opt-in, standalone, and exposed on the public base URL.**
+  `policy.default_model` stays `deepseek-chat`; a request that names no model
+  (or `"auto"`/`""`) takes the ordinary single-model path, unchanged. A client
+  reaches fusion only by naming it explicitly (`model: "fusion"`), and
+  `/v1/models` lists it alongside the real models so it is discoverable —
+  that listing is the only thing that makes "select it by name" actually
+  reachable for a client that enumerates models first. This was reversed from
+  an earlier decision to make fusion the default; existing default traffic is
+  untouched by this feature.
 - Cost and compute are **not** constraints ("目标是效果好而非省钱", "不惜算力").
   Latency is treated as a correctness concern, not a cost one.
 - `gateway/` **must not import `evaluator/`**. The evaluator pulls litellm,
@@ -58,8 +64,9 @@ Three things follow, and the spec is honest about all of them:
 Naively, fusion is three serial stages, each waiting on its slowest member.
 kimi-k3 is a reasoning model measured at ~34 s per call, so it is the bottleneck
 in both the candidate and the review stage: **34 + 34 + 5 ≈ 73 s**, against
-0.8 s for a single deepseek call. As the default path that is not a cost
-problem, it is an availability problem — many clients time out at 60 s.
+0.8 s for a single deepseek call. For a client that opts into fusion that is
+not merely a cost problem, it is an availability problem — many clients time
+out at 60 s.
 
 The fix comes out of M5's own fusion prompt, which says:
 
@@ -152,9 +159,8 @@ Candidates get the client's body verbatim, so `response_format`, `stop`,
 does not: `fuser_body` builds a fresh single-message body and passes through
 only an explicit allowlist (`_FUSER_PASSTHROUGH`). Final whole-branch review,
 finding 6 found `response_format` and `stop` were missing from it — a client
-in JSON mode silently got prose back on the default (fusion) path, and a
-client-supplied `stop` sequence was ignored by the answer the client actually
-received. Both are now passed through: the fuser is an ordinary completions
+in JSON mode silently got prose back on the fusion path, and a client-supplied
+`stop` sequence was ignored by the answer the client actually received. Both are now passed through: the fuser is an ordinary completions
 call to the same kind of upstream the candidates use, so "the fuser writes
 the final answer" should mean the final answer honours the same
 `response_format`/`stop` contract the candidates' answers did. `n` is
@@ -188,8 +194,12 @@ may be omitted entirely — then no fusion pseudo-model is served and
 ## Request flow
 
 `plan_route` is unchanged. `app.py` resolves the requested model first: if it
-equals `cfg.fusion.model` (including via `"auto"`/`""` → `default_model`), the
-fusion path runs; otherwise the existing single-model chain runs untouched.
+equals `cfg.fusion.model` (including via `"auto"`/`""` → `default_model`, were
+`default_model` ever set to the fusion pseudo-model), the fusion path runs;
+otherwise the existing single-model chain runs untouched. In the shipped
+config `default_model` is `deepseek-chat`, so `"auto"`/`""` take the
+single-model path — a client only reaches fusion by naming `"fusion"`
+explicitly.
 
 **Non-streaming** returns a normal OpenAI response with `model: "fusion"`, plus
 a non-standard `"fusion"` object (`path`, `panel`, `fuser`, `degraded`) that
@@ -286,9 +296,10 @@ New events, all under the request's id: `fusion.started` (panel, quorum),
 
 ## Acceptance criteria
 
-1. `model: "fusion"` and an unspecified model both return a fused answer;
-   naming a real model still takes the single-model path with no behaviour
-   change.
+1. `model: "fusion"` returns a fused answer; naming a real model, or naming no
+   model at all (`"auto"`/`""`, which resolves to `default_model`), still
+   takes the single-model path with no behaviour change — fusion is reached
+   only by naming it explicitly.
 2. The quorum short-circuit fires when the two fast members agree, cancels the
    slow leg, and its output equals what full fusion would have produced under
    the majority-copy rule.

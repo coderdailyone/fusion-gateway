@@ -34,6 +34,61 @@ def test_happy_path_settles_ledger(tmp_path, monkeypatch):
     st = c.get("/admin/status", headers=H("tokB")).json()
     assert st["ledger"]["consumed_usd"] > 0 and st["requests"]["succeeded"] == 1
 
+def test_auto_now_takes_the_single_model_path(tmp_path, monkeypatch):
+    # Fusion reverted to opt-in: policy.default_model is deepseek-chat again,
+    # so a request naming "auto" (or no model) no longer gets fused.
+    c = make_client(tmp_path, monkeypatch)
+    r = c.post("/v1/chat/completions", json={**BODY, "model": "auto"}, headers=H())
+    assert r.status_code == 200
+    assert r.json()["model"] == "deepseek-chat"
+    assert "fusion" not in r.json()
+
+
+def test_v1_models_lists_the_fusion_pseudo_model_when_configured(tmp_path, monkeypatch):
+    # configs/gateway.toml keeps [fusion] configured even though it is no
+    # longer the default -- a client can only reach it by name, so it must
+    # be discoverable here.
+    c = make_client(tmp_path, monkeypatch)
+    r = c.get("/v1/models", headers=H())
+    assert r.status_code == 200
+    ids = [m["id"] for m in r.json()["data"]]
+    assert "fusion" in ids
+    assert "deepseek-chat" in ids   # ordinary [models] entries still listed
+
+
+NO_FUSION_CFG = """
+[budget]
+active = "T"
+[budgets.T]
+[providers.p]
+base_url = "https://example.invalid"
+api_key_env = "P_KEY"
+[models."m1"]
+provider = "p"
+upstream_model = "m1"
+in_usd_per_mtok = 1.0
+out_usd_per_mtok = 1.0
+fallback = []
+[policy]
+version = "test-v0"
+default_model = "m1"
+"""
+
+
+def test_v1_models_omits_fusion_when_not_configured(tmp_path, monkeypatch):
+    monkeypatch.setenv("GATEWAY_TOKENS", "prism:tokA,admin:tokB")
+    monkeypatch.setenv("P_KEY", "sk-p")
+    p = tmp_path / "g.toml"
+    p.write_text(NO_FUSION_CFG)
+    app = create_app(p, tmp_path / "g.sqlite", clock=FakeClock())
+    c = TestClient(app)
+    r = c.get("/v1/models", headers=H())
+    assert r.status_code == 200
+    ids = [m["id"] for m in r.json()["data"]]
+    assert ids == ["m1"]
+    assert "fusion" not in ids
+
+
 def test_fallback_chain_on_provider_error(tmp_path, monkeypatch):
     c = make_client(tmp_path, monkeypatch, deepseek=boom_handler)
     r = c.post("/v1/chat/completions", json=BODY, headers=H())

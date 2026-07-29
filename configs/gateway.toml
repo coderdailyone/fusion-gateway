@@ -66,10 +66,14 @@ out_usd_per_mtok = 2.50
 fallback = ["deepseek-chat"]
 
 [fusion]
-# Wired 2026-07-29 (M8). The panel and fuser are exactly what M5 measured at
-# 0.8901 on the 1063-task standard tier -- see docs/M5_FUSION_REPORT.md, and
-# note the win over the best single member was +1.1pt at p = 0.176, i.e. not
-# significant, and was measured on benchmark tasks rather than chat.
+# Wired 2026-07-29 (M8), opt-in as of the same day: this is NOT
+# policy.default_model. A client reaches it only by naming it explicitly
+# (model: "fusion") on the public base URL; a request naming no model gets
+# the ordinary single-model path, unchanged. The panel and fuser are exactly
+# what M5 measured at 0.8901 on the 1063-task standard tier -- see
+# docs/M5_FUSION_REPORT.md, and note the win over the best single member was
+# +1.1pt at p = 0.176, i.e. not significant, and was measured on benchmark
+# tasks rather than chat.
 model = "fusion"
 panel = ["deepseek-chat", "glm-5.2", "kimi-k3"]
 # If these two review each other "correct" AND their answers agree in
@@ -94,4 +98,4 @@ stage_timeout_s = 120
 
 [policy]
 version = "static-v0"
-default_model = "fusion"
+default_model = "deepseek-chat"

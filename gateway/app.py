@@ -197,7 +197,13 @@ def create_app(
 
     @app.get("/v1/models")
     async def list_models(principal: str = Depends(get_principal)):
-        return {"data": [{"id": name} for name in cfg.models]}
+        # Fusion is opt-in, selected by name (model: "fusion") -- it is
+        # deliberately not a [models] entry, so without this it would be
+        # unlisted and undiscoverable to any client that enumerates models.
+        ids = list(cfg.models)
+        if cfg.fusion is not None:
+            ids.append(cfg.fusion.model)
+        return {"data": [{"id": name} for name in ids]}
 
     async def _fusion_request(*, request_id, body, streaming, fcfg):
         common = dict(fcfg=fcfg, cfg=cfg, adapters=adapters, ledger=ledger,

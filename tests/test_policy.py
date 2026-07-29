@@ -10,10 +10,14 @@ def test_explicit_default_chain_still_routes():
     assert rp.chain == ("deepseek-chat", "glm-4.5-flash")
     assert rp.policy_version == "static-v0"
 
-def test_auto_now_resolves_to_the_fusion_pseudo_model():
-    # app.py intercepts this before plan_route; plan_route itself has no
-    # route for a pseudo-model, and saying so is correct.
-    assert CFG.default_model == "fusion"
+def test_auto_resolves_to_deepseek_chat_again_fusion_is_opt_in():
+    # Fusion reverted to opt-in: default_model names a real model again, so
+    # "auto"/"" take the single-model path. [fusion] is still configured
+    # (selectable by naming it explicitly), and plan_route itself still has
+    # no route for the pseudo-model -- app.py intercepts "fusion" before
+    # ever calling plan_route, so this remains correct to assert directly.
+    assert CFG.default_model == "deepseek-chat"
+    assert CFG.fusion is not None and CFG.fusion.model == "fusion"
     with pytest.raises(UnknownModel):
         plan_route(CFG, "fusion")
 
