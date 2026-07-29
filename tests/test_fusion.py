@@ -375,6 +375,70 @@ async def test_budget_trip_mid_review_leaves_no_running_task_or_preflight_row(tm
         f"a ledger row was left in preflight: {[dict(r) for r in rows]}")
 
 
+# -- Final whole-branch review, finding 3: the review stage ran twice even
+# when the slow leg contributed nothing -- same reviewers, same candidates,
+# same prompts, charged again for evidence that cannot change anything.
+
+@pytest.mark.anyio
+async def test_no_second_review_round_when_the_slow_leg_adds_nothing(tmp_path):
+    """kimi-k3 is 403ing in production right now, so every disagreeing
+    request was paying for this duplicate round today. Reproduced with the
+    slow member failing outright (matches production): only ONE review round
+    (2 calls: a reviews b, b reviews a) should ever run."""
+    review_calls = []
+
+    def script(payload):
+        prompt = payload["messages"][0]["content"]
+        if "VERDICT" in prompt:
+            review_calls.append(prompt)
+            targets = [n for n in ("a", "b", "s") if f"Candidate {n}" in prompt]
+            return "\n".join(f"VERDICT {t} wrong nope" for t in targets)
+        return "an answer"
+
+    ad = FakeAdapter({"a": script, "b": script}, errors={"s"})
+    env, _ = make_env(tmp_path, ad)
+    panel = await gather_panel(body=BODY, **env)
+    assert panel.path == "full"
+    assert set(panel.candidates) == {"a", "b"}      # s failed, never joined
+    assert len(review_calls) == 2, (
+        f"expected exactly 2 review calls (one round), got {len(review_calls)} "
+        f"-- the slow leg added no candidate, so a second round must not run")
+
+
+# -- Final whole-branch review, finding 4: the second review round REPLACED
+# the first instead of merging into it. If round 2 wholly fails, already-paid
+# round-1 verdicts were discarded and the fuser prompt fell back to "(no
+# reviews available)" even though round 1 succeeded and was billed.
+
+@pytest.mark.anyio
+async def test_round_2_review_failure_does_not_discard_round_1_verdicts(tmp_path):
+    calls = {"a": 0, "b": 0}
+
+    def candidate_or_review(model):
+        def fn(payload):
+            prompt = payload["messages"][0]["content"]
+            if "VERDICT" not in prompt:
+                return f"answer-{model}"       # disagreeing candidate text
+            calls[model] += 1
+            if calls[model] > 1:
+                raise RuntimeError("round 2 review blew up")
+            targets = [n for n in ("a", "b", "s") if f"Candidate {n}" in prompt]
+            return "\n".join(f"VERDICT {t} wrong round1-verdict" for t in targets)
+        return fn
+
+    ad = FakeAdapter({"a": candidate_or_review("a"), "b": candidate_or_review("b"),
+                      "s": lambda payload: "answer-s"})
+    env, _ = make_env(tmp_path, ad)
+    panel = await gather_panel(body=BODY, **env)
+
+    assert panel.path == "full"
+    assert set(panel.candidates) == {"a", "b", "s"}   # slow leg joined -> round 2 ran
+    # Round 1's verdicts must survive even though round 2 raised for both
+    # reviewers -- a bare `reviews = round2_result` would leave this {}.
+    assert panel.reviews.get("a", {}).get("b") is not None
+    assert panel.reviews.get("b", {}).get("a") is not None
+
+
 def test_is_consensus_requires_every_pairwise_correct():
     c = {"a": "x", "b": "x"}
     assert is_consensus(c, {"a": {"b": Verdict("correct", "")},
@@ -400,6 +464,25 @@ def test_fuser_body_drops_client_tools_and_messages():
     assert len(out["messages"]) == 1 and out["messages"][0]["role"] == "user"
     assert "Candidate a" in out["messages"][0]["content"]
     assert out["max_tokens"] == 99 and out["temperature"] == 0.3
+
+
+# -- Final whole-branch review, finding 6: response_format/stop reached the
+# candidates but were silently dropped for the fuser -- a client in JSON mode
+# got prose back on the default (fusion) path, and `stop` was ignored by the
+# answer the client actually received.
+
+def test_fuser_body_passes_response_format_and_stop_but_never_n():
+    panel = PanelResult("Q", {"a": "x", "b": "y"}, {}, "quorum", False)
+    body = {"messages": [{"role": "user", "content": "Q"}],
+            "response_format": {"type": "json_object"}, "stop": ["END"], "n": 2,
+            "max_tokens": 99, "temperature": 0.3}
+    out = fuser_body(FCFG, panel, body)
+    assert out["response_format"] == {"type": "json_object"}
+    assert out["stop"] == ["END"]
+    # The fuser must return exactly one answer -- passing `n` through would
+    # ask the upstream for several, and _extract_text only ever reads
+    # choices[0], silently discarding the rest while still paying for them.
+    assert "n" not in out
 
 
 def test_best_candidate_prefers_panel_order():

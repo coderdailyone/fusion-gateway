@@ -53,7 +53,15 @@ from gateway.providers import ProviderError
 logger = logging.getLogger(__name__)
 
 # Passed through to the fuser; everything else the client sent is dropped.
-_FUSER_PASSTHROUGH = ("max_tokens", "temperature", "top_p")
+# `response_format` and `stop` are here so a client in JSON mode gets JSON
+# back and a client-supplied stop sequence is honoured by the answer the
+# client actually receives (final review, finding 6) -- both the candidates
+# and the fuser are ordinary completions calls to the same kind of upstream,
+# so passing them through is exactly what "the fuser writes the final answer"
+# means. `n` is deliberately NOT here: the fuser must return exactly one
+# answer, and `_extract_text` only ever reads `choices[0]`, so passing `n`
+# through would ask (and pay) for extra choices that are silently discarded.
+_FUSER_PASSTHROUGH = ("max_tokens", "temperature", "top_p", "response_format", "stop")
 
 
 @dataclass(frozen=True)
@@ -379,12 +387,32 @@ async def gather_panel(*, fcfg, cfg, adapters, ledger, events, clock,
             return PanelResult(conversation, candidates, reviews, "quorum",
                                degraded=len(candidates) < len(fcfg.quorum))
 
-        candidates.update(await collect(slow))
-        if len(candidates) >= 2:
-            reviews = await _cross_review(
+        new_from_slow = await collect(slow)
+        candidates.update(new_from_slow)
+        # Fix (finding 3): only re-review when the slow leg actually added a
+        # candidate. Without this gate, a slow leg that failed or timed out
+        # (kimi-k3 is 403ing in production right now) still triggered a
+        # SECOND, byte-identical review round -- same reviewers, same
+        # candidates, same prompts -- charged twice for evidence that could
+        # not possibly change.
+        if new_from_slow and len(candidates) >= 2:
+            round2 = await _cross_review(
                 candidates=candidates, fcfg=fcfg, cfg=cfg, adapters=adapters,
                 ledger=ledger, events=events, clock=clock,
                 request_id=request_id, conversation=conversation)
+            # Fix (finding 4): merge round 2 into round 1 instead of
+            # replacing it. A bare `reviews = round2` discarded already-paid
+            # round-1 verdicts whenever round 2 failed wholly or partly (a
+            # reviewer timing out or erroring on the second call), leaving
+            # the fuser prompt saying "(no reviews available)" even though
+            # round 1 succeeded. A reviewer present in round 2 supersedes its
+            # own round-1 verdicts (it re-judged with the full candidate set,
+            # which is strictly more evidence); a reviewer ABSENT from round
+            # 2 keeps its round-1 verdicts rather than losing them.
+            merged = {r: dict(v) for r, v in reviews.items()}
+            for reviewer, verdicts in round2.items():
+                merged.setdefault(reviewer, {}).update(verdicts)
+            reviews = merged
         return PanelResult(conversation, candidates, reviews, "full",
                            degraded=len(candidates) < len(fcfg.panel))
     finally:

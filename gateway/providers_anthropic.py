@@ -143,7 +143,15 @@ class AnthropicAdapter:
                             # protocol properly: a bare return would leave it
                             # with no finish_reason and no [DONE], which is
                             # indistinguishable from a dropped connection.
-                            yield b'data: {"error": {"type": "upstream_error"}}\n\n'
+                            # Every prior yield here is a complete `_wire()`
+                            # frame (already terminated with its own \n\n), so
+                            # this is not vulnerable to app.py's finding-2
+                            # concatenation bug -- but a leading blank line is
+                            # a no-op for a conformant parser, so there is no
+                            # reason for this call site to be the one
+                            # exception to "every mid-stream error envelope in
+                            # this codebase is self-terminating on its own."
+                            yield b'\n\ndata: {"error": {"type": "upstream_error"}}\n\n'
                             for chunk in translator.finish():
                                 yield _wire(chunk)
                             yield b"data: [DONE]\n\n"

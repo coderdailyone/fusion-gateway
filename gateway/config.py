@@ -78,6 +78,13 @@ def load_config(path: Path) -> Config:
         fuser = f["fuser"]
         if len(panel) < 2:
             raise ConfigError("fusion.panel needs at least 2 models")
+        if len(set(panel)) != len(panel):
+            # A duplicate collapses to one task in gather_panel's `{m:
+            # asyncio.create_task(...) for m in fcfg.panel}` dict
+            # comprehension, so `len(candidates) < len(fcfg.panel)` is
+            # permanently true even when every distinct model answered --
+            # `degraded` pins true forever for this panel.
+            raise ConfigError("fusion.panel must not contain duplicates")
         if len(quorum) == 0:
             raise ConfigError("fusion.quorum must not be empty")
         if len(reviewers) == 0:

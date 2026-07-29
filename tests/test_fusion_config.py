@@ -190,3 +190,14 @@ def test_defaults_are_applied_when_omitted(tmp_path):
     cfg = load_config(write(tmp_path, text))
     assert cfg.fusion.review_max_tokens == 512
     assert cfg.fusion.stage_timeout_s == 120
+
+
+# Final whole-branch review, finding 8: a duplicate panel entry collapses to
+# one task in gather_panel's `tasks = {m: asyncio.create_task(...) for m in
+# fcfg.panel}` dict comprehension -- the duplicate silently vanishes, so
+# `len(candidates) < len(fcfg.panel)` is permanently true even when every
+# distinct model answered, pinning `degraded` true forever for that panel.
+def test_panel_must_not_contain_duplicates(tmp_path):
+    text = BASE.replace('panel = ["a", "b", "c"]', 'panel = ["a", "b", "a"]')
+    with pytest.raises(ConfigError):
+        load_config(write(tmp_path, text))

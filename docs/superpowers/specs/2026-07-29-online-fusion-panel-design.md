@@ -130,10 +130,38 @@ All of it is dropped.
 
 M5's prompts took `task.problem`, a single string. A chat request is
 `messages[]`. Candidate calls receive the client's `messages` **verbatim**, so
-multi-turn, system prompts and tool definitions all work unchanged. The review
-and fusion prompts need the problem as text, so `render_conversation(messages)`
-renders the conversation into a transcript block. The final user turn is what
-the candidates are answering; earlier turns are context.
+multi-turn and system prompts work unchanged. **Tool definitions do NOT** —
+final whole-branch review, finding 1 (CRITICAL) found that a request carrying
+`tools` or `tool_choice` never reaches a fuser at all: the standard OpenAI
+function-call shape (`message.content: null`, `tool_calls: [...]`) makes
+`_extract_text` return `""` for every candidate, so the panel ends up with
+zero usable candidates while still being billed in full. `app.py` therefore
+checks for `tools`/`tool_choice` **before** deciding to fuse and routes such a
+request to the single-model chain instead, starting from the panel's
+preferred member — fusing a tool call is not meaningful anyway, since the
+fuser writes prose and there is no sound way to merge divergent tool
+invocations. The review and fusion prompts need the problem as text, so
+`render_conversation(messages)` renders the conversation into a transcript
+block. The final user turn is what the candidates are answering; earlier
+turns are context.
+
+### Fuser parameters
+
+Candidates get the client's body verbatim, so `response_format`, `stop`,
+`n` and every other OpenAI field already reach them unchanged. The fuser
+does not: `fuser_body` builds a fresh single-message body and passes through
+only an explicit allowlist (`_FUSER_PASSTHROUGH`). Final whole-branch review,
+finding 6 found `response_format` and `stop` were missing from it — a client
+in JSON mode silently got prose back on the default (fusion) path, and a
+client-supplied `stop` sequence was ignored by the answer the client actually
+received. Both are now passed through: the fuser is an ordinary completions
+call to the same kind of upstream the candidates use, so "the fuser writes
+the final answer" should mean the final answer honours the same
+`response_format`/`stop` contract the candidates' answers did. `n` is
+deliberately **not** passed through — the fuser must return exactly one
+answer, and `_extract_text` only ever reads `choices[0]`, so forwarding `n`
+would pay for extra choices that are silently discarded. `max_tokens`,
+`temperature` and `top_p` were already passed through and are unchanged.
 
 ## Config
 
@@ -150,9 +178,12 @@ stage_timeout_s = 120
 
 `load_config` validates at load time, raising `ConfigError` for: a `panel`,
 `quorum`, `reviewers` or `fuser` entry not in `[models]`; a `quorum` that is not
-a subset of `panel`; a panel smaller than 2; or a `model` name that collides
-with a real `[models]` key. `[fusion]` may be omitted entirely — then no fusion
-pseudo-model is served and `default_model` must name a real model.
+a subset of `panel`; a panel smaller than 2; a duplicate entry in `panel`
+(final whole-branch review, finding 8 — a duplicate collapses to one task in
+`gather_panel`'s task dict, permanently pinning `degraded` true for that
+panel); or a `model` name that collides with a real `[models]` key. `[fusion]`
+may be omitted entirely — then no fusion pseudo-model is served and
+`default_model` must name a real model.
 
 ## Request flow
 
@@ -178,13 +209,24 @@ Each rung is an event with a reason, and the response says `degraded: true`.
 
 | condition | behaviour |
 |---|---|
+| the request carries `tools` or `tool_choice` | never fuse — route to the single-model chain from the panel's preferred member (finding 1a) |
 | a panel member fails or times out | continue with the rest |
 | **fewer than 2 candidates** succeed | return the single survivor verbatim, no fusion |
-| **zero candidates** succeed | `502 upstream_exhausted`, as today |
+| **zero usable candidates** succeed (non-streaming) | fall through to the single-model chain, starting from the panel's preferred member (including *its own* fallback chain); `502 upstream_exhausted` only if that also exhausts (finding 1b — was an unconditional 502 before this fix) |
 | all reviews fail | fuse anyway — the prompt already renders `(no reviews available)` |
 | the fuser fails | return the best candidate verbatim: the quorum-agreed answer if there was one, else the first surviving member in `panel` order |
 | `BudgetTripped` at any preflight | abort remaining stages, `503 budget_exhausted` |
 | a stage exceeds `stage_timeout_s` | treated as failure of the outstanding calls |
+
+"No usable text" includes an upstream error, a 2xx with `content: null` (a
+refusal, or a model that puts text only in `reasoning_content`), and —
+before finding 1a — the standard tool-call shape. The single-model fallback
+for the zero-candidates rung is currently wired for the **non-streaming**
+path only; the streaming path still calls the fuser regardless of candidate
+count. That streaming gap is a known, separate limitation left for a
+follow-up — it never 5xxs (the existing `_fuser_gave_nothing` fallback still
+applies if the fuser itself then fails), it is just not as resilient as the
+non-streaming path against a panel that produced nothing usable.
 
 The panel deliberately keeps the M5 rule that **two candidates are enough** to
 fuse. With kimi-k3's quota exhausted the panel is effectively two today, and
@@ -193,8 +235,14 @@ the gateway must serve traffic regardless.
 ## Billing and tracing
 
 **The ledger needs no change.** It already writes one row per upstream call
-keyed by `request_id`, so a fused request produces 5–7 rows sharing one id, and
-`consumed_usd` sums them correctly. Every call goes through the existing
+keyed by `request_id`. Final whole-branch review, finding 5: the row count is
+**never 5 or 7** — with the configured 3-model panel it is **6 rows** (3
+candidates + 2 reviews + 1 fuser) when the quorum reaches consensus, or when
+the full path's slow leg adds no new candidate to review (kimi-k3 403ing is
+exactly this case in production today — see finding 3 below), and **8 rows**
+(3 candidates + 2 reviews × 2 rounds + 1 fuser) only when the full path's slow
+leg succeeds and a genuine second review round runs. `consumed_usd` sums
+whichever rows exist correctly. Every call goes through the existing
 `preflight` → `settle`/`fail` path with the model's own prices.
 
 **Cancelled slow-leg calls are settled, not failed.** When the quorum
@@ -232,8 +280,9 @@ New events, all under the request's id: `fusion.started` (panel, quorum),
 - **Regression**: the existing 334 tests still pass, and a request naming a real
   model still takes the single-model path byte-identically.
 - **Live smoke (gated, real keys):** one fused non-streaming and one fused
-  streaming request; assert 5–7 ledger rows under one request id, a non-zero
-  delta, and a sane answer. Records the measured latency of both paths.
+  streaming request; assert 6 or 8 ledger rows under one request id (never 5
+  or 7 — see Billing above), a non-zero delta, and a sane answer. Records the
+  measured latency of both paths.
 
 ## Acceptance criteria
 

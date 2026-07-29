@@ -1,7 +1,7 @@
 import httpx, json
 from fastapi.testclient import TestClient
 from gateway.app import create_app
-from tests.helpers import FakeClock
+from tests.helpers import DelayedByteStream, FakeClock
 
 CFG = """
 [budget]
@@ -157,6 +157,117 @@ def test_fusion_writes_one_ledger_row_per_call_under_one_request_id(tmp_path, mo
     # 2 candidates + 2 reviews + 1 fuser
     assert len(rows) == 5
     assert not any(state == "preflight" for _, state in rows)
+
+
+# -- Final whole-branch review, finding 1 (CRITICAL): a tool-calling request
+# was billed for the whole panel and then handed a 502. Standard OpenAI
+# function-call shape (content: null, tool_calls: [...]) makes
+# `_extract_text` return "" for every candidate; `collect()`'s `if text:`
+# drops them all; zero candidates survive; `_finish_fusion` finds
+# `best_candidate` is None -> 502, even though naming the same model
+# explicitly works fine.
+
+def _tool_call_response(model):
+    return httpx.Response(200, json={
+        "choices": [{"message": {"content": None, "tool_calls": [
+            {"id": "call_1", "type": "function",
+             "function": {"name": "get_weather", "arguments": "{}"}}]},
+                    "finish_reason": "tool_calls"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+
+
+TOOLS = [{"type": "function", "function": {"name": "get_weather",
+                                           "parameters": {"type": "object"}}}]
+
+
+def test_a_tool_calling_request_bypasses_fusion_and_keeps_the_tool_call(tmp_path, monkeypatch):
+    def h(req):
+        return _tool_call_response(json.loads(req.content).get("model"))
+    c = make_client(tmp_path, monkeypatch, h=h)
+    r = c.post("/v1/chat/completions",
+              json={**BODY, "tools": TOOLS}, headers=H())
+    assert r.status_code == 200
+    body = r.json()
+    assert body["model"] != "fusion"          # single-model chain answered
+    assert "fusion" not in body
+    msg = body["choices"][0]["message"]
+    assert msg["tool_calls"][0]["function"]["name"] == "get_weather"
+
+
+def test_tool_choice_alone_also_bypasses_fusion(tmp_path, monkeypatch):
+    # tool_choice can be sent without a fresh `tools` list (e.g. a
+    # multi-turn conversation that already established the tool set) --
+    # either key alone must be enough to skip fusion.
+    def h(req):
+        return _tool_call_response(json.loads(req.content).get("model"))
+    c = make_client(tmp_path, monkeypatch, h=h)
+    r = c.post("/v1/chat/completions",
+              json={**BODY, "tool_choice": "auto"}, headers=H())
+    assert r.status_code == 200
+    assert r.json()["model"] != "fusion"
+
+
+def test_streaming_tool_calling_request_also_bypasses_fusion(tmp_path, monkeypatch):
+    # The critical repro was non-streaming (a clean 502), but the routing
+    # decision happens before either branch, so the streaming path must be
+    # covered too -- otherwise a tool-calling streaming request would have
+    # silently gone through the fuser and gotten prose back instead of its
+    # tool call, which is worse than a loud error. The handler distinguishes
+    # the fuser's own stream call (fuser_body strips `tools`) from the
+    # bypassed single-model chain's stream call (the client's body, `tools`
+    # and all, forwarded verbatim) by the presence of `tools` on the wire.
+    def h(req):
+        body = json.loads(req.content)
+        if body.get("stream") and body.get("tools"):
+            payload = json.dumps({
+                "choices": [{"index": 0, "delta": {
+                    "tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                                    "function": {"name": "get_weather", "arguments": "{}"}}]},
+                            "finish_reason": None}]})
+            sse = (f"data: {payload}\n\n"
+                  'data: {"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n'
+                  "data: [DONE]\n\n")
+            return httpx.Response(200, content=sse.encode(),
+                                  headers={"content-type": "text/event-stream"})
+        if body.get("stream"):
+            # The fuser's own stream (no `tools` -- fusion did NOT get
+            # bypassed): plain prose, no tool call in sight.
+            payload = json.dumps({"choices": [{"index": 0,
+                                               "delta": {"content": "FUSED PROSE"},
+                                               "finish_reason": None}]})
+            sse = (f"data: {payload}\n\n"
+                  'data: {"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n'
+                  "data: [DONE]\n\n")
+            return httpx.Response(200, content=sse.encode(),
+                                  headers={"content-type": "text/event-stream"})
+        # Non-streaming candidate/review calls the panel makes internally.
+        return _tool_call_response(body.get("model"))
+    c = make_client(tmp_path, monkeypatch, h=h)
+    with c.stream("POST", "/v1/chat/completions",
+                  json={**BODY, "tools": TOOLS, "stream": True}, headers=H()) as r:
+        assert r.status_code == 200
+        raw = b"".join(r.iter_bytes()).decode()
+    assert "get_weather" in raw
+    assert "stream_failed" not in raw and '"error"' not in raw
+
+
+# -- Final whole-branch review, finding 1b: "every candidate returned no
+# usable text" used to degrade straight to a 502. Paying for a panel and
+# then hard-failing is the worst outcome available -- fall through to the
+# single-model chain instead.
+
+def test_zero_usable_candidates_degrades_to_the_single_model_chain_not_502(tmp_path, monkeypatch):
+    def h(req):
+        # Every upstream call -- panel candidates AND the eventual
+        # single-model retry -- answers 200 with unusable (null) content, a
+        # refusal-shaped response with no extractable text.
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": None}, "finish_reason": "content_filter"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+    c = make_client(tmp_path, monkeypatch, h=h)
+    r = c.post("/v1/chat/completions", json=BODY, headers=H())
+    assert r.status_code == 200          # not 502
+    assert r.json()["model"] != "fusion"  # the single-model chain answered
 
 
 def test_all_upstreams_down_returns_502_not_500(tmp_path, monkeypatch):
@@ -346,6 +457,127 @@ def test_streaming_empty_fuser_stream_falls_back_to_the_best_candidate(tmp_path,
     # The fuser's own row must be fail()ed -- never settled as a paid
     # success, and never left in 'preflight'.
     assert rows[-1] == ("b", "failed")
+
+
+# -- Final whole-branch review, finding 7: the streaming fuser's bound was
+# wall-clock, not the per-chunk idle bound its own comment claims.
+
+def test_streaming_fuser_deadline_resets_per_chunk_not_wall_clock(tmp_path, monkeypatch):
+    """stage_timeout_s=1; the fuser emits a chunk every 0.3s (never idle more
+    than 0.3s) for 8 chunks -- ~2.4s of real time, comfortably over the 1s
+    budget in wall-clock terms but never idle anywhere near it. Before the
+    fix `deadline` was computed once before the loop and never reset, so
+    `remaining` hit zero around t=1s regardless of how recently a chunk
+    arrived, truncating the stream after 3 chunks with a spurious
+    stream_failed -- exactly what app.py's own comment at the wait_for call
+    says must NOT happen ('a fuser that is genuinely still producing output
+    at the deadline isn't cut off mid-token, only one that goes quiet is').
+    """
+    def h(req):
+        body = json.loads(req.content)
+        prompt = body["messages"][-1]["content"]
+        if "Produce the single best final answer" in prompt:
+            chunks = [
+                (f'data: {{"choices":[{{"index":0,"delta":{{"content":"{i}"}},'
+                 f'"finish_reason":null}}]}}\n\n').encode()
+                for i in range(8)]
+            chunks.append(b'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":4}}\n\n')
+            chunks.append(b"data: [DONE]\n\n")
+            return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                                  stream=DelayedByteStream(chunks, 0.3))
+        if "VERDICT" in prompt:
+            return httpx.Response(200, json={
+                "choices": [{"message": {"content": "VERDICT a correct ok\nVERDICT b correct ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "candidate answer"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+
+    cfg = CFG.replace("stage_timeout_s = 5", "stage_timeout_s = 1")
+    c = make_client(tmp_path, monkeypatch, h=h, cfg=cfg)
+    with c.stream("POST", "/v1/chat/completions",
+                  json={**BODY, "stream": True}, headers=H()) as r:
+        assert r.status_code == 200
+        raw = b"".join(r.iter_bytes()).decode()
+
+    assert "stream_failed" not in raw, f"stream was cut short:\n{raw}"
+    assert raw.rstrip().endswith("data: [DONE]")
+    contents = []
+    for line in raw.splitlines():
+        if line.startswith(": ") or not line.startswith("data: "):
+            continue
+        payload = line[6:].strip()
+        if payload == "[DONE]":
+            continue
+        obj = json.loads(payload)
+        if obj.get("choices"):
+            content = obj["choices"][0]["delta"].get("content")
+            if content is not None:
+                contents.append(content)
+    assert contents == [str(i) for i in range(8)], (
+        f"expected all 8 chunks, got {contents!r} -- the stream was cut off "
+        f"by a wall-clock deadline instead of an idle one")
+
+
+class _BrokenMidStream(httpx.AsyncByteStream):
+    """Yields one truncated raw chunk (no line terminator, mid-token) then
+    blows up -- simulates a real upstream connection dropping mid-flight."""
+    def __init__(self, first_chunk: bytes):
+        self.first_chunk = first_chunk
+
+    async def __aiter__(self):
+        yield self.first_chunk
+        raise RuntimeError("upstream connection dropped")
+
+    async def aclose(self) -> None:
+        pass
+
+
+def test_streaming_fuser_mid_stream_error_does_not_glue_onto_a_truncated_chunk(tmp_path, monkeypatch):
+    """Final whole-branch review, finding 2 (CRITICAL), fusion path. Same bug
+    as test_streaming.py's single-model pin, but for the fuser's own stream
+    -- M8 makes streaming fusion the default, so this is now the common
+    path. Reproduced end to end against the real openai SDK decoder."""
+    def h(req):
+        body = json.loads(req.content)
+        prompt = body["messages"][-1]["content"]
+        if "Produce the single best final answer" in prompt:
+            # A COMPLETE, valid data line -- the connection drops before the
+            # blank-line terminator that would normally follow it. That gap
+            # is exactly what the \n\n-prefix fix closes; a chunk cut
+            # mid-token produces unparseable JSON on its own regardless of
+            # what follows, which would not isolate this bug.
+            truncated = b'data: {"id":"x","choices":[{"index":0,"delta":{"content":"wor"},"finish_reason":null}]}'
+            return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                                  stream=_BrokenMidStream(truncated))
+        if "VERDICT" in prompt:
+            return httpx.Response(200, json={
+                "choices": [{"message": {"content": "VERDICT a correct ok\nVERDICT b correct ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "candidate answer"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+
+    c = make_client(tmp_path, monkeypatch, h=h)
+    with c.stream("POST", "/v1/chat/completions",
+                  json={**BODY, "stream": True}, headers=H()) as r:
+        assert r.status_code == 200
+        raw = b"".join(r.iter_bytes())
+    assert b"stream_failed" in raw
+
+    from openai import OpenAI
+    client = OpenAI(api_key="x", base_url="http://test",
+                    http_client=httpx.Client(transport=httpx.MockTransport(
+                        lambda req: httpx.Response(200, content=raw,
+                            headers={"content-type": "text/event-stream"}))))
+    stream = client.chat.completions.create(
+        model="fusion", messages=[{"role": "user", "content": "hi"}], stream=True)
+    try:
+        list(stream)
+    except Exception as e:
+        assert not isinstance(e, json.JSONDecodeError), (
+            f"the error envelope glued onto a truncated upstream line and "
+            f"broke the real SDK's decoder: {e!r}\nraw={raw!r}")
 
 
 def test_non_streaming_budget_trip_at_the_fuser_returns_503_not_500(tmp_path, monkeypatch):

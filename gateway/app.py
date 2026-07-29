@@ -227,9 +227,18 @@ def create_app(
                 return JSONResponse(status_code=503,
                                     content={"error": {"type": "budget_exhausted"}})
             if text is None:
-                _finish_request(store, request_id, "failed", clock)
-                return JSONResponse(status_code=502,
-                                    content={"error": {"type": "upstream_exhausted"}})
+                # Final review, finding 1b: paying for a panel and then
+                # hard-failing is the worst outcome available. Fall through
+                # to the single-model chain, starting from the panel's
+                # preferred member -- the same thing the client would have
+                # gotten by naming it explicitly, including ITS OWN fallback
+                # chain (which can reach a model outside the panel that may
+                # still be up when every panel member is down).
+                events.append(request_id, "fusion.degraded",
+                              {"rung": "zero_candidates_chain_fallback",
+                               "model": fcfg.panel[0]})
+                chain_plan = plan_route(cfg, fcfg.panel[0])
+                return await _run_chain_once(request_id, body, chain_plan.chain)
             _finish_request(store, request_id, "succeeded", clock)
             meta = {"path": panel.path, "panel": sorted(panel.candidates),
                     "fuser": fcfg.fuser, "degraded": panel.degraded or source != "fuser",
@@ -250,7 +259,13 @@ def create_app(
             except BudgetTripped:
                 events.append(request_id, "budget.tripped", {"model": fcfg.model})
                 _finish_request(store, request_id, "failed", clock)
-                yield b'data: {"error": {"type": "budget_exhausted"}}\n\n'
+                # Defensive hardening alongside finding 2's fix below: this
+                # site is provably safe already (the preceding keepalive
+                # comment always ends its own line cleanly), but a leading
+                # blank line is a no-op for a conformant parser, so there is
+                # no reason for this generator to have any error yield that
+                # ISN'T self-contained regardless of what precedes it.
+                yield b'\n\ndata: {"error": {"type": "budget_exhausted"}}\n\n'
                 return
             yield b": fusion fusing\n\n"
 
@@ -266,7 +281,7 @@ def create_app(
             except BudgetTripped:
                 events.append(request_id, "budget.tripped", {"model": fcfg.fuser})
                 _finish_request(store, request_id, "failed", clock)
-                yield b'data: {"error": {"type": "budget_exhausted"}}\n\n'
+                yield b'\n\ndata: {"error": {"type": "budget_exhausted"}}\n\n'
                 return
 
             events.append(request_id, "call.attempt",
@@ -292,7 +307,7 @@ def create_app(
                 fallback = best_candidate(fcfg, panel)
                 if fallback is None:
                     _finish_request(store, request_id, "failed", clock)
-                    yield b'data: {"error": {"type": "upstream_exhausted"}}\n\n'
+                    yield b'\n\ndata: {"error": {"type": "upstream_exhausted"}}\n\n'
                     return
                 events.append(request_id, "fusion.degraded",
                               {"rung": "fuser_failed", "model": fallback[0]})
@@ -312,7 +327,13 @@ def create_app(
                             # chunk, not for the whole call, so a fuser that
                             # is genuinely still producing output at the
                             # deadline isn't cut off mid-token, only one that
-                            # goes quiet is.
+                            # goes quiet is. That requires `deadline` itself
+                            # to be reset after every chunk (below) -- a
+                            # deadline computed once before this loop and
+                            # never touched again is a WALL-CLOCK bound on
+                            # the whole call, the exact thing this comment
+                            # says is not what happens here (final review,
+                            # finding 7).
                             chunk = await asyncio.wait_for(
                                 stream_iter.__anext__(), timeout=remaining)
                         except StopAsyncIteration:
@@ -320,6 +341,7 @@ def create_app(
                         first_byte = True
                         accumulated.extend(chunk)
                         yield chunk
+                        deadline = time.monotonic() + fcfg.stage_timeout_s
                 except Exception:
                     if not first_byte:
                         async for piece in _fuser_gave_nothing("unknown"):
@@ -332,7 +354,18 @@ def create_app(
                                   int((clock.now() - start).total_seconds() * 1000),
                                   model_cfg.in_usd_per_mtok, model_cfg.out_usd_per_mtok)
                     _finish_request(store, request_id, "failed", clock)
-                    yield b'data: {"error": {"type": "stream_failed"}}\n\n'
+                    # Final review, finding 2 (CRITICAL): `accumulated` holds
+                    # raw upstream bytes forwarded via bare `yield chunk`
+                    # above, cut at an arbitrary socket boundary -- there is
+                    # no guarantee the last byte sent was a clean SSE line
+                    # terminator. Concatenating the error envelope directly
+                    # onto that produced e.g. `..."content":"wordata:
+                    # {"error"...`, which the real openai SDK's SSEDecoder
+                    # cannot parse (JSONDecodeError, not a clean recognized
+                    # API error). A leading blank line is a no-op for a
+                    # conformant parser and closes out whatever line was left
+                    # open.
+                    yield b'\n\ndata: {"error": {"type": "stream_failed"}}\n\n'
                     return
 
                 if not first_byte:
@@ -418,144 +451,16 @@ def create_app(
                       {"rung": "fuser_failed", "model": fallback[0]})
         return fallback[1], "candidate"
 
-    @app.post("/v1/chat/completions")
-    async def chat_completions(request: Request, principal: str = Depends(get_principal)):
-        body = await request.json()
-        streaming = bool(body.get("stream"))
-
-        request_id = uuid.uuid4().hex
-        requested_model = body.get("model") or ""
-        _insert_request(store, request_id, principal, requested_model, clock)
-        events.append(request_id, "request.received",
-                       {"model": requested_model, "client": principal})
-
-        fcfg = cfg.fusion
-        resolved = (cfg.default_model
-                    if requested_model in ("", "auto") else requested_model)
-        if fcfg is not None and resolved == fcfg.model:
-            return await _fusion_request(
-                request_id=request_id, body=body, streaming=streaming,
-                fcfg=fcfg,
-            )
-
-        try:
-            plan = plan_route(cfg, requested_model)
-        except UnknownModel:
-            _finish_request(store, request_id, "failed", clock)
-            events.append(request_id, "route.failed", {"reason": "unknown_model"})
-            return JSONResponse(status_code=400, content={"error": {"type": "unknown_model"}})
-
-        with store.lock:
-            store.conn.execute(
-                "INSERT INTO decisions (request_id, policy_version, action, features, degraded) "
-                "VALUES (?, ?, 'route', ?, 0)",
-                (request_id, plan.policy_version, json.dumps({"chain": list(plan.chain)})),
-            )
-            store.conn.commit()
-        events.append(request_id, "route.planned",
-                       {"chain": list(plan.chain), "policy_version": plan.policy_version})
-
+    async def _run_chain_once(request_id, body, chain):
+        """Try each model in `chain` in order (non-streaming); always
+        returns a JSONResponse. This is the plain single-model path's own
+        loop, factored out so the fusion path's zero-usable-candidates
+        fallback (finding 1b, above) can reuse it exactly rather than
+        reimplementing the same preflight/settle/fallback bookkeeping."""
         messages = body.get("messages", [])
         max_tokens = body.get("max_tokens")
 
-        if streaming:
-            async def gen():
-                for model_name in plan.chain:
-                    model_cfg = cfg.models[model_name]
-                    adapter = adapters[model_cfg.provider]
-                    est_in, est_out = estimate_tokens(messages, max_tokens)
-
-                    try:
-                        entry_id = ledger.preflight(
-                            request_id, model_cfg.provider, model_name,
-                            est_in, est_out, model_cfg.in_usd_per_mtok, model_cfg.out_usd_per_mtok,
-                        )
-                    except BudgetTripped:
-                        events.append(request_id, "budget.tripped", {"model": model_name})
-                        _finish_request(store, request_id, "failed", clock)
-                        yield b'data: {"error": {"type": "budget_exhausted"}}\n\n'
-                        return
-
-                    events.append(request_id, "call.attempt", {"model": model_name})
-                    start = clock.now()
-                    accumulated = bytearray()
-                    first_byte = False
-                    try:
-                        async for chunk in adapter.chat_stream(model_cfg.upstream_model, body):
-                            first_byte = True
-                            accumulated.extend(chunk)
-                            yield chunk
-                    except ProviderError as exc:
-                        # Adapter contract: ProviderError is only raised before
-                        # the first byte reaches the client, so it's always
-                        # safe to fall back to the next model in the chain.
-                        ledger.fail(entry_id)
-                        events.append(
-                            request_id, "call.failed",
-                            {"model": model_name, "kind": exc.kind, "status": exc.status},
-                        )
-                        continue
-                    except Exception:
-                        if not first_byte:
-                            # Defensive: treat any pre-first-byte failure like
-                            # a ProviderError and fall back.
-                            ledger.fail(entry_id)
-                            events.append(
-                                request_id, "call.failed",
-                                {"model": model_name, "kind": "unknown"},
-                            )
-                            continue
-                        latency_ms = int((clock.now() - start).total_seconds() * 1000)
-                        in_tokens = est_in
-                        out_tokens = max(len(accumulated) // 4, 0)
-                        ledger.settle(
-                            entry_id, in_tokens, out_tokens, "estimated", latency_ms,
-                            model_cfg.in_usd_per_mtok, model_cfg.out_usd_per_mtok,
-                        )
-                        events.append(request_id, "call.failed",
-                                       {"model": model_name, "kind": "stream_error"})
-                        _finish_request(store, request_id, "failed", clock)
-                        yield b'data: {"error": {"type": "stream_failed"}}\n\n'
-                        return
-
-                    if not first_byte:
-                        # Upstream returned a 2xx with an empty body: no bytes
-                        # reached the client, so it's still safe to fall back.
-                        ledger.fail(entry_id)
-                        events.append(request_id, "call.failed",
-                                       {"model": model_name, "kind": "empty_stream"})
-                        continue
-
-                    latency_ms = int((clock.now() - start).total_seconds() * 1000)
-                    raw = bytes(accumulated)
-                    usage = parse_stream_usage(raw)
-                    if usage and "prompt_tokens" in usage and "completion_tokens" in usage:
-                        in_tokens = usage["prompt_tokens"]
-                        out_tokens = usage["completion_tokens"]
-                        usage_source = "reported"
-                    else:
-                        in_tokens = est_in
-                        out_tokens = max(len(raw) // 4, 0)
-                        usage_source = "estimated"
-
-                    ledger.settle(
-                        entry_id, in_tokens, out_tokens, usage_source, latency_ms,
-                        model_cfg.in_usd_per_mtok, model_cfg.out_usd_per_mtok,
-                    )
-                    events.append(request_id, "call.succeeded", {"model": model_name})
-                    _finish_request(store, request_id, "succeeded", clock)
-                    return
-
-                _finish_request(store, request_id, "failed", clock)
-                yield b'data: {"error": {"type": "upstream_exhausted"}}\n\n'
-
-            return StreamingResponse(
-                gen(),
-                media_type="text/event-stream",
-                headers={"x-fusion-trace-id": request_id},
-            )
-
-        for model_name in plan.chain:
+        for model_name in chain:
             model_cfg = cfg.models[model_name]
             adapter = adapters[model_cfg.provider]
             est_in, est_out = estimate_tokens(messages, max_tokens)
@@ -628,6 +533,166 @@ def create_app(
 
         _finish_request(store, request_id, "failed", clock)
         return JSONResponse(status_code=502, content={"error": {"type": "upstream_exhausted"}})
+
+    @app.post("/v1/chat/completions")
+    async def chat_completions(request: Request, principal: str = Depends(get_principal)):
+        body = await request.json()
+        streaming = bool(body.get("stream"))
+
+        request_id = uuid.uuid4().hex
+        requested_model = body.get("model") or ""
+        _insert_request(store, request_id, principal, requested_model, clock)
+        events.append(request_id, "request.received",
+                       {"model": requested_model, "client": principal})
+
+        fcfg = cfg.fusion
+        resolved = (cfg.default_model
+                    if requested_model in ("", "auto") else requested_model)
+        if fcfg is not None and resolved == fcfg.model:
+            wants_tools = bool(body.get("tools")) or body.get("tool_choice") is not None
+            if not wants_tools:
+                return await _fusion_request(
+                    request_id=request_id, body=body, streaming=streaming,
+                    fcfg=fcfg,
+                )
+            # Final review, finding 1a (CRITICAL): fusing a tool call is not
+            # meaningful -- the fuser writes prose, and there is no sound way
+            # to merge divergent tool invocations. The standard OpenAI
+            # function-call shape (`message.content: null`, `tool_calls:
+            # [...]`) makes `_extract_text` return "" for every candidate, so
+            # the panel ended up with zero usable candidates, was billed in
+            # full, and then handed back a 502 -- while naming the same
+            # model explicitly worked fine (see the corrected "Conversation
+            # rendering" section of the M8 spec). Route to the single-model
+            # chain instead, starting from the panel's preferred member, the
+            # same as if the client had named it explicitly.
+            events.append(request_id, "fusion.bypassed",
+                          {"reason": "tools", "model": fcfg.panel[0]})
+            requested_model = fcfg.panel[0]
+
+        try:
+            plan = plan_route(cfg, requested_model)
+        except UnknownModel:
+            _finish_request(store, request_id, "failed", clock)
+            events.append(request_id, "route.failed", {"reason": "unknown_model"})
+            return JSONResponse(status_code=400, content={"error": {"type": "unknown_model"}})
+
+        with store.lock:
+            store.conn.execute(
+                "INSERT INTO decisions (request_id, policy_version, action, features, degraded) "
+                "VALUES (?, ?, 'route', ?, 0)",
+                (request_id, plan.policy_version, json.dumps({"chain": list(plan.chain)})),
+            )
+            store.conn.commit()
+        events.append(request_id, "route.planned",
+                       {"chain": list(plan.chain), "policy_version": plan.policy_version})
+
+        messages = body.get("messages", [])
+        max_tokens = body.get("max_tokens")
+
+        if streaming:
+            async def gen():
+                for model_name in plan.chain:
+                    model_cfg = cfg.models[model_name]
+                    adapter = adapters[model_cfg.provider]
+                    est_in, est_out = estimate_tokens(messages, max_tokens)
+
+                    try:
+                        entry_id = ledger.preflight(
+                            request_id, model_cfg.provider, model_name,
+                            est_in, est_out, model_cfg.in_usd_per_mtok, model_cfg.out_usd_per_mtok,
+                        )
+                    except BudgetTripped:
+                        events.append(request_id, "budget.tripped", {"model": model_name})
+                        _finish_request(store, request_id, "failed", clock)
+                        yield b'\n\ndata: {"error": {"type": "budget_exhausted"}}\n\n'
+                        return
+
+                    events.append(request_id, "call.attempt", {"model": model_name})
+                    start = clock.now()
+                    accumulated = bytearray()
+                    first_byte = False
+                    try:
+                        async for chunk in adapter.chat_stream(model_cfg.upstream_model, body):
+                            first_byte = True
+                            accumulated.extend(chunk)
+                            yield chunk
+                    except ProviderError as exc:
+                        # Adapter contract: ProviderError is only raised before
+                        # the first byte reaches the client, so it's always
+                        # safe to fall back to the next model in the chain.
+                        ledger.fail(entry_id)
+                        events.append(
+                            request_id, "call.failed",
+                            {"model": model_name, "kind": exc.kind, "status": exc.status},
+                        )
+                        continue
+                    except Exception:
+                        if not first_byte:
+                            # Defensive: treat any pre-first-byte failure like
+                            # a ProviderError and fall back.
+                            ledger.fail(entry_id)
+                            events.append(
+                                request_id, "call.failed",
+                                {"model": model_name, "kind": "unknown"},
+                            )
+                            continue
+                        latency_ms = int((clock.now() - start).total_seconds() * 1000)
+                        in_tokens = est_in
+                        out_tokens = max(len(accumulated) // 4, 0)
+                        ledger.settle(
+                            entry_id, in_tokens, out_tokens, "estimated", latency_ms,
+                            model_cfg.in_usd_per_mtok, model_cfg.out_usd_per_mtok,
+                        )
+                        events.append(request_id, "call.failed",
+                                       {"model": model_name, "kind": "stream_error"})
+                        _finish_request(store, request_id, "failed", clock)
+                        # Final review, finding 2 (CRITICAL) -- the ORIGINAL
+                        # site (inherited by the fusion path above). Same
+                        # reasoning: `accumulated` is raw, arbitrarily-cut
+                        # upstream bytes, so a leading blank line before the
+                        # error envelope is required, not decorative.
+                        yield b'\n\ndata: {"error": {"type": "stream_failed"}}\n\n'
+                        return
+
+                    if not first_byte:
+                        # Upstream returned a 2xx with an empty body: no bytes
+                        # reached the client, so it's still safe to fall back.
+                        ledger.fail(entry_id)
+                        events.append(request_id, "call.failed",
+                                       {"model": model_name, "kind": "empty_stream"})
+                        continue
+
+                    latency_ms = int((clock.now() - start).total_seconds() * 1000)
+                    raw = bytes(accumulated)
+                    usage = parse_stream_usage(raw)
+                    if usage and "prompt_tokens" in usage and "completion_tokens" in usage:
+                        in_tokens = usage["prompt_tokens"]
+                        out_tokens = usage["completion_tokens"]
+                        usage_source = "reported"
+                    else:
+                        in_tokens = est_in
+                        out_tokens = max(len(raw) // 4, 0)
+                        usage_source = "estimated"
+
+                    ledger.settle(
+                        entry_id, in_tokens, out_tokens, usage_source, latency_ms,
+                        model_cfg.in_usd_per_mtok, model_cfg.out_usd_per_mtok,
+                    )
+                    events.append(request_id, "call.succeeded", {"model": model_name})
+                    _finish_request(store, request_id, "succeeded", clock)
+                    return
+
+                _finish_request(store, request_id, "failed", clock)
+                yield b'\n\ndata: {"error": {"type": "upstream_exhausted"}}\n\n'
+
+            return StreamingResponse(
+                gen(),
+                media_type="text/event-stream",
+                headers={"x-fusion-trace-id": request_id},
+            )
+
+        return await _run_chain_once(request_id, body, plan.chain)
 
     @app.get("/admin/status")
     async def admin_status(principal: str = Depends(require_admin)):
