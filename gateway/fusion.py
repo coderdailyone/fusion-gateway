@@ -216,6 +216,19 @@ async def _cross_review(*, candidates, fcfg, cfg, adapters, ledger, events,
             if not task.done():
                 pending.append(reviewer)
                 continue
+            # `Task.exception()` RAISES CancelledError for a task in the
+            # cancelled state -- it does not return it. Nothing in this loop
+            # cancels these tasks before we get here (that only happens in
+            # the `finally` below, after this loop has already run), so this
+            # guard is currently unreachable dead code on any live path --
+            # but it must stay: one refactor that starts cancelling a
+            # reviewer task earlier (e.g. a per-reviewer timeout) would turn
+            # `task.exception()` into a crash here otherwise. Treat a
+            # cancelled task the same as "not done" -- there is no verdict to
+            # collect from it either way.
+            if task.cancelled():
+                pending.append(reviewer)
+                continue
             # `.exception()` retrieves it even when we don't act on it below,
             # so asyncio never logs "Task exception was never retrieved" for
             # a sibling we're about to discard in favour of the first one.
