@@ -19,10 +19,21 @@ class ModelCfg:
     fallback: tuple[str, ...]
 
 @dataclass(frozen=True)
+class FusionCfg:
+    model: str                      # the pseudo-model clients request
+    panel: tuple[str, ...]          # every candidate, in preference order
+    quorum: tuple[str, ...]         # agreement here short-circuits the slow leg
+    reviewers: tuple[str, ...]      # who cross-reviews (may exclude slow models)
+    fuser: str                      # writes the final answer
+    review_max_tokens: int
+    stage_timeout_s: float
+
+@dataclass(frozen=True)
 class Config:
     providers: dict[str, ProviderCfg]; models: dict[str, ModelCfg]
     policy_version: str; default_model: str
     active_budget: str; budget_caps: dict[str, float | None]   # None == no cap
+    fusion: "FusionCfg | None" = None
 
 def load_config(path: Path) -> Config:
     data = tomllib.loads(Path(path).read_text())
@@ -43,8 +54,42 @@ def load_config(path: Path) -> Config:
         for f in m.fallback:
             if f not in models:
                 raise ConfigError(f"model {n}: unknown fallback {f}")
+
+    fusion = None
+    if "fusion" in data:
+        f = data["fusion"]
+        name = f["model"]
+        if name in models:
+            raise ConfigError(
+                f"fusion.model {name!r} collides with a real model; the fusion "
+                "pseudo-model must not shadow one"
+            )
+        panel = tuple(f["panel"])
+        quorum = tuple(f["quorum"])
+        reviewers = tuple(f["reviewers"])
+        fuser = f["fuser"]
+        if len(panel) < 2:
+            raise ConfigError("fusion.panel needs at least 2 models")
+        for field, names in (("panel", panel), ("quorum", quorum),
+                             ("reviewers", reviewers), ("fuser", (fuser,))):
+            for n in names:
+                if n not in models:
+                    raise ConfigError(f"fusion.{field} names unknown model {n!r}")
+        if not set(quorum) <= set(panel):
+            raise ConfigError("fusion.quorum must be a subset of fusion.panel")
+        fusion = FusionCfg(
+            model=name, panel=panel, quorum=quorum, reviewers=reviewers,
+            fuser=fuser,
+            review_max_tokens=int(f.get("review_max_tokens", 512)),
+            stage_timeout_s=float(f.get("stage_timeout_s", 120)),
+        )
+
     pol = data["policy"]
-    if pol["default_model"] not in models:
+    # The fusion pseudo-model is deliberately absent from [models], so it is a
+    # legitimate default even though it resolves to no ModelCfg.
+    if pol["default_model"] not in models and not (
+        fusion is not None and pol["default_model"] == fusion.model
+    ):
         raise ConfigError("policy.default_model not in models")
     # cap_usd omitted == no ceiling. Kept explicit rather than defaulted to a
     # number, so "unbounded" is something an operator writes on purpose.
@@ -55,4 +100,4 @@ def load_config(path: Path) -> Config:
     if data["budget"]["active"] not in caps:
         raise ConfigError("active budget has no [budgets.<name>] table")
     return Config(providers, models, pol["version"], pol["default_model"],
-                  data["budget"]["active"], caps)
+                  data["budget"]["active"], caps, fusion)
