@@ -64,12 +64,24 @@ def load_config(path: Path) -> Config:
                 f"fusion.model {name!r} collides with a real model; the fusion "
                 "pseudo-model must not shadow one"
             )
+        # Validate that panel, quorum, reviewers are lists before converting
+        if not isinstance(f["panel"], list):
+            raise ConfigError(f"fusion.panel must be a list, got {type(f['panel']).__name__}")
+        if not isinstance(f["quorum"], list):
+            raise ConfigError(f"fusion.quorum must be a list, got {type(f['quorum']).__name__}")
+        if not isinstance(f["reviewers"], list):
+            raise ConfigError(f"fusion.reviewers must be a list, got {type(f['reviewers']).__name__}")
+
         panel = tuple(f["panel"])
         quorum = tuple(f["quorum"])
         reviewers = tuple(f["reviewers"])
         fuser = f["fuser"]
         if len(panel) < 2:
             raise ConfigError("fusion.panel needs at least 2 models")
+        if len(quorum) == 0:
+            raise ConfigError("fusion.quorum must not be empty")
+        if len(reviewers) == 0:
+            raise ConfigError("fusion.reviewers must not be empty")
         for field, names in (("panel", panel), ("quorum", quorum),
                              ("reviewers", reviewers), ("fuser", (fuser,))):
             for n in names:
@@ -77,11 +89,21 @@ def load_config(path: Path) -> Config:
                     raise ConfigError(f"fusion.{field} names unknown model {n!r}")
         if not set(quorum) <= set(panel):
             raise ConfigError("fusion.quorum must be a subset of fusion.panel")
+        if not set(reviewers) <= set(panel):
+            raise ConfigError("fusion.reviewers must be a subset of fusion.panel")
+
+        review_max_tokens = int(f.get("review_max_tokens", 512))
+        stage_timeout_s = float(f.get("stage_timeout_s", 120))
+        if review_max_tokens <= 0:
+            raise ConfigError(f"fusion.review_max_tokens must be > 0, got {review_max_tokens}")
+        if stage_timeout_s <= 0:
+            raise ConfigError(f"fusion.stage_timeout_s must be > 0, got {stage_timeout_s}")
+
         fusion = FusionCfg(
             model=name, panel=panel, quorum=quorum, reviewers=reviewers,
             fuser=fuser,
-            review_max_tokens=int(f.get("review_max_tokens", 512)),
-            stage_timeout_s=float(f.get("stage_timeout_s", 120)),
+            review_max_tokens=review_max_tokens,
+            stage_timeout_s=stage_timeout_s,
         )
 
     pol = data["policy"]

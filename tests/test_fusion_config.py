@@ -113,3 +113,71 @@ def test_the_real_config_still_loads(tmp_path):
     # Task 6 adds [fusion] to it; until then fusion is None. Either way the
     # real file must load -- several other test modules depend on it.
     load_config(REAL)
+
+
+# Finding 1: reviewers must be a subset of panel
+def test_reviewers_must_be_a_subset_of_panel(tmp_path):
+    text = BASE.replace('reviewers = ["a", "b"]', 'reviewers = ["a", "b", "c", "x"]')
+    with pytest.raises(ConfigError):    # "x" not in panel
+        load_config(write(tmp_path, text))
+
+
+# Finding 2: stage_timeout_s and review_max_tokens must be > 0
+def test_stage_timeout_s_must_be_positive(tmp_path):
+    text = BASE.replace('stage_timeout_s = 120', 'stage_timeout_s = 0')
+    with pytest.raises(ConfigError):
+        load_config(write(tmp_path, text))
+
+    text = BASE.replace('stage_timeout_s = 120', 'stage_timeout_s = -1')
+    with pytest.raises(ConfigError):
+        load_config(write(tmp_path, text))
+
+
+def test_review_max_tokens_must_be_positive(tmp_path):
+    text = BASE.replace('review_max_tokens = 512', 'review_max_tokens = 0')
+    with pytest.raises(ConfigError):
+        load_config(write(tmp_path, text))
+
+    text = BASE.replace('review_max_tokens = 512', 'review_max_tokens = -1')
+    with pytest.raises(ConfigError):
+        load_config(write(tmp_path, text))
+
+
+# Finding 3: quorum and reviewers must be non-empty
+def test_quorum_must_not_be_empty(tmp_path):
+    text = BASE.replace('quorum = ["a", "b"]', 'quorum = []')
+    with pytest.raises(ConfigError):
+        load_config(write(tmp_path, text))
+
+
+def test_reviewers_must_not_be_empty(tmp_path):
+    text = BASE.replace('reviewers = ["a", "b"]', 'reviewers = []')
+    with pytest.raises(ConfigError):
+        load_config(write(tmp_path, text))
+
+
+# Finding 4: panel, quorum, reviewers must be lists
+def test_panel_must_be_a_list(tmp_path):
+    text = BASE.replace('panel = ["a", "b", "c"]', 'panel = "abc"')
+    with pytest.raises(ConfigError):
+        load_config(write(tmp_path, text))
+
+
+def test_quorum_must_be_a_list(tmp_path):
+    text = BASE.replace('quorum = ["a", "b"]', 'quorum = "ab"')
+    with pytest.raises(ConfigError):
+        load_config(write(tmp_path, text))
+
+
+def test_reviewers_must_be_a_list(tmp_path):
+    text = BASE.replace('reviewers = ["a", "b"]', 'reviewers = "ab"')
+    with pytest.raises(ConfigError):
+        load_config(write(tmp_path, text))
+
+
+# Finding 5: defaults are applied when keys are omitted
+def test_defaults_are_applied_when_omitted(tmp_path):
+    text = BASE.replace('review_max_tokens = 512\nstage_timeout_s = 120\n', '')
+    cfg = load_config(write(tmp_path, text))
+    assert cfg.fusion.review_max_tokens == 512
+    assert cfg.fusion.stage_timeout_s == 120
