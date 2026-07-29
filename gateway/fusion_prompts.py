@@ -37,6 +37,11 @@ def _as_text(value) -> str:
         return ""
     if isinstance(value, str):
         return value
+    if isinstance(value, dict):
+        # OpenAI content part as a bare dict: {"type": "text", "text": "..."}
+        if isinstance(value.get("text"), str):
+            return value["text"]
+        return ""
     if isinstance(value, list):
         # OpenAI content parts: [{"type": "text", "text": "..."}, ...]
         parts = []
@@ -46,7 +51,7 @@ def _as_text(value) -> str:
             elif isinstance(item, str):
                 parts.append(item)
         return "\n".join(parts)
-    return str(value)
+    return ""
 
 
 def render_conversation(messages) -> str:

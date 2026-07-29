@@ -27,6 +27,19 @@ def test_render_conversation_survives_hostile_message_shapes():
         assert isinstance(out, str)
 
 
+def test_render_conversation_extracts_text_from_a_bare_dict_content():
+    # Clients send content parts as a bare dict as well as a list; a Python
+    # repr leaking into the prompt would be read by the reviewer and fuser
+    # models as if it were the user's own words.
+    out = render_conversation([{"role": "user", "content": {"type": "text", "text": "hi"}}])
+    assert "hi" in out and "{" not in out
+
+
+def test_render_conversation_drops_an_unrenderable_content_object():
+    out = render_conversation([{"role": "user", "content": {"unexpected": "shape"}}])
+    assert "unexpected" not in out and "{" not in out
+
+
 def test_review_prompt_never_shows_the_reviewer_its_own_answer():
     p = build_review_prompt("Q", CANDS, reviewer="glm-5.2")
     assert "It is 4." not in p                      # its own candidate text
