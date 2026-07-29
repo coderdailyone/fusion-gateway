@@ -87,7 +87,7 @@ def test_review_prompt_never_shows_the_reviewer_its_own_answer():
     p = build_review_prompt("Q", CANDS, reviewer="glm-5.2")
     assert "It is 4." not in p                      # its own candidate text
     assert "The answer is 4." in p and "Four." in p  # the others
-    assert "glm-5.2" not in p.split("Problem:")[0] or True  # name may appear in instructions
+    assert "--- Candidate glm-5.2 ---" not in p      # and no block header for it
 
 
 def test_review_prompt_states_the_exact_verdict_format():
@@ -427,11 +427,8 @@ def test_default_model_still_rejected_when_it_names_nothing(tmp_path):
     ('quorum = ["a", "b"]', 'quorum = ["a", "nope"]'),          # quorum member unknown
     ('reviewers = ["a", "b"]', 'reviewers = ["nope"]'),         # reviewer unknown
     ('fuser = "b"', 'fuser = "nope"'),                          # fuser unknown
-    ('quorum = ["a", "b"]', 'quorum = ["a", "c", "b"]\nunused = 0'),  # not a subset? c IS in panel
 ])
 def test_unknown_names_are_rejected(tmp_path, old, new):
-    if new.startswith('quorum = ["a", "c", "b"]'):
-        pytest.skip("covered by the subset test below")
     with pytest.raises(ConfigError):
         load_config(write(tmp_path, BASE.replace(old, new)))
 
@@ -605,6 +602,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 ```python
 # tests/test_fusion.py
 import asyncio
+import time
 import pytest
 from gateway.config import FusionCfg, ModelCfg, ProviderCfg
 from gateway.db import connect, Store
@@ -654,6 +652,7 @@ class FakeAdapter:
 
 
 def make_env(tmp_path, adapter):
+    tmp_path.mkdir(parents=True, exist_ok=True)
     store = Store(connect(tmp_path / "g.sqlite"))
     clock = FakeClock()
     store.conn.execute(
@@ -731,10 +730,10 @@ async def test_slow_leg_starts_at_t0_not_after_the_quorum(tmp_path):
     # of max(quorum, slow).
     ad = FakeAdapter(agree_script(), delays={"a": 0.2, "b": 0.2, "s": 0.2})
     env, _ = make_env(tmp_path, ad)
-    started = asyncio.get_event_loop().time()
+    started = time.monotonic()
     await gather_panel(body=BODY, **env)
     # a, b and s all ran concurrently, then one review round: ~0.4s, not ~0.6s.
-    assert asyncio.get_event_loop().time() - started < 0.55
+    assert time.monotonic() - started < 0.55
 
 
 def test_is_consensus_requires_every_pairwise_correct():
@@ -1148,8 +1147,6 @@ async def test_zero_candidates_returns_an_empty_panel(tmp_path):
 async def test_all_reviews_failing_still_fuses(tmp_path):
     # Reviews are evidence, not a precondition. The fusion prompt already
     # renders "(no reviews available)".
-    calls = {"n": 0}
-
     def script(payload):
         prompt = payload["messages"][0]["content"]
         if "VERDICT" in prompt:
@@ -1415,9 +1412,13 @@ def test_streaming_fusion_emits_keepalives_then_the_fuser_stream(tmp_path, monke
     assert ": fusion" in raw                    # SSE comment keepalive
     assert "FUSED ANSWER" in raw
     assert raw.rstrip().endswith("data: [DONE]")
+    # Every keepalive must be an SSE COMMENT, not a data line -- a data line
+    # the client cannot parse as a chunk would break a conformant SDK.
     for line in raw.splitlines():
+        if line.startswith(": "):
+            continue
         if line.startswith("data: ") and line[6:].strip() != "[DONE]":
-            assert json.loads(line[6:])["object"] == "chat.completion.chunk" or True
+            json.loads(line[6:])       # must be valid JSON, or this raises
 ```
 
 - [ ] **Step 2: Run them to verify they fail**
