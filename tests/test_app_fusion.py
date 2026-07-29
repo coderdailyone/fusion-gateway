@@ -180,6 +180,14 @@ TOOLS = [{"type": "function", "function": {"name": "get_weather",
                                            "parameters": {"type": "object"}}}]
 
 
+def _ledger_row_count(tmp_path, request_id):
+    import sqlite3
+    conn = sqlite3.connect(tmp_path / "g.sqlite")
+    return conn.execute(
+        "SELECT COUNT(*) FROM ledger WHERE request_id=?", (request_id,)
+    ).fetchone()[0]
+
+
 def test_a_tool_calling_request_bypasses_fusion_and_keeps_the_tool_call(tmp_path, monkeypatch):
     def h(req):
         return _tool_call_response(json.loads(req.content).get("model"))
@@ -192,6 +200,14 @@ def test_a_tool_calling_request_bypasses_fusion_and_keeps_the_tool_call(tmp_path
     assert "fusion" not in body
     msg = body["choices"][0]["message"]
     assert msg["tool_calls"][0]["function"]["name"] == "get_weather"
+    # Re-review residual 2: with the handler answering the tool-call shape
+    # for EVERY model, a reverted 1a is silently rescued by 1b's
+    # zero-usable-candidates fallback -- status 200 and a real tool_calls
+    # payload either way. Only the ledger row count tells "the panel never
+    # ran" (1 row: the single bypassed call) apart from "the panel ran,
+    # burned money, and then the fallback answered" (5 rows: 2 candidates +
+    # 2 reviews + 1 fuser attempt/fallback).
+    assert _ledger_row_count(tmp_path, r.headers["x-fusion-trace-id"]) == 1
 
 
 def test_tool_choice_alone_also_bypasses_fusion(tmp_path, monkeypatch):
@@ -205,6 +221,48 @@ def test_tool_choice_alone_also_bypasses_fusion(tmp_path, monkeypatch):
               json={**BODY, "tool_choice": "auto"}, headers=H())
     assert r.status_code == 200
     assert r.json()["model"] != "fusion"
+    assert _ledger_row_count(tmp_path, r.headers["x-fusion-trace-id"]) == 1
+
+
+# -- Re-review residual 1: the legacy OpenAI `functions`/`function_call`
+# shape (deprecated but still accepted by real clients) bypassed the bypass
+# -- app.py only checked `tools`/`tool_choice`, so a `functions` request
+# still fused: 5 ledger rows billed and the client got prose back instead of
+# a function call, the exact semantics-loss finding 1a exists to prevent.
+
+FUNCTIONS = [{"name": "get_weather", "parameters": {"type": "object"}}]
+
+
+def _legacy_function_call_response(model):
+    return httpx.Response(200, json={
+        "choices": [{"message": {"content": None, "function_call": {
+            "name": "get_weather", "arguments": "{}"}},
+                    "finish_reason": "function_call"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+
+
+def test_legacy_functions_request_bypasses_fusion(tmp_path, monkeypatch):
+    def h(req):
+        return _legacy_function_call_response(json.loads(req.content).get("model"))
+    c = make_client(tmp_path, monkeypatch, h=h)
+    r = c.post("/v1/chat/completions",
+              json={**BODY, "functions": FUNCTIONS}, headers=H())
+    assert r.status_code == 200
+    body = r.json()
+    assert body["model"] != "fusion"
+    assert body["choices"][0]["message"]["function_call"]["name"] == "get_weather"
+    assert _ledger_row_count(tmp_path, r.headers["x-fusion-trace-id"]) == 1
+
+
+def test_legacy_function_call_alone_also_bypasses_fusion(tmp_path, monkeypatch):
+    def h(req):
+        return _legacy_function_call_response(json.loads(req.content).get("model"))
+    c = make_client(tmp_path, monkeypatch, h=h)
+    r = c.post("/v1/chat/completions",
+              json={**BODY, "function_call": "auto"}, headers=H())
+    assert r.status_code == 200
+    assert r.json()["model"] != "fusion"
+    assert _ledger_row_count(tmp_path, r.headers["x-fusion-trace-id"]) == 1
 
 
 def test_streaming_tool_calling_request_also_bypasses_fusion(tmp_path, monkeypatch):

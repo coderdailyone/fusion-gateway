@@ -549,7 +549,14 @@ def create_app(
         resolved = (cfg.default_model
                     if requested_model in ("", "auto") else requested_model)
         if fcfg is not None and resolved == fcfg.model:
-            wants_tools = bool(body.get("tools")) or body.get("tool_choice") is not None
+            # Re-review residual 1: `functions`/`function_call` is the
+            # deprecated OpenAI shape `tools`/`tool_choice` replaced, but
+            # real clients still send it. It carries the exact same
+            # semantics-loss `tools`/`tool_choice` does (a fuser writing
+            # prose over what should be a function call), so it gets the
+            # same over-conservative-in-the-safe-direction treatment.
+            wants_tools = (bool(body.get("tools")) or body.get("tool_choice") is not None
+                          or bool(body.get("functions")) or body.get("function_call") is not None)
             if not wants_tools:
                 return await _fusion_request(
                     request_id=request_id, body=body, streaming=streaming,
