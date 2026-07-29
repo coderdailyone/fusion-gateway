@@ -25,6 +25,14 @@ server {
     # (POST /admin/killswitch/trip).
     limit_req zone=fusion_gw burst=20 nodelay;
 
+    # The admin surface (budget status, killswitch trip/release) has no reason
+    # to be on the public internet -- the operator reaches it over SSH. Drop
+    # this block if you need it remotely; it is protected by the admin bearer
+    # token either way.
+    location /admin/ {
+        deny all;
+    }
+
     location / {
         proxy_pass http://127.0.0.1:8800;
         proxy_http_version 1.1;

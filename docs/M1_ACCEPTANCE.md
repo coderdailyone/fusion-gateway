@@ -186,3 +186,47 @@ settled, no orphan rows.
 and drive the budget killswitch; the M1 cap is $5 and trips hard (503 on every
 request until `/admin/killswitch/release`); the bind is loopback-only, so
 external clients would need a reverse proxy and TLS that do not exist yet.
+
+## Public endpoint live 2026-07-29 — https://gateway.cutecookie.xyz
+
+nginx reverse proxy + Let's Encrypt (certbot `--nginx`, auto-renew scheduled).
+HTTP 301s to HTTPS. The other 15 vhosts on the host were unaffected
+(`nginx -t` before every reload; prism/ember/status still answering).
+
+Verified from outside the host, over the public internet:
+
+| check | result |
+|---|---|
+| TLS verify | 0 (valid) |
+| `http://` → `https://` | 301 |
+| no token / bad token on `/v1/models` | 401 / 401 |
+| valid token on `/v1/models` | 200, all four models |
+| non-streaming completion (glm-5.2) | 200, `"ok"`, usage reported |
+| **streaming** (glm-5.2) | 19 SSE events, first byte 7.09 s, last 7.43 s — **0.33 s spread, so genuinely incremental**, not one buffered burst |
+| `/admin/*` with a valid admin token | **403 — blocked at nginx** |
+| `/admin/status` from the box | 200 |
+
+**No SSO in front.** API clients authenticate with `Authorization: Bearer`;
+a browser-redirect SSO layer would bounce every one of them to a login page.
+The gateway's own token map is the auth boundary, and it holds: two 401s and a
+403 above.
+
+**`/admin/` is denied at nginx.** Budget status and the killswitch have no
+reason to be internet-facing when the operator reaches them over SSH. Remove
+the `location /admin/ { deny all; }` block to open it.
+
+Streaming needed `proxy_buffering off` and a 900 s read timeout — the nginx
+default of 60 s would cut off a reasoning model mid-generation.
+
+### Client usage
+
+```
+base_url: https://gateway.cutecookie.xyz/v1
+api_key:  <the prism token from /opt/fusion-gateway/.env>
+models:   deepseek-chat | glm-4.5-flash | glm-5.2 | kimi-k3
+```
+
+**The budget is now uncapped** (`cap_usd` omitted from `[budgets.M1]`), so a
+public endpoint holding real provider credit has no automatic ceiling. nginx
+rate-limits to 10 r/s with burst 20 per IP; the only hard brake is
+`POST /admin/killswitch/trip`, reachable on the box.
