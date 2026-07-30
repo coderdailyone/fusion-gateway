@@ -466,6 +466,50 @@ def test_streaming_dead_fuser_falls_back_to_the_best_candidate(tmp_path, monkeyp
     assert contents == ["answer from a"]
 
 
+# -- M9 Task 3 review, finding 1 (Important, live at the Candidate-carrying-
+# -commit): _fuser_gave_nothing used to call _as_chunks(fallback[1].text,
+# ...) unconditionally. A tool-calls-only Candidate has empty .text, so the
+# client got a silent HTTP 200 with an empty content delta -- worse than the
+# 502 this milestone exists to fix, since the panel is fully billed and the
+# client is told it succeeded. No `tools`/`tool_choice` on the client
+# request (so the tool-call bypass never fires) but a panel member emits
+# `content: null` + `tool_calls` unprompted -- a shape a provider with
+# server-side tools can produce on its own.
+
+def test_streaming_tool_call_only_fallback_after_a_dead_fuser_is_not_a_silent_empty_200(
+        tmp_path, monkeypatch):
+    def h(req):
+        body = json.loads(req.content)
+        prompt = body["messages"][-1]["content"]
+        if "Produce the single best final answer" in prompt:
+            return httpx.Response(500, json={})               # fuser dead
+        if "VERDICT" in prompt:
+            return httpx.Response(200, json={
+                "choices": [{"message": {"content": "VERDICT a correct ok\nVERDICT b correct ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+        # Candidate call: tool-calls only, no prose -- unprompted.
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": None, "tool_calls": [
+                {"id": "call_1", "type": "function",
+                 "function": {"name": "get_weather", "arguments": "{}"}}]},
+                        "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+    c = make_client(tmp_path, monkeypatch, h=h)
+    with c.stream("POST", "/v1/chat/completions",
+                  json={**BODY, "stream": True}, headers=H()) as r:
+        assert r.status_code == 200          # headers already committed by then
+        raw = b"".join(r.iter_bytes()).decode()
+    assert ": fusion fusing" in raw          # the panel succeeded before the fuser died
+    data_lines = [l for l in raw.splitlines() if l.startswith("data: ")]
+    assert len(data_lines) == 1
+    err = json.loads(data_lines[0][6:])
+    assert err["error"]["type"] == "upstream_exhausted"
+    # Must NOT be the old silent-empty-200 shape: no content delta of any
+    # kind, and no [DONE] terminator implying a normal stream completed.
+    assert '"content"' not in raw
+    assert "[DONE]" not in raw
+
+
 def test_streaming_empty_fuser_stream_falls_back_to_the_best_candidate(tmp_path, monkeypatch):
     """The fuser answers 200 with a genuinely empty body -- no bytes at all,
     distinct from an upstream error. Without an explicit `first_byte` guard

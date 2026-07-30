@@ -7,8 +7,8 @@ from gateway.events import EventLog
 from gateway.ledger import BudgetTripped, Ledger, estimate_tokens
 from gateway.fusion_prompts import Verdict, build_review_prompt, render_conversation
 from gateway.fusion import (
-    PanelResult, gather_panel, is_consensus, fuser_body, best_candidate,
-    openai_response, call_model, _extract_text,
+    Candidate, PanelResult, gather_panel, is_consensus, fuser_body,
+    best_candidate, openai_response, call_model, _extract_text,
 )
 from gateway.providers import ProviderError
 from tests.helpers import FakeClock
@@ -721,3 +721,44 @@ async def test_no_ledger_row_is_ever_left_in_preflight(tmp_path):
         await gather_panel(body=BODY, **env)
         rows = store.conn.execute("SELECT state FROM ledger").fetchall()
         assert not any(r["state"] == "preflight" for r in rows), (errors, delays)
+
+
+# -- M9 Task 3 review, finding 2: no test anywhere asserted a tool-calls-only
+# candidate actually SURVIVES the panel -- only `Candidate.__bool__` stands
+# between that and reinstating M8 finding 1a (the tool call made the old
+# `_extract_text` return "", `collect()`'s `if text:` dropped it, a
+# fully-billed panel returned 502). Mutating `__bool__` to `return
+# bool(self.text)` reinstates that bug exactly and every OTHER test in the
+# suite stays green.
+
+class _ToolCallAdapter:
+    """Candidate calls answer with tool-calls only (content: null); review
+    calls answer honestly with VERDICT text -- isolates collect()'s
+    truthiness handling of a Candidate with empty .text from everything
+    else gather_panel does."""
+    def __init__(self):
+        self.calls = []
+
+    async def chat(self, upstream_model, payload):
+        self.calls.append((upstream_model, payload))
+        prompt = payload["messages"][0]["content"]
+        if "VERDICT" in prompt:
+            targets = [n for n in ("a", "b", "s") if f"Candidate {n}" in prompt]
+            text = "\n".join(f"VERDICT {t} correct fine" for t in targets)
+            return {"choices": [{"message": {"content": text}}],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 4}}
+        return {"choices": [{"message": {"content": None, "tool_calls": [
+                    {"id": "call_1", "type": "function",
+                     "function": {"name": "read", "arguments": "{}"}}]}}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 4}}
+
+
+@pytest.mark.anyio
+async def test_a_tool_call_only_candidate_survives_the_panel(tmp_path):
+    ad = _ToolCallAdapter()
+    env, _ = make_env(tmp_path, ad)
+    panel = await gather_panel(body=BODY, **env)
+    assert set(panel.candidates) == {"a", "b"}      # not dropped, quorum reached
+    assert panel.candidates["a"].text == ""
+    assert panel.candidates["a"].tool_calls
+    assert panel.candidates["a"].tool_calls[0]["function"]["name"] == "read"

@@ -192,12 +192,15 @@ async def call_model(*, model_name, body, cfg, adapters, ledger, events, clock,
     return _extract_text(resp)
 
 
-def is_consensus(candidates: dict[str, str],
+def is_consensus(candidates: dict[str, Candidate],
                  reviews: dict[str, dict[str, Verdict]]) -> bool:
     """True only when every candidate was reviewed `correct` by every other.
 
     Deliberately conservative: a missing review is NOT agreement. Absence of
     evidence sends the request down the slow path, which is the safe direction.
+
+    Only ever reads `candidates`' keys (never a value), so it is unaffected
+    by candidates carrying tool calls -- the annotation just tracks reality.
     """
     names = sorted(candidates)
     if len(names) < 2:
@@ -482,7 +485,7 @@ def best_candidate(fcfg, panel: PanelResult):
     return None
 
 
-def openai_response(candidate, model: str, meta: dict) -> dict:
+def openai_response(candidate: Candidate | str, model: str, meta: dict) -> dict:
     """The client-facing JSON response for a fused (or fallback) answer.
 
     `candidate` is usually a `Candidate` -- but the fuser's own call still

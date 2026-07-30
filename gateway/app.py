@@ -311,7 +311,15 @@ def create_app(
                               {"model": fcfg.fuser, "stage": "fuser",
                                "kind": kind})
                 fallback = best_candidate(fcfg, panel)
-                if fallback is None:
+                # A tool-calls-only Candidate has empty .text and, until
+                # Task 6 builds a real tool-call chunk synthesiser, no usable
+                # _as_chunks() representation either. Treat it as no usable
+                # fallback rather than serving it: _as_chunks("", ...) would
+                # be a silent HTTP 200 with an empty content delta, worse
+                # than the 502 this milestone exists to fix -- the panel is
+                # fully billed and the client is told it succeeded (M9 Task
+                # 3 review, finding 1).
+                if fallback is None or not fallback[1].text:
                     _finish_request(store, request_id, "failed", clock)
                     yield b'\n\ndata: {"error": {"type": "upstream_exhausted"}}\n\n'
                     return
