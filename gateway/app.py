@@ -125,10 +125,24 @@ def _as_tool_chunks(candidate, model: str) -> list[bytes]:
     """
     base = {"id": f"chatcmpl-{uuid.uuid4().hex}", "object": "chat.completion.chunk",
             "created": int(time.time()), "model": model}
-    calls = [{"index": i, "id": c.get("id") or f"call_{i}", "type": "function",
-              "function": {"name": c.get("function", {}).get("name", ""),
-                           "arguments": c.get("function", {}).get("arguments", "")}}
-             for i, c in enumerate(candidate.tool_calls)]
+    calls = []
+    for i, c in enumerate(candidate.tool_calls):
+        # M9 Task 6 review, finding 2: `c["function"]` is upstream-controlled
+        # and reaches here through the dead-fuser fallback (the `decided`
+        # path is safe -- `canonical_calls` already rejects a non-dict
+        # `function` before a call can win tool_fast/tool_reviewed/
+        # tool_plurality). `c.get("function", {})` only substitutes the
+        # default when the KEY is missing, not when it's present with a
+        # `null` (or string, or other non-dict) value, so `.get("name", "")`
+        # on that raised AttributeError mid-stream -- after
+        # `_finish_request(..., "succeeded", ...)` had already run, so the
+        # request logged as succeeded while the client's stream aborted with
+        # no [DONE]. Same guard `render_candidate` already uses (7188905).
+        fn = c.get("function")
+        fn = fn if isinstance(fn, dict) else {}
+        calls.append({"index": i, "id": c.get("id") or f"call_{i}", "type": "function",
+                      "function": {"name": fn.get("name", ""),
+                                   "arguments": fn.get("arguments", "")}})
     out = [dict(base, choices=[{"index": 0, "delta": {"role": "assistant"},
                                 "finish_reason": None}])]
     if candidate.text:
@@ -313,23 +327,55 @@ def create_app(
                 return
             yield b": fusion fusing\n\n"
 
-            # The tool decision tree already decided structurally -- the
-            # panel is a single candidate and calling the fuser would just
-            # spend a call (now with `tools` forwarded to it) to reach the
-            # exact same answer. Without this, the streaming generator would
-            # be the only path paying for a fuser call on a TOOL_DECIDED_PATH
-            # panel: `_finish_fusion`'s own `len(panel.candidates) < 2` guard
-            # already skips it on the non-streaming side, but that guard
-            # lives in a function this generator never calls.
-            decided = panel.path in TOOL_DECIDED_PATHS
-            if decided:
-                model_name, cand = next(iter(panel.candidates.items()))
+            # Mirrors `_finish_fusion`'s own "< 2 candidates" rung exactly
+            # (M9 Task 6 review, finding 1, CRITICAL). Every one of the
+            # three TOOL_DECIDED_PATHS lands here -- they always return
+            # exactly one candidate, see TOOL_DECIDED_PATHS's docstring --
+            # but so does a genuine single-candidate fallback unrelated to
+            # any tool decision (e.g. one quorum member down; production has
+            # exactly this shape today with kimi-k3 403ing against a
+            # 2-quorum panel). Both must skip the fuser; only the latter is
+            # a real degradation. Before this fix the streaming generator
+            # only special-cased the three TOOL_DECIDED_PATHS (a `decided`
+            # flag checked only `panel.path in TOOL_DECIDED_PATHS`), so a
+            # lone survivor holding a tool call fell all the way through to
+            # a fuser call -- with `tools` forwarded to it -- and the client
+            # got PROSE from the fuser instead of the tool call, after being
+            # billed for the whole panel: precisely the "fuser writes prose
+            # over what should be a function call" failure the deleted M8
+            # bypass existed to prevent, now reachable because that bypass
+            # is gone.
+            if len(panel.candidates) < 2:
+                fallback = best_candidate(fcfg, panel)
+                if fallback is None:
+                    events.append(request_id, "fusion.degraded", {"rung": "no_candidates"})
+                    # Same "paying for a panel and then hard-failing is the
+                    # worst outcome available" rung the non-streaming path
+                    # uses (final review, finding 1b) -- fall through to the
+                    # single-model chain, streaming this time, through the
+                    # exact same `_stream_chain_once` the plain single-model
+                    # path itself uses.
+                    events.append(request_id, "fusion.degraded",
+                                  {"rung": "zero_candidates_chain_fallback",
+                                   "model": fcfg.panel[0]})
+                    chain_plan = plan_route(cfg, fcfg.panel[0])
+                    async for piece in _stream_chain_once(request_id, body, chain_plan.chain):
+                        yield piece
+                    return
+                if panel.path not in TOOL_DECIDED_PATHS:
+                    events.append(request_id, "fusion.degraded",
+                                  {"rung": "single_candidate", "model": fallback[0]})
                 events.append(request_id, "fusion.fused",
-                              {"path": panel.path, "source": "candidate",
-                               "model": model_name})
+                              {"fuser": fcfg.fuser, "path": panel.path, "source": "candidate"})
                 _finish_request(store, request_id, "succeeded", clock)
-                for piece in (_as_tool_chunks(cand, fcfg.model) if cand.tool_calls
-                              else _as_chunks(cand.text, fcfg.model)):
+                # Every TOOL_DECIDED_PATH winner carries tool calls by
+                # construction (`decide_tools` only returns one of the three
+                # verdicts when every candidate structurally agreed on a
+                # call) -- the `_as_chunks` branch below is unreachable for
+                # those paths and only ever fires for a genuine
+                # single-candidate PROSE fallback.
+                for piece in (_as_tool_chunks(fallback[1], fcfg.model) if fallback[1].tool_calls
+                              else _as_chunks(fallback[1].text, fcfg.model)):
                     yield piece
                 return
 
@@ -624,6 +670,118 @@ def create_app(
         _finish_request(store, request_id, "failed", clock)
         return JSONResponse(status_code=502, content={"error": {"type": "upstream_exhausted"}})
 
+    async def _stream_chain_once(request_id, body, chain):
+        """Streaming counterpart to `_run_chain_once`: try each model in
+        `chain` in order, yielding upstream bytes to an already-open SSE
+        stream. Always finishes the `requests` row itself (success or the
+        terminal upstream_exhausted error) before returning.
+
+        M9 Task 6 review, finding 1 (CRITICAL): the fusion path's streaming
+        generator had no streaming equivalent of `_run_chain_once` at all --
+        its zero-usable-candidates rung (finding 1b) could only return a
+        JSONResponse, so it was silently skipped on the streaming side and
+        a tool request with no usable candidate fell all the way through to
+        a fuser call instead, exactly the "fuser writes prose over what
+        should be a function call" failure the deleted M8 bypass existed to
+        prevent. Factored out here (rather than duplicated inline) so both
+        the plain single-model streaming path and this fallback share the
+        one preflight/settle/fallback bookkeeping implementation.
+        """
+        messages = body.get("messages", [])
+        max_tokens = body.get("max_tokens")
+
+        for model_name in chain:
+            model_cfg = cfg.models[model_name]
+            adapter = adapters[model_cfg.provider]
+            est_in, est_out = estimate_tokens(messages, max_tokens)
+
+            try:
+                entry_id = ledger.preflight(
+                    request_id, model_cfg.provider, model_name,
+                    est_in, est_out, model_cfg.in_usd_per_mtok, model_cfg.out_usd_per_mtok,
+                )
+            except BudgetTripped:
+                events.append(request_id, "budget.tripped", {"model": model_name})
+                _finish_request(store, request_id, "failed", clock)
+                yield b'\n\ndata: {"error": {"type": "budget_exhausted"}}\n\n'
+                return
+
+            events.append(request_id, "call.attempt", {"model": model_name})
+            start = clock.now()
+            accumulated = bytearray()
+            first_byte = False
+            try:
+                async for chunk in adapter.chat_stream(model_cfg.upstream_model, body):
+                    first_byte = True
+                    accumulated.extend(chunk)
+                    yield chunk
+            except ProviderError as exc:
+                # Adapter contract: ProviderError is only raised before
+                # the first byte reaches the client, so it's always
+                # safe to fall back to the next model in the chain.
+                ledger.fail(entry_id)
+                events.append(
+                    request_id, "call.failed",
+                    {"model": model_name, "kind": exc.kind, "status": exc.status},
+                )
+                continue
+            except Exception:
+                if not first_byte:
+                    # Defensive: treat any pre-first-byte failure like
+                    # a ProviderError and fall back.
+                    ledger.fail(entry_id)
+                    events.append(
+                        request_id, "call.failed",
+                        {"model": model_name, "kind": "unknown"},
+                    )
+                    continue
+                latency_ms = int((clock.now() - start).total_seconds() * 1000)
+                in_tokens = est_in
+                out_tokens = max(len(accumulated) // 4, 0)
+                ledger.settle(
+                    entry_id, in_tokens, out_tokens, "estimated", latency_ms,
+                    model_cfg.in_usd_per_mtok, model_cfg.out_usd_per_mtok,
+                )
+                events.append(request_id, "call.failed",
+                               {"model": model_name, "kind": "stream_error"})
+                _finish_request(store, request_id, "failed", clock)
+                # `accumulated` is raw, arbitrarily-cut upstream bytes, so a
+                # leading blank line before the error envelope is required,
+                # not decorative (final review, finding 2).
+                yield b'\n\ndata: {"error": {"type": "stream_failed"}}\n\n'
+                return
+
+            if not first_byte:
+                # Upstream returned a 2xx with an empty body: no bytes
+                # reached the client, so it's still safe to fall back.
+                ledger.fail(entry_id)
+                events.append(request_id, "call.failed",
+                               {"model": model_name, "kind": "empty_stream"})
+                continue
+
+            latency_ms = int((clock.now() - start).total_seconds() * 1000)
+            raw = bytes(accumulated)
+            usage = parse_stream_usage(raw)
+            if usage and "prompt_tokens" in usage and "completion_tokens" in usage:
+                in_tokens = usage["prompt_tokens"]
+                out_tokens = usage["completion_tokens"]
+                usage_source = "reported"
+            else:
+                in_tokens = est_in
+                out_tokens = max(len(raw) // 4, 0)
+                usage_source = "estimated"
+
+            ledger.settle(
+                entry_id, in_tokens, out_tokens, usage_source, latency_ms,
+                model_cfg.in_usd_per_mtok, model_cfg.out_usd_per_mtok,
+            )
+            events.append(request_id, "call.succeeded", {"model": model_name})
+            _finish_request(store, request_id, "succeeded", clock)
+            return
+
+        _finish_request(store, request_id, "failed", clock)
+        yield b'\n\ndata: {"error": {"type": "upstream_exhausted"}}\n\n'
+
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request, principal: str = Depends(get_principal)):
         body = await request.json()
@@ -666,107 +824,9 @@ def create_app(
         events.append(request_id, "route.planned",
                        {"chain": list(plan.chain), "policy_version": plan.policy_version})
 
-        messages = body.get("messages", [])
-        max_tokens = body.get("max_tokens")
-
         if streaming:
-            async def gen():
-                for model_name in plan.chain:
-                    model_cfg = cfg.models[model_name]
-                    adapter = adapters[model_cfg.provider]
-                    est_in, est_out = estimate_tokens(messages, max_tokens)
-
-                    try:
-                        entry_id = ledger.preflight(
-                            request_id, model_cfg.provider, model_name,
-                            est_in, est_out, model_cfg.in_usd_per_mtok, model_cfg.out_usd_per_mtok,
-                        )
-                    except BudgetTripped:
-                        events.append(request_id, "budget.tripped", {"model": model_name})
-                        _finish_request(store, request_id, "failed", clock)
-                        yield b'\n\ndata: {"error": {"type": "budget_exhausted"}}\n\n'
-                        return
-
-                    events.append(request_id, "call.attempt", {"model": model_name})
-                    start = clock.now()
-                    accumulated = bytearray()
-                    first_byte = False
-                    try:
-                        async for chunk in adapter.chat_stream(model_cfg.upstream_model, body):
-                            first_byte = True
-                            accumulated.extend(chunk)
-                            yield chunk
-                    except ProviderError as exc:
-                        # Adapter contract: ProviderError is only raised before
-                        # the first byte reaches the client, so it's always
-                        # safe to fall back to the next model in the chain.
-                        ledger.fail(entry_id)
-                        events.append(
-                            request_id, "call.failed",
-                            {"model": model_name, "kind": exc.kind, "status": exc.status},
-                        )
-                        continue
-                    except Exception:
-                        if not first_byte:
-                            # Defensive: treat any pre-first-byte failure like
-                            # a ProviderError and fall back.
-                            ledger.fail(entry_id)
-                            events.append(
-                                request_id, "call.failed",
-                                {"model": model_name, "kind": "unknown"},
-                            )
-                            continue
-                        latency_ms = int((clock.now() - start).total_seconds() * 1000)
-                        in_tokens = est_in
-                        out_tokens = max(len(accumulated) // 4, 0)
-                        ledger.settle(
-                            entry_id, in_tokens, out_tokens, "estimated", latency_ms,
-                            model_cfg.in_usd_per_mtok, model_cfg.out_usd_per_mtok,
-                        )
-                        events.append(request_id, "call.failed",
-                                       {"model": model_name, "kind": "stream_error"})
-                        _finish_request(store, request_id, "failed", clock)
-                        # Final review, finding 2 (CRITICAL) -- the ORIGINAL
-                        # site (inherited by the fusion path above). Same
-                        # reasoning: `accumulated` is raw, arbitrarily-cut
-                        # upstream bytes, so a leading blank line before the
-                        # error envelope is required, not decorative.
-                        yield b'\n\ndata: {"error": {"type": "stream_failed"}}\n\n'
-                        return
-
-                    if not first_byte:
-                        # Upstream returned a 2xx with an empty body: no bytes
-                        # reached the client, so it's still safe to fall back.
-                        ledger.fail(entry_id)
-                        events.append(request_id, "call.failed",
-                                       {"model": model_name, "kind": "empty_stream"})
-                        continue
-
-                    latency_ms = int((clock.now() - start).total_seconds() * 1000)
-                    raw = bytes(accumulated)
-                    usage = parse_stream_usage(raw)
-                    if usage and "prompt_tokens" in usage and "completion_tokens" in usage:
-                        in_tokens = usage["prompt_tokens"]
-                        out_tokens = usage["completion_tokens"]
-                        usage_source = "reported"
-                    else:
-                        in_tokens = est_in
-                        out_tokens = max(len(raw) // 4, 0)
-                        usage_source = "estimated"
-
-                    ledger.settle(
-                        entry_id, in_tokens, out_tokens, usage_source, latency_ms,
-                        model_cfg.in_usd_per_mtok, model_cfg.out_usd_per_mtok,
-                    )
-                    events.append(request_id, "call.succeeded", {"model": model_name})
-                    _finish_request(store, request_id, "succeeded", clock)
-                    return
-
-                _finish_request(store, request_id, "failed", clock)
-                yield b'\n\ndata: {"error": {"type": "upstream_exhausted"}}\n\n'
-
             return StreamingResponse(
-                gen(),
+                _stream_chain_once(request_id, body, plan.chain),
                 media_type="text/event-stream",
                 headers={"x-fusion-trace-id": request_id},
             )

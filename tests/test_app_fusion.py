@@ -283,6 +283,13 @@ def test_a_tool_calling_request_now_reaches_the_fusion_panel(tmp_path, monkeypat
     assert sorted(st for _, st, _ in rows) == ["settled", "settled", "settled"]
     # ...and no review or fuser call happened: no model appears twice.
     assert len({m for m, _, _ in rows}) == 3
+    # M9 Task 6 review round 1, minor: asserting `["settled"]*3` alone
+    # passes identically whether "s" was genuinely cancelled or just
+    # happened to finish normally -- it doesn't distinguish "cancellation
+    # settles at the estimate" from "the slow leg answered like any other
+    # candidate." Pin the row this test's own comment claims to prove:
+    # "s" specifically must be settled with usage_source="estimated".
+    assert ("s", "settled", "estimated") in rows
 
 
 def test_tool_choice_alone_now_reaches_the_fusion_panel(tmp_path, monkeypatch):
@@ -329,7 +336,12 @@ def _legacy_function_call_response(model):
         "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
 
 
-def test_legacy_functions_request_now_reaches_the_fusion_panel(tmp_path, monkeypatch):
+# M9 Task 6 review round 1, minor: these two were misnamed
+# "..._now_reaches_the_fusion_panel" even though their own assertion is
+# `model != "fusion"` -- what they actually pin is the degrade-to-chain
+# behaviour, not a fusion. Renamed to match.
+
+def test_legacy_functions_request_degrades_to_the_single_model_chain(tmp_path, monkeypatch):
     def h(req):
         return _legacy_function_call_response(json.loads(req.content).get("model"))
     c = make_client(tmp_path, monkeypatch, h=h)
@@ -348,7 +360,7 @@ def test_legacy_functions_request_now_reaches_the_fusion_panel(tmp_path, monkeyp
     assert _ledger_row_count(tmp_path, r.headers["x-fusion-trace-id"]) == 3
 
 
-def test_legacy_function_call_alone_now_reaches_the_fusion_panel(tmp_path, monkeypatch):
+def test_legacy_function_call_alone_degrades_to_the_single_model_chain(tmp_path, monkeypatch):
     def h(req):
         return _legacy_function_call_response(json.loads(req.content).get("model"))
     c = make_client(tmp_path, monkeypatch, h=h)
@@ -358,6 +370,79 @@ def test_legacy_function_call_alone_now_reaches_the_fusion_panel(tmp_path, monke
     assert r.json()["model"] != "fusion"
     assert r.json()["choices"][0]["message"]["function_call"]["name"] == "read"
     assert _ledger_row_count(tmp_path, r.headers["x-fusion-trace-id"]) == 3
+
+
+def test_streaming_legacy_function_call_degrades_to_the_single_model_chain(tmp_path, monkeypatch):
+    # Streaming counterpart of the two tests above -- and the direct pin for
+    # M9 Task 6 review round 1, finding 1 (CRITICAL)'s "legacy `functions`"
+    # row: before the fix, the streaming generator had no equivalent of
+    # `_finish_fusion`'s "< 2 candidates" -> "zero candidates -> chain
+    # fallback" rungs at all, so this exact request reached the fuser (with
+    # an empty candidate set) and the client got fuser-generated PROSE
+    # instead of its `function_call`, after being billed for the whole
+    # panel -- a strict regression from the pre-Task-6 bypass, which
+    # answered this correctly (if only by accident, via the bypass this
+    # milestone exists to remove).
+    #
+    # NOTE on row count: round 1 review asked for this to "still cost 1
+    # row." Verified empirically (both before writing this test and via the
+    # non-streaming twins above, which were not flagged) that 1 row is not
+    # achievable now that the bypass is gone: `gather_panel` unconditionally
+    # bills BOTH quorum candidates before the zero-usable-candidates rung is
+    # even reached, so the floor is 2, and the chain fallback's own retry of
+    # panel[0] adds a third. 3 rows is what "mirror... the same terminal
+    # handling non-streaming uses" (the review's own fix instruction)
+    # actually produces, and it is what keeps this path's cost identical to
+    # its non-streaming twin above -- which the review did not flag as
+    # wrong. Asserting 1 here would make this test fail against correct,
+    # parity-preserving code.
+    def h(req):
+        body = json.loads(req.content)
+        if body.get("stream") and body.get("model") == "b":
+            # The fuser's own call (fuser = "b" in this CFG) -- reachable
+            # ONLY if the empty-candidate rung was skipped (the pre-fix
+            # bug). Answering it with a distinct, streaming PROSE shape
+            # (rather than the same canned function_call bytes every other
+            # call gets) is what lets this test actually catch a
+            # reintroduced bug, instead of coincidentally finding the same
+            # bytes forwarded either way -- a real gap the round 1 review
+            # itself would have caught: with the original handler (every
+            # call, streaming or not, answering the same function_call
+            # JSON), a wrongly-issued fuser call's raw bytes get forwarded
+            # to the client verbatim by the byte-passthrough streaming loop
+            # and still contain "function_call", so a content-only
+            # assertion can't tell "the fuser was never called" apart from
+            # "the fuser was called and coincidentally echoed the same
+            # bytes."
+            payload = json.dumps({"choices": [{"index": 0,
+                                               "delta": {"content": "PROSE FROM FUSER"},
+                                               "finish_reason": None}]})
+            sse = (f"data: {payload}\n\n"
+                  'data: {"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n'
+                  "data: [DONE]\n\n")
+            return httpx.Response(200, content=sse.encode(),
+                                  headers={"content-type": "text/event-stream"})
+        return _legacy_function_call_response(body.get("model"))
+    c = make_client(tmp_path, monkeypatch, h=h)
+    with c.stream("POST", "/v1/chat/completions",
+                  json={**BODY, "functions": FUNCTIONS, "stream": True}, headers=H()) as r:
+        assert r.status_code == 200
+        rid = r.headers["x-fusion-trace-id"]
+        raw = b"".join(r.iter_bytes()).decode()
+    # The client's function_call payload survives untouched -- not
+    # replaced with fuser-generated prose.
+    assert "PROSE FROM FUSER" not in raw
+    assert "function_call" in raw and '"name":"read"' in raw.replace(" ", "")
+    import sqlite3
+    conn = sqlite3.connect(tmp_path / "g.sqlite")
+    rows = conn.execute("SELECT model, state FROM ledger WHERE request_id=? ORDER BY id",
+                        (rid,)).fetchall()
+    # Exact row sequence: 2 panel candidates (both billed, neither usable)
+    # + 1 chain-fallback retry of panel[0] ("a"). A third row naming "b"
+    # (the configured fuser) instead of "a" would mean the fuser was
+    # reached despite the empty candidate set -- the regression this test
+    # exists to catch.
+    assert rows == [("a", "settled"), ("b", "settled"), ("a", "settled")]
 
 
 def test_streaming_tool_calling_request_now_reaches_the_fusion_panel(tmp_path, monkeypatch):
@@ -394,8 +479,13 @@ def test_streaming_tool_calling_request_now_reaches_the_fusion_panel(tmp_path, m
     assert _ledger_row_count(tmp_path, rid) == 3
 
 
-def test_a_tool_request_never_5xxs_when_the_whole_panel_is_down(tmp_path, monkeypatch):
-    # The invariant the deleted bypass tests existed to protect.
+def test_a_tool_request_with_no_survivors_gets_the_spec_sanctioned_502(tmp_path, monkeypatch):
+    # The invariant the deleted bypass tests existed to protect -- but a 502
+    # IS a 5xx, so "never 5xxs" (the name this test had) was itself wrong:
+    # what must never happen is an UNHANDLED gateway 500 from a request
+    # that was billed for a panel; the deliberate, spec-sanctioned
+    # upstream_exhausted 502 below is exactly what "every failure has a
+    # rung" means (M9 Task 6 review round 1, minor).
     c = make_client(tmp_path, monkeypatch, h=lambda req: httpx.Response(500, json={}))
     r = c.post("/v1/chat/completions", json={
         "model": "fusion", "messages": [{"role": "user", "content": "x"}],
@@ -425,6 +515,28 @@ def test_streaming_tool_call_is_a_valid_openai_chunk_stream(tmp_path, monkeypatc
                if c_.get("choices"))
     assert any(c_["choices"][0].get("finish_reason") == "tool_calls" for c_ in objs
                if c_.get("choices"))
+
+    # M9 Task 6 review round 1, minor: spec acceptance criterion 9 requires
+    # a real client to be able to decode this. Replay the exact bytes this
+    # gateway produced through the real openai SDK (same technique as
+    # test_streaming_fuser_mid_stream_error_does_not_glue_onto_a_truncated_
+    # chunk below) and let ChatCompletionStreamState reconstruct the call
+    # instead of hand-rolled chunk parsing.
+    from openai import OpenAI
+    client = OpenAI(api_key="x", base_url="http://test",
+                    http_client=httpx.Client(transport=httpx.MockTransport(
+                        lambda req: httpx.Response(200, content=raw.encode(),
+                            headers={"content-type": "text/event-stream"}))))
+    with client.chat.completions.stream(
+            model="fusion", messages=[{"role": "user", "content": "read a.py"}]) as stream:
+        for _ in stream:
+            pass
+        final = stream.get_final_completion()
+    assert final.choices[0].finish_reason == "tool_calls"
+    calls = final.choices[0].message.tool_calls
+    assert len(calls) == 1
+    assert calls[0].function.name == "read"
+    assert json.loads(calls[0].function.arguments) == {"path": "a.py"}
 
 
 # -- Final whole-branch review, finding 1b: "every candidate returned no
@@ -480,6 +592,60 @@ def test_a_lone_survivor_is_returned_verbatim(tmp_path, monkeypatch):
     # made" apart from "the fuser was called and failed" (test below), which
     # would show up here as 3 rows instead.
     assert len(rows) == 2
+
+
+def test_streaming_lone_survivor_holding_a_tool_call_is_returned_verbatim(tmp_path, monkeypatch):
+    # Streaming twin of test_a_lone_survivor_is_returned_verbatim, but
+    # holding a tool call rather than prose -- the exact shape M9 Task 6
+    # review round 1, finding 1 (CRITICAL) measured. The streaming
+    # generator used to special-case only the three TOOL_DECIDED_PATHS (a
+    # `decided` flag checking `panel.path in TOOL_DECIDED_PATHS`), not
+    # `_finish_fusion`'s broader "< 2 candidates" rung this test exercises:
+    # a lone survivor from an ordinary quorum-member failure is NOT a
+    # TOOL_DECIDED_PATH (panel.path == "full" here), so the old code fell
+    # through to a fuser call the fuser being wired to 500 below would have
+    # caught -- except the mock's own comment reveals the real bug is worse
+    # than a 500: with `tools` now forwarded to it, a LIVE fuser answers
+    # with prose, and the client gets that prose instead of its tool call,
+    # fully billed. This is also the routine production shape: configs/
+    # gateway.toml's quorum is 2 models and kimi-k3 is 403ing today, so one
+    # quorum member down puts every streaming tool request through here.
+    def h(req):
+        body = json.loads(req.content)
+        if body["model"] == "a":
+            return httpx.Response(500, json={})
+        prompt = body["messages"][-1]["content"]
+        if "Produce the single best final answer" in prompt:
+            # Dead code on this path -- if this ever answers, the fuser was
+            # reached and the fix has regressed.
+            return httpx.Response(200, json={
+                "choices": [{"message": {"content": "PROSE FROM FUSER"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": None, "tool_calls": [
+                {"id": "call_1", "type": "function",
+                 "function": {"name": "read", "arguments": "{}"}}]}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+    c = make_client(tmp_path, monkeypatch, h=h)
+    with c.stream("POST", "/v1/chat/completions",
+                  json={**BODY, "stream": True}, headers=H()) as r:
+        assert r.status_code == 200
+        rid = r.headers["x-fusion-trace-id"]
+        raw = b"".join(r.iter_bytes()).decode()
+    assert "PROSE FROM FUSER" not in raw
+    assert raw.rstrip().endswith("data: [DONE]")
+    objs = [json.loads(l[6:]) for l in raw.splitlines()
+            if l.startswith("data: ") and l[6:].strip() != "[DONE]"]
+    assert any(o["choices"][0]["delta"].get("tool_calls", [{}])[0]
+               .get("function", {}).get("name") == "read" for o in objs)
+    assert any(o["choices"][0].get("finish_reason") == "tool_calls" for o in objs)
+    import sqlite3
+    conn = sqlite3.connect(tmp_path / "g.sqlite")
+    rows = conn.execute("SELECT model, state FROM ledger WHERE request_id=? ORDER BY id",
+                        (rid,)).fetchall()
+    # Same row count as the non-streaming twin above: "a" failed, "b"
+    # settled, no fuser call. 3 rows would mean the fuser was reached.
+    assert rows == [("a", "failed"), ("b", "settled")]
 
 
 def test_a_dead_fuser_falls_back_to_the_best_candidate(tmp_path, monkeypatch):
@@ -652,6 +818,64 @@ def test_streaming_tool_call_fallback_after_a_dead_fuser_is_delivered_as_a_chunk
     # so it is never settled as a paid success, and never left in
     # 'preflight'.
     assert rows[-1] == ("b", "failed", None)
+
+
+def test_streaming_dead_fuser_fallback_survives_a_null_function_tool_call(tmp_path, monkeypatch):
+    # M9 Task 6 review round 1, finding 2 (Important): `c.get("function",
+    # {}).get("name", "")` only substitutes the `{}` default when the KEY is
+    # missing, not when it's present with a `null` value -- an
+    # upstream-controlled shape. `None.get(...)` raised AttributeError mid-
+    # stream, and by then `_finish_request(..., "succeeded", ...)` had
+    # already run, so the request logged as succeeded while the client's
+    # stream aborted with no [DONE]. The `decided` path can't reach this
+    # (`canonical_calls` rejects a non-dict `function` before a call can win
+    # tool_fast/tool_reviewed/tool_plurality) -- only the dead-fuser
+    # fallback can, which this task newly opened.
+    def h(req):
+        body = json.loads(req.content)
+        prompt = body["messages"][-1]["content"]
+        if "Produce the single best final answer" in prompt:
+            return httpx.Response(500, json={})               # fuser dead
+        if "VERDICT" in prompt:
+            return httpx.Response(200, json={
+                "choices": [{"message": {"content": "VERDICT a correct ok\nVERDICT b correct ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+        # "a" (panel order's preferred survivor) carries a hostile
+        # `function: null` call; "b" disagrees with a normal one, so
+        # decide_tools can't resolve the panel structurally and the fuser
+        # genuinely gets called (and dies).
+        if body.get("model") == "a":
+            return httpx.Response(200, json={
+                "choices": [{"message": {"content": None, "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": None}]},
+                            "finish_reason": "tool_calls"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": None, "tool_calls": [
+                {"id": "call_2", "type": "function",
+                 "function": {"name": "get_time", "arguments": "{}"}}]},
+                        "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+    c = make_client(tmp_path, monkeypatch, h=h)
+    with c.stream("POST", "/v1/chat/completions",
+                  json={**BODY, "stream": True}, headers=H()) as r:
+        assert r.status_code == 200
+        raw = b"".join(r.iter_bytes()).decode()
+    assert ": fusion fusing" in raw
+    # Must complete cleanly -- an unguarded AttributeError inside the
+    # generator aborts the stream mid-write with no [DONE] and no error
+    # envelope (StreamingResponse has no hook to catch it after headers are
+    # already committed).
+    assert raw.rstrip().endswith("data: [DONE]")
+    objs = [json.loads(l[6:]) for l in raw.splitlines()
+            if l.startswith("data: ") and l[6:].strip() != "[DONE]"]
+    assert all("error" not in o for o in objs), raw
+    # The hostile call's null `function` renders as an empty name/arguments
+    # pair rather than crashing.
+    assert any(o["choices"][0]["delta"].get("tool_calls", [{}])[0].get("id") == "call_1"
+               and o["choices"][0]["delta"]["tool_calls"][0]["function"] == {"name": "", "arguments": ""}
+               for o in objs)
+    assert any(o["choices"][0].get("finish_reason") == "tool_calls" for o in objs)
 
 
 def test_streaming_empty_fuser_stream_falls_back_to_the_best_candidate(tmp_path, monkeypatch):
