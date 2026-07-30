@@ -991,7 +991,36 @@ Then let control continue into the existing prose flow (`_cross_review` +
 `is_consensus` + the `full` return) for the `"prose"` and three-way-split cases.
 Import `canonical_calls`, `plurality`, `all_readonly` from `gateway.tool_vote`.
 
-- [ ] **Step 5: Forward `tools` to the fuser**
+- [ ] **Step 5: Forward `tools` to the fuser — and read its answer back**
+
+**Task 3's review found a landmine here; this step closes it.** Once `tools` are
+forwarded and Task 4's action rule tells the fuser to act, the fuser will answer
+`content: null` + `tool_calls`. But `call_model(kind="fuser")` returns
+`_extract_text(resp)`, which is `""` for that shape — so `_finish_fusion`'s
+`if text:` is false, the **fully-billed fuser answer is discarded**, and the
+gateway falls back to `best_candidate`: one of the three *disagreeing* calls,
+picked by panel order. The arbitration the fuser exists to perform would be
+thrown away at exactly the moment it is needed. This is M8 finding 1a reproduced
+in the fuser leg.
+
+So this step has three parts, and the first two are not optional:
+
+1. `call_model` must return `_extract_message(resp)` for `kind == "fuser"` as
+   well as `kind == "candidate"` — only the *review* calls stay text-only.
+2. `_finish_fusion` must test the returned `Candidate`'s truthiness rather than a
+   string's, and pass the `Candidate` through unchanged.
+3. Once (1) and (2) hold, **delete the `isinstance` coercion at the top of
+   `openai_response`** and restore the brief's original `candidate: Candidate`
+   signature. That coercion existed only because the fuser leg still returned a
+   bare string; keeping it after this step would turn a loud `AttributeError`
+   into a silent wrong answer.
+
+Add a test: a three-way split where the fuser answers with a tool call, asserting
+the response carries **the fuser's** call and not any candidate's, and that the
+`fusion` metadata records the fuser as the source. Prove it bites by reverting
+(1) — the test must fail with a candidate's call in place of the fuser's.
+
+Then the `tools` forwarding itself:
 
 ```python
 def fuser_body(fcfg, panel: PanelResult, body: dict) -> dict:
