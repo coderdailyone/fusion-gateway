@@ -219,10 +219,28 @@ def _merge_reviews(base: dict[str, dict[str, Verdict]],
     here so the tool decision tree's own fall-through into the full path
     (Task 5 fix round 1, finding 1) can reuse it instead of a second,
     subtly different inline copy.
+
+    Fix round 2, finding 2: "supersedes" is NOT unconditional at the
+    (reviewer, target) level. A "wrong" verdict already recorded for a
+    given pair survives being overwritten by a later "correct" for that
+    SAME pair -- an objection once raised does not get silently laundered
+    away by a re-roll, whether that re-roll is a live model's own
+    non-determinism or (before fix round 2, finding 1) a byte-identical
+    duplicate call. "A reviewer objection cancels a copy" is carried over
+    verbatim from the brief as a binding rule; a merge that lets a later
+    round quietly erase the objection is not that rule. A target new to
+    `extra` (not present in `base` at all) is unaffected -- this only
+    guards an EXISTING "wrong" from being overwritten, it does not stop a
+    reviewer from adding fresh verdicts for targets it hadn't judged yet.
     """
     merged = {r: dict(v) for r, v in base.items()}
     for reviewer, verdicts in extra.items():
-        merged.setdefault(reviewer, {}).update(verdicts)
+        slot = merged.setdefault(reviewer, {})
+        for target, verdict in verdicts.items():
+            existing = slot.get(target)
+            if existing is not None and existing.verdict == "wrong":
+                continue
+            slot[target] = verdict
     return merged
 
 
@@ -545,6 +563,14 @@ async def gather_panel(*, fcfg, cfg, adapters, ledger, events, clock,
         # the same three candidates -- doubling both the bill and, on a
         # hanging slow leg, the latency budget.
         slow_collected = False
+        # Fix round 2, finding 1: set when `disagree_no_plurality` finds the
+        # slow leg added nothing (dead or timed out) -- round 1's review,
+        # already merged into `reviews` above, covered this EXACT candidate
+        # set (nothing changed), so the fall-through's own `_cross_review`
+        # below must not run again. Finding 3's defect class reappearing in
+        # this branch: kimi-k3 is 403ing in production right now, so this is
+        # today's actual shape for every objected write-class call.
+        skip_review_round = False
 
         verdict, winner = decide_tools(candidates, fcfg.readonly_tools)
         if verdict != "prose":
@@ -642,16 +668,26 @@ async def gather_panel(*, fcfg, cfg, adapters, ledger, events, clock,
             # emitted directly: fall through to the full path.
 
         if verdict == "disagree_no_plurality":
-            candidates.update(await collect(slow))
+            new_from_slow_here = await collect(slow)
+            candidates.update(new_from_slow_here)
             slow_collected = True
+            if not new_from_slow_here:
+                # The slow leg is dead or timed out -- `candidates` is still
+                # exactly the {a, b} set `agree_review`'s own round 1
+                # already reviewed (those verdicts are already in `reviews`
+                # from above). Re-reviewing here would send byte-identical
+                # prompts to the same reviewers for evidence that cannot
+                # possibly change. Reuse round 1 as-is.
+                skip_review_round = True
             # Deliberately does NOT attempt `plurality` -- see the comment
             # in the `agree_review` branch above for why that would just
             # re-elect the rejected call.
 
-        reviews = _merge_reviews(reviews, await _cross_review(
-            candidates=candidates, fcfg=fcfg, cfg=cfg, adapters=adapters,
-            ledger=ledger, events=events, clock=clock, request_id=request_id,
-            conversation=conversation))
+        if not skip_review_round:
+            reviews = _merge_reviews(reviews, await _cross_review(
+                candidates=candidates, fcfg=fcfg, cfg=cfg, adapters=adapters,
+                ledger=ledger, events=events, clock=clock, request_id=request_id,
+                conversation=conversation))
         agreed = is_consensus(candidates, reviews)
         events.append(request_id, "fusion.consensus",
                       {"agreed": agreed, "candidates": sorted(candidates)})

@@ -322,6 +322,90 @@ async def test_a_wholly_failed_review_stage_on_write_class_agreement_escalates(t
     assert sorted(r["state"] for r in rows) == ["failed"] * 4 + ["settled"] * 3
 
 
+# -- Fix round 2, finding 1 (Important): the escalation branch
+# (`disagree_no_plurality`) called `_cross_review` unconditionally, so a
+# DEAD slow leg (errors or times out, adding no candidate) still triggered a
+# second, byte-identical review round over the exact {a, b} set round 1
+# (inside `agree_review`) already reviewed -- Finding 3's defect class
+# reappearing in the branch Fix round 1 created. This is today's PRODUCTION
+# shape: kimi-k3 is 403ing right now, so every objected write-class call was
+# paying for two review calls that could not tell anyone anything new.
+
+@pytest.mark.anyio
+async def test_an_objection_with_a_dead_slow_leg_reviews_only_once(tmp_path):
+    review_prompts = []
+
+    def script(p):
+        prompt = p["messages"][0]["content"]
+        if "VERDICT" in prompt:
+            review_prompts.append(prompt)
+            return {"choices": [{"message": {"content":
+                     "VERDICT a wrong no\nVERDICT b wrong no"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+        return tool_resp("write", '{"path":"a.py"}')
+
+    ad = FakeAdapter({"a": script, "b": script}, errors={"s"})
+    env, store = make_env(tmp_path, ad)
+    panel = await gather_panel(body=TOOLS_BODY, **env)
+    assert panel.path not in ("tool_reviewed", "tool_plurality", "tool_fast")
+    # Exactly ONE review round: two calls (a reviews b, b reviews a), two
+    # DISTINCT prompts -- not four calls with a byte-identical duplicate.
+    assert len(review_prompts) == 2
+    assert len(set(review_prompts)) == 2
+    # Exact row count: 2 candidates settled + "s" failed (still bills a row,
+    # never vanishes) + 2 reviews (ONE round). Before this fix: 7 (the same
+    # 3 candidate rows + 4 review rows, 2 of them a byte-identical repeat).
+    rows = store.conn.execute("SELECT model, state FROM ledger").fetchall()
+    assert len(rows) == 5
+    assert sorted(r["state"] for r in rows) == ["failed"] + ["settled"] * 4
+
+
+# -- Fix round 2, finding 2 (Important): `_merge_reviews` let a later,
+# byte-identical (or merely re-rolled) round's "correct" silently overwrite
+# an earlier "wrong" for the SAME (reviewer, target) pair. Reproduced: round
+# 1 objects, round 2 (triggered because the slow leg genuinely joined) comes
+# back clean -> `is_consensus` reads all-correct -> `path='quorum'` ->
+# the fuser is told to COPY VERBATIM an answer a reviewer just rejected.
+# This does not reopen the CRITICAL (the fuser is still always reached for
+# any >=2-candidate panel), but it defeats the amended spec's requirement
+# that escalation carry "whatever reviews exist" to the fuser.
+
+@pytest.mark.anyio
+async def test_an_objection_survives_a_round_2_reroll_that_comes_back_clean(tmp_path):
+    calls = {"a": 0, "b": 0}
+
+    def make(name):
+        def fn(p):
+            prompt = p["messages"][0]["content"]
+            if "VERDICT" in prompt:
+                calls[name] += 1
+                if calls[name] == 1:
+                    # Round 1 (over {a, b} only): objects.
+                    return {"choices": [{"message": {"content":
+                             "VERDICT a wrong no\nVERDICT b wrong no"}}],
+                            "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+                # Round 2 (over {a, b, s}, once s joins): re-rolls clean.
+                return {"choices": [{"message": {"content":
+                         "VERDICT a correct ok\nVERDICT b correct ok\n"
+                         "VERDICT s correct ok"}}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+            return tool_resp("write", '{"path":"a.py"}')
+        return fn
+
+    # "s" agrees with the objected pair -- it is a genuinely new candidate,
+    # so the fall-through review round is warranted (fix round 2, finding 1
+    # does not skip it here) and round 2 legitimately runs.
+    ad = FakeAdapter({"a": make("a"), "b": make("b"),
+                      "s": lambda p: tool_resp("write", '{"path":"a.py"}')})
+    env, _ = make_env(tmp_path, ad)
+    panel = await gather_panel(body=TOOLS_BODY, **env)
+    # The objection must not be laundered into "quorum" (a silent COPY
+    # VERBATIM instruction to the fuser for an answer just rejected).
+    assert panel.path == "full"
+    assert panel.reviews["a"]["b"].verdict == "wrong"
+    assert panel.reviews["b"]["a"].verdict == "wrong"
+
+
 # -- Fix round 1, finding 2 (Important): the all_readonly gate applied only
 # to a quorum agreement, not to a plurality winner -- a write-class 2-of-3
 # plurality was served directly, with reviews={} and no fuser, carrying no
