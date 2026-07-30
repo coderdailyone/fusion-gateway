@@ -88,7 +88,10 @@ def render_candidate(c) -> str:
     if text:
         lines.append(text)
     for call in calls:
-        fn = call.get("function", {}) if isinstance(call, dict) else {}
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function")
+        fn = fn if isinstance(fn, dict) else {}
         name = fn.get("name", "?")
         args = fn.get("arguments", "")
         lines.append(f"TOOL_CALL {name} {args}")

@@ -129,7 +129,8 @@ def test_a_reviewer_still_never_sees_its_own_tool_call():
 def test_the_fusion_prompt_tells_the_fuser_to_act_not_narrate():
     p = build_fusion_prompt("Q", {"m1": Candidate("", TOOL)}, {})
     low = p.lower()
-    assert "tool" in low and ("call" in low or "action" in low)
+    # Distinctive rule language not found in any candidate block rendering
+    assert "do not answer in prose instead of acting" in low
 
 
 def test_prose_prompts_are_byte_identical_to_the_string_era():
@@ -140,5 +141,29 @@ def test_prose_prompts_are_byte_identical_to_the_string_era():
     assert "--- Candidate a ---\nfirst" in review
     assert "--- Candidate b ---" not in review
     fusion = build_fusion_prompt("CONV", cands, {})
+    # Exact equality anchor to catch trailing/interstitial drift
+    assert ("--- Candidate a ---\nfirst\n\n--- Candidate b ---\nsecond\n\n--- Peer review ---\n"
+            "(no reviews available)\n\nRules:\n") in fusion
+    # Also keep the broader in-based checks
     assert "--- Candidate a ---\nfirst\n\n--- Candidate b ---\nsecond" in fusion
     assert "(no reviews available)" in fusion
+
+
+def test_render_candidate_survives_hostile_shapes():
+    from gateway.fusion_prompts import render_candidate
+    # function as None, str, or list should not crash
+    assert isinstance(render_candidate(Candidate("text", ({"function": None},))), str)
+    assert isinstance(render_candidate(Candidate("text", ({"function": "not_a_dict"},))), str)
+    assert isinstance(render_candidate(Candidate("text", ({"function": []},))), str)
+    # Non-dict tool_calls items should be skipped
+    assert isinstance(render_candidate(Candidate("text", ("not_a_dict", None, 123))), str)
+    # Missing name and arguments should default gracefully
+    assert isinstance(render_candidate(Candidate("text", ({"function": {}},))), str)
+    assert isinstance(render_candidate(Candidate("", ({"function": {"name": "foo"}},))), str)
+    # Bare string candidate (no object attributes)
+    assert render_candidate("plain text") == "plain text"
+    # Output should never contain Python repr artifacts
+    result = render_candidate(Candidate("", ({"function": None},)))
+    assert "{" not in result and ">" not in result
+    result = render_candidate(Candidate("", ({"function": "x"},)))
+    assert "{" not in result and ">" not in result
