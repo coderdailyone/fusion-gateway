@@ -74,6 +74,27 @@ def render_conversation(messages) -> str:
     return "\n".join(lines)
 
 
+def render_candidate(c) -> str:
+    """Render a candidate for a reviewer or the fuser.
+
+    Text-only candidates render as their bare text, byte-identical to when
+    candidates were strings -- the prose path must not shift.
+    """
+    text = getattr(c, "text", c) or ""
+    calls = getattr(c, "tool_calls", ()) or ()
+    if not calls:
+        return text
+    lines = []
+    if text:
+        lines.append(text)
+    for call in calls:
+        fn = call.get("function", {}) if isinstance(call, dict) else {}
+        name = fn.get("name", "?")
+        args = fn.get("arguments", "")
+        lines.append(f"TOOL_CALL {name} {args}")
+    return "\n".join(lines)
+
+
 def _candidate_block(candidates: dict, exclude: str | None = None) -> str:
     """Render each candidate's text for the review/fusion prompts.
 
@@ -88,8 +109,7 @@ def _candidate_block(candidates: dict, exclude: str | None = None) -> str:
     for model, c in sorted(candidates.items()):
         if model == exclude:
             continue
-        text = c if isinstance(c, str) else c.text
-        parts.append(f"--- Candidate {model} ---\n{text}")
+        parts.append(f"--- Candidate {model} ---\n{render_candidate(c)}")
     return "\n\n".join(parts)
 
 
@@ -124,6 +144,10 @@ def build_fusion_prompt(conversation: str, candidates: dict,
         "concrete error in it.",
         "- If they disagree, decide using the specific objections raised, and "
         "write a corrected answer (you may combine correct parts of several).",
+        "- If the candidates proposed tool calls (shown as TOOL_CALL lines), "
+        "the conversation calls for an action, not an explanation. Choose the "
+        "correct call, or state the corrected one in the same TOOL_CALL form. "
+        "Do not answer in prose instead of acting.",
         "- Reply with the answer itself. Do not mention the candidates, the "
         "reviews, or that several models were consulted.",
     ]

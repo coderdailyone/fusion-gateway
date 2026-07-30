@@ -106,3 +106,39 @@ def test_parse_review_drops_junk_without_raising():
 
 def test_parse_review_allows_a_verdict_with_no_reason():
     assert parse_review("VERDICT a correct", {"a"}) == {"a": Verdict("correct", "")}
+
+
+from gateway.fusion import Candidate
+
+TOOL = ({"id": "c1", "type": "function",
+         "function": {"name": "read", "arguments": '{"path":"a.py"}'}},)
+
+
+def test_a_tool_call_candidate_renders_its_name_and_arguments():
+    p = build_review_prompt("Q", {"m1": Candidate("", TOOL),
+                                  "m2": Candidate("prose")}, reviewer="m2")
+    assert "read" in p and '"path"' in p and "a.py" in p
+
+
+def test_a_reviewer_still_never_sees_its_own_tool_call():
+    p = build_review_prompt("Q", {"m1": Candidate("", TOOL),
+                                  "m2": Candidate("", TOOL)}, reviewer="m1")
+    assert "--- Candidate m1 ---" not in p
+
+
+def test_the_fusion_prompt_tells_the_fuser_to_act_not_narrate():
+    p = build_fusion_prompt("Q", {"m1": Candidate("", TOOL)}, {})
+    low = p.lower()
+    assert "tool" in low and ("call" in low or "action" in low)
+
+
+def test_prose_prompts_are_byte_identical_to_the_string_era():
+    # The prose path must not shift by a single character. These are the exact
+    # strings the pre-Candidate implementation produced.
+    cands = {"a": Candidate("first"), "b": Candidate("second")}
+    review = build_review_prompt("CONV", cands, reviewer="b")
+    assert "--- Candidate a ---\nfirst" in review
+    assert "--- Candidate b ---" not in review
+    fusion = build_fusion_prompt("CONV", cands, {})
+    assert "--- Candidate a ---\nfirst\n\n--- Candidate b ---\nsecond" in fusion
+    assert "(no reviews available)" in fusion
