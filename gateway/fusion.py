@@ -65,9 +65,25 @@ _FUSER_PASSTHROUGH = ("max_tokens", "temperature", "top_p", "response_format", "
 
 
 @dataclass(frozen=True)
+class Candidate:
+    """One panel member's answer: prose, tool calls, or both.
+
+    Candidates used to be bare strings, which is why a tool call made
+    `_extract_text` return "" and got the candidate dropped -- a fully-billed
+    panel then returned 502 (M8 final review, finding 1a). A Candidate with
+    empty `tool_calls` must behave exactly as the string did.
+    """
+    text: str
+    tool_calls: tuple[dict, ...] = ()
+
+    def __bool__(self) -> bool:
+        return bool(self.text or self.tool_calls)
+
+
+@dataclass(frozen=True)
 class PanelResult:
     conversation: str
-    candidates: dict[str, str]
+    candidates: dict[str, Candidate]
     reviews: dict[str, dict[str, Verdict]]
     path: str            # "quorum" | "full"
     degraded: bool
@@ -91,12 +107,35 @@ def _extract_text(resp) -> str:
     return ""
 
 
+def _extract_message(resp) -> Candidate:
+    """Pull text AND tool calls out of an upstream response, defensively.
+
+    The response is upstream-controlled, so every access is guarded: a raw
+    index would turn a malformed 200 into a gateway 500. Kept alongside
+    `_extract_text` on purpose (not a duplicate to "clean up"): the review
+    and fuser calls return prose and have no use for tool calls, so only the
+    candidate path needs this.
+    """
+    text = _extract_text(resp)
+    calls: tuple[dict, ...] = ()
+    try:
+        raw = resp["choices"][0]["message"].get("tool_calls")
+    except (TypeError, KeyError, IndexError, AttributeError):
+        raw = None
+    if isinstance(raw, (list, tuple)):
+        calls = tuple(c for c in raw if isinstance(c, dict))
+    return Candidate(text, calls)
+
+
 async def call_model(*, model_name, body, cfg, adapters, ledger, events, clock,
                      request_id, kind):
-    """One billed upstream call. Returns its text, or None on failure.
+    """One billed upstream call. Returns its answer, or None on failure.
 
     `kind` labels the event ("candidate" | "review" | "fuser"). Raises only
-    BudgetTripped and asyncio.CancelledError.
+    BudgetTripped and asyncio.CancelledError. Only the candidate path can
+    carry tool calls, so only it returns a `Candidate` (via
+    `_extract_message`); review and fuser calls return prose (`_extract_text`)
+    exactly as before -- they have no use for tool calls.
     """
     model_cfg = cfg.models[model_name]
     adapter = adapters[model_cfg.provider]
@@ -148,6 +187,8 @@ async def call_model(*, model_name, body, cfg, adapters, ledger, events, clock,
     ledger.settle(entry_id, in_tok, out_tok, source, _latency(),
                   model_cfg.in_usd_per_mtok, model_cfg.out_usd_per_mtok)
     events.append(request_id, "call.succeeded", {"model": model_name, "stage": kind})
+    if kind == "candidate":
+        return _extract_message(resp)
     return _extract_text(resp)
 
 
@@ -428,25 +469,49 @@ def fuser_body(fcfg, panel: PanelResult, body: dict) -> dict:
 
 
 def best_candidate(fcfg, panel: PanelResult):
-    """The answer to fall back on when the fuser itself fails: the first
-    surviving member in configured panel order."""
+    """The answer to fall back on when the fuser fails: the first surviving
+    member in configured panel order. Returns (model, Candidate) or None."""
     for m in fcfg.panel:
-        if panel.candidates.get(m):
-            return m, panel.candidates[m]
+        c = panel.candidates.get(m)
+        if c:
+            return m, c
     for m in sorted(panel.candidates):
-        if panel.candidates[m]:
-            return m, panel.candidates[m]
+        c = panel.candidates[m]
+        if c:
+            return m, c
     return None
 
 
-def openai_response(text: str, model: str, meta: dict) -> dict:
+def openai_response(candidate, model: str, meta: dict) -> dict:
+    """The client-facing JSON response for a fused (or fallback) answer.
+
+    `candidate` is usually a `Candidate` -- but the fuser's own call still
+    returns plain prose via `_extract_text` (never `_extract_message`; the
+    fuser has no use for tool calls), so a bare `str` reaches here too on the
+    "fuser succeeded" path in app.py's `_finish_fusion`. Coercing it into a
+    `Candidate(text)` up front means both shapes render identically, which is
+    also what `tests/test_fusion.py::test_openai_response_is_well_formed`
+    (calling this with a bare string, unchanged since before this task)
+    already pins.
+    """
+    if not isinstance(candidate, Candidate):
+        candidate = Candidate(candidate)
+    message: dict = {"role": "assistant"}
+    if candidate.tool_calls:
+        # OpenAI sends content: null alongside tool_calls unless the model
+        # also produced prose; finish_reason must be "tool_calls" or clients
+        # will not execute the call.
+        message["content"] = candidate.text or None
+        message["tool_calls"] = list(candidate.tool_calls)
+        finish = "tool_calls"
+    else:
+        message["content"] = candidate.text
+        finish = "stop"
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex}",
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model,
-        "choices": [{"index": 0,
-                     "message": {"role": "assistant", "content": text},
-                     "finish_reason": "stop"}],
+        "choices": [{"index": 0, "message": message, "finish_reason": finish}],
         "fusion": meta,
     }

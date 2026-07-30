@@ -318,7 +318,9 @@ def create_app(
                 events.append(request_id, "fusion.degraded",
                               {"rung": "fuser_failed", "model": fallback[0]})
                 _finish_request(store, request_id, "succeeded", clock)
-                for piece in _as_chunks(fallback[1], fcfg.model):
+                # fallback[1] is a Candidate now; .text for now -- the
+                # tool-call stream is Task 6.
+                for piece in _as_chunks(fallback[1].text, fcfg.model):
                     yield piece
 
             try:
@@ -419,7 +421,11 @@ def create_app(
 
     async def _finish_fusion(panel, body, fcfg, common, request_id):
         """Run the fuser. Returns (text, source) with source in
-        {"fuser", "candidate"}, or (None, "none") when nothing survived."""
+        {"fuser", "candidate"}, or (None, "none") when nothing survived.
+        `text` is a bare str on the "fuser" source (call_model's fuser path
+        still returns prose via _extract_text) and a Candidate on the
+        "candidate" source (best_candidate's fallback) -- openai_response
+        accepts either."""
         if len(panel.candidates) < 2:
             fallback = best_candidate(fcfg, panel)
             if fallback is None:

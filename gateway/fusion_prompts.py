@@ -74,16 +74,26 @@ def render_conversation(messages) -> str:
     return "\n".join(lines)
 
 
-def _candidate_block(candidates: dict[str, str], exclude: str | None = None) -> str:
+def _candidate_block(candidates: dict, exclude: str | None = None) -> str:
+    """Render each candidate's text for the review/fusion prompts.
+
+    Task 3: `candidates` values are usually `gateway.fusion.Candidate`
+    (rendered via `.text`), but this module is deliberately import-free of
+    `gateway` (see module docstring), and several existing tests build a
+    `PanelResult` directly with bare strings -- accepting both here, rather
+    than requiring `Candidate`, is what keeps that prose path byte-identical.
+    Task 4 is where this starts rendering tool calls too.
+    """
     parts = []
-    for model, text in sorted(candidates.items()):
+    for model, c in sorted(candidates.items()):
         if model == exclude:
             continue
+        text = c if isinstance(c, str) else c.text
         parts.append(f"--- Candidate {model} ---\n{text}")
     return "\n\n".join(parts)
 
 
-def build_review_prompt(conversation: str, candidates: dict[str, str],
+def build_review_prompt(conversation: str, candidates: dict,
                         reviewer: str) -> str:
     """Ask `reviewer` to judge the OTHER candidates -- never its own answer."""
     return (
@@ -98,7 +108,7 @@ def build_review_prompt(conversation: str, candidates: dict[str, str],
     )
 
 
-def build_fusion_prompt(conversation: str, candidates: dict[str, str],
+def build_fusion_prompt(conversation: str, candidates: dict,
                         reviews: dict[str, dict[str, Verdict]]) -> str:
     """The fuser sees every candidate plus the cross-review evidence."""
     lines = []
