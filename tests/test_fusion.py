@@ -50,6 +50,15 @@ class FakeAdapter:
         text = self.script.get(upstream_model, "")
         if callable(text):
             text = text(payload)
+        # M9 Task 5: a script can return a full response dict (e.g. a
+        # tool-call shape with its own "choices"/"usage") instead of plain
+        # text, when a candidate needs to answer with `tool_calls` rather
+        # than `content`. Passed through unchanged rather than wrapped a
+        # second time as `{"content": <dict>}`, which every plain-string
+        # script (every test predating M9 Task 5) still gets exactly as
+        # before.
+        if isinstance(text, dict):
+            return text
         return {"choices": [{"message": {"content": text}}],
                 "usage": {"prompt_tokens": 3, "completion_tokens": 4}}
 
@@ -503,7 +512,15 @@ def test_best_candidate_skips_falsy_entries_in_the_sorted_fallback():
 
 
 def test_openai_response_is_well_formed():
-    r = openai_response("hi", "fusion", {"path": "quorum"})
+    # M9 Task 5 step 5: openai_response used to accept a bare str too (the
+    # fuser leg still returned one via _extract_text, coerced here with an
+    # isinstance check) -- this test originally called it with "hi" directly
+    # to pin that. Once the fuser leg was fixed to return a Candidate like
+    # every other caller, the coercion was deleted on purpose (see
+    # openai_response's docstring), so a bare str now raises AttributeError
+    # instead of being silently accepted. Updated to pass a Candidate, which
+    # is what every real caller has always done since Task 3.
+    r = openai_response(Candidate("hi"), "fusion", {"path": "quorum"})
     assert r["object"] == "chat.completion"
     assert r["choices"][0]["message"] == {"role": "assistant", "content": "hi"}
     assert r["choices"][0]["finish_reason"] == "stop"
@@ -735,21 +752,39 @@ class _ToolCallAdapter:
     """Candidate calls answer with tool-calls only (content: null); review
     calls answer honestly with VERDICT text -- isolates collect()'s
     truthiness handling of a Candidate with empty .text from everything
-    else gather_panel does."""
+    else gather_panel does.
+
+    M9 Task 5: "a" and "b" now propose DIFFERENT arguments and "s" errors
+    outright. Before Task 5, all three proposed the exact same call, which
+    was irrelevant here -- there was no structural comparison yet. After
+    Task 5, decide_tools would read that identical call as "agree_readonly"
+    (it's the default-readonly "read" tool) and correctly fast-path to a
+    SINGLE winner, which is Task 5's whole point but not what THIS test —
+    predating the decision tree -- is about: whether a tool-calls-only
+    Candidate survives collect()'s truthiness gate at all. Keeping "a" and
+    "b" genuinely disagreeing (and "s" out of the picture entirely) sends
+    decide_tools straight to "disagree", plurality finds no winner once
+    slow errors out and never joins, and control falls through unchanged
+    into the pre-Task-5 _cross_review/is_consensus path this test actually
+    exercises.
+    """
     def __init__(self):
         self.calls = []
 
     async def chat(self, upstream_model, payload):
         self.calls.append((upstream_model, payload))
+        if upstream_model == "s":
+            raise ProviderError("p", "http", status=500)
         prompt = payload["messages"][0]["content"]
         if "VERDICT" in prompt:
             targets = [n for n in ("a", "b", "s") if f"Candidate {n}" in prompt]
             text = "\n".join(f"VERDICT {t} correct fine" for t in targets)
             return {"choices": [{"message": {"content": text}}],
                     "usage": {"prompt_tokens": 3, "completion_tokens": 4}}
+        args = '{"path":"a.py"}' if upstream_model == "a" else '{"path":"b.py"}'
         return {"choices": [{"message": {"content": None, "tool_calls": [
                     {"id": "call_1", "type": "function",
-                     "function": {"name": "read", "arguments": "{}"}}]}}],
+                     "function": {"name": "read", "arguments": args}}]}}],
                 "usage": {"prompt_tokens": 3, "completion_tokens": 4}}
 
 

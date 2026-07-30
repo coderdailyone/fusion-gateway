@@ -49,6 +49,7 @@ from gateway.fusion_prompts import (
 )
 from gateway.ledger import BudgetTripped, estimate_tokens
 from gateway.providers import ProviderError
+from gateway.tool_vote import all_readonly, canonical_calls, plurality
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +86,7 @@ class PanelResult:
     conversation: str
     candidates: dict[str, Candidate]
     reviews: dict[str, dict[str, Verdict]]
-    path: str            # "quorum" | "full"
+    path: str            # "quorum" | "full" | "tool_fast" | "tool_reviewed" | "tool_plurality"
     degraded: bool
 
 
@@ -132,10 +133,13 @@ async def call_model(*, model_name, body, cfg, adapters, ledger, events, clock,
     """One billed upstream call. Returns its answer, or None on failure.
 
     `kind` labels the event ("candidate" | "review" | "fuser"). Raises only
-    BudgetTripped and asyncio.CancelledError. Only the candidate path can
-    carry tool calls, so only it returns a `Candidate` (via
-    `_extract_message`); review and fuser calls return prose (`_extract_text`)
-    exactly as before -- they have no use for tool calls.
+    BudgetTripped and asyncio.CancelledError. The candidate AND fuser paths
+    can both carry tool calls -- once `fuser_body` forwards `tools`, the
+    fuser is free to answer with `content: null` + `tool_calls` exactly like
+    a candidate, and `_extract_text` would silently return "" for that shape
+    (M8 finding 1a, reproduced in the fuser leg -- Task 5 step 5). So both
+    return a `Candidate` via `_extract_message`. Only review calls stay
+    text-only (`_extract_text`) -- a reviewer's job is to judge, never to act.
     """
     model_cfg = cfg.models[model_name]
     adapter = adapters[model_cfg.provider]
@@ -187,7 +191,7 @@ async def call_model(*, model_name, body, cfg, adapters, ledger, events, clock,
     ledger.settle(entry_id, in_tok, out_tok, source, _latency(),
                   model_cfg.in_usd_per_mtok, model_cfg.out_usd_per_mtok)
     events.append(request_id, "call.succeeded", {"model": model_name, "stage": kind})
-    if kind == "candidate":
+    if kind in ("candidate", "fuser"):
         return _extract_message(resp)
     return _extract_text(resp)
 
@@ -332,6 +336,35 @@ async def _cross_review(*, candidates, fcfg, cfg, adapters, ledger, events,
                 pass
 
 
+def decide_tools(candidates: dict[str, Candidate], readonly: frozenset[str]):
+    """Classify a set of candidates by their tool calls.
+
+    Returns one of:
+      ("agree_readonly", winner)  every candidate proposed the same calls, all
+                                  read-only -- emit with no review
+      ("agree_review", winner)    same calls, but at least one is write-class --
+                                  the review still runs
+      ("disagree", None)          the calls differ, or one is prose and one a
+                                  call, or none are comparable
+      ("prose", None)             no candidate proposed a call at all
+
+    Pure and read-only: never touches the ledger or events. `winner` is the
+    alphabetically-first model among the (structurally identical) agreeing
+    set -- deterministic, so it does not depend on dict iteration order.
+    """
+    by_model = {m: canonical_calls(c.tool_calls) for m, c in candidates.items()}
+    if all(v is None for v in by_model.values()):
+        return "prose", None
+    if len(candidates) < 2:
+        return "disagree", None
+    values = list(by_model.values())
+    if any(v is None for v in values) or len(set(values)) != 1:
+        return "disagree", None
+    winner = sorted(candidates)[0]
+    kind = "agree_readonly" if all_readonly(values[0], readonly) else "agree_review"
+    return kind, winner
+
+
 async def gather_panel(*, fcfg, cfg, adapters, ledger, events, clock,
                        request_id, body) -> PanelResult:
     """Stages 1-2. Raises BudgetTripped; every other call failure degrades.
@@ -417,8 +450,78 @@ async def gather_panel(*, fcfg, cfg, adapters, ledger, events, clock,
             except Exception:
                 pass
 
+    async def cancel(names):
+        """Cancel and await a SPECIFIC subset of panel tasks -- the tool fast
+        path's "the winner is decided, the slow leg is no longer needed"
+        signal, as opposed to `cancel_remaining`'s unconditional end-of-
+        function sweep. Deliberately reuses the exact same pattern (task.
+        cancel(), then await, re-raising only a CancelledError that ISN'T
+        this cleanup's own doing) rather than settling the ledger by hand:
+        `call_model`'s CancelledError handler is what already settles a
+        cancelled leg at its preflight estimate instead of leaving the row
+        in 'preflight' or `fail`ing it, and that must stay the ONLY place
+        that happens. A task already done here (e.g. it raced to completion
+        before the cancel arrived) is left alone -- `task.cancel()` on a
+        finished task is a documented no-op, and `cancel_remaining` in the
+        `finally` below will not touch it either since `task.done()` is
+        already true.
+        """
+        for m in names:
+            if not tasks[m].done():
+                tasks[m].cancel()
+        for m in names:
+            try:
+                await tasks[m]
+            except asyncio.CancelledError:
+                if not tasks[m].cancelled():
+                    raise
+            except Exception:
+                pass
+
     try:
         candidates = await collect(fcfg.quorum)
+
+        verdict, winner = decide_tools(candidates, fcfg.readonly_tools)
+        events.append(request_id, "fusion.tool_verdict",
+                      {"verdict": verdict, "winner": winner})
+
+        if verdict == "agree_readonly":
+            # Structural agreement is an exact agreement signal, unlike mutual
+            # "correct" verdicts -- so no review is needed. It carries no
+            # independent correctness check, which is why write-class calls
+            # below keep the review even when the models agree.
+            await cancel(slow)
+            return PanelResult(conversation, {winner: candidates[winner]}, {},
+                               "tool_fast",
+                               degraded=len(candidates) < len(fcfg.quorum))
+
+        if verdict == "agree_review":
+            reviews = await _cross_review(
+                candidates=candidates, fcfg=fcfg, cfg=cfg, adapters=adapters,
+                ledger=ledger, events=events, clock=clock,
+                request_id=request_id, conversation=conversation)
+            objected = any(v.verdict == "wrong"
+                           for verds in reviews.values() for v in verds.values())
+            # A MISSING review is not agreement either -- the same conservative
+            # rule the prose path's is_consensus uses.
+            if reviews and not objected:
+                await cancel(slow)
+                return PanelResult(conversation, {winner: candidates[winner]},
+                                   reviews, "tool_reviewed",
+                                   degraded=len(candidates) < len(fcfg.quorum))
+            verdict = "disagree"
+
+        if verdict == "disagree":
+            candidates.update(await collect(slow))
+            plur = plurality({m: canonical_calls(c.tool_calls)
+                              for m, c in candidates.items()})
+            if plur is not None:
+                return PanelResult(conversation, {plur: candidates[plur]}, {},
+                                   "tool_plurality",
+                                   degraded=len(candidates) < len(fcfg.panel))
+            # Three-way split: fall through to the existing full path, which
+            # cross-reviews everything and lets the fuser decide.
+
         reviews = await _cross_review(
             candidates=candidates, fcfg=fcfg, cfg=cfg, adapters=adapters,
             ledger=ledger, events=events, clock=clock, request_id=request_id,
@@ -464,8 +567,23 @@ async def gather_panel(*, fcfg, cfg, adapters, ledger, events, clock,
 
 
 def fuser_body(fcfg, panel: PanelResult, body: dict) -> dict:
-    """The OpenAI body for the fuser call: one user message, no client tools."""
+    """The OpenAI body for the fuser call: one user message.
+
+    `tools`/`tool_choice` are forwarded only when the panel actually holds tool
+    calls -- the fuser has to be able to answer with a call, and on the prose
+    path forwarding them would invite a call nobody asked for.
+    """
     out = {k: body[k] for k in _FUSER_PASSTHROUGH if k in body}
+    # `getattr(c, "tool_calls", ())`, not `c.tool_calls`: several existing
+    # tests build a PanelResult directly with bare strings for candidates
+    # (predating Task 3's Candidate refactor -- see _candidate_block's
+    # docstring in fusion_prompts.py for the same convention), and this must
+    # tolerate that exactly like render_candidate already does, rather than
+    # AttributeError on the prose path's own pre-existing tests.
+    if any(getattr(c, "tool_calls", ()) for c in panel.candidates.values()):
+        for k in ("tools", "tool_choice"):
+            if k in body:
+                out[k] = body[k]
     out["messages"] = [{"role": "user", "content": build_fusion_prompt(
         panel.conversation, panel.candidates, panel.reviews)}]
     return out
@@ -485,20 +603,24 @@ def best_candidate(fcfg, panel: PanelResult):
     return None
 
 
-def openai_response(candidate: Candidate | str, model: str, meta: dict) -> dict:
+def openai_response(candidate: Candidate, model: str, meta: dict) -> dict:
     """The client-facing JSON response for a fused (or fallback) answer.
 
-    `candidate` is usually a `Candidate` -- but the fuser's own call still
-    returns plain prose via `_extract_text` (never `_extract_message`; the
-    fuser has no use for tool calls), so a bare `str` reaches here too on the
-    "fuser succeeded" path in app.py's `_finish_fusion`. Coercing it into a
-    `Candidate(text)` up front means both shapes render identically, which is
-    also what `tests/test_fusion.py::test_openai_response_is_well_formed`
-    (calling this with a bare string, unchanged since before this task)
-    already pins.
+    `candidate` must be a `Candidate` -- both sources that reach here now
+    agree on that shape: `best_candidate`'s fallback always was one, and as
+    of Task 5 step 5 the fuser's own call is too (`call_model(kind="fuser")`
+    returns `_extract_message`, not `_extract_text`, precisely so a fuser
+    that answers with a tool call isn't silently coerced into empty prose).
+    A bare `str` used to reach here from the fuser leg, so this function
+    briefly coerced one into a `Candidate(text)` -- that coercion is gone on
+    purpose. If `call_model`'s fuser branch ever regresses back to
+    `_extract_text` (which drops any tool call the upstream returned), a
+    lingering coercion here would silently re-wrap the resulting bare string
+    into prose and serve it as a normal 200 -- a wrong answer with nothing to
+    signal it. Without the coercion, `candidate.tool_calls` on a plain `str`
+    raises `AttributeError` immediately: a loud, obvious failure instead of a
+    quiet, wrong one.
     """
-    if not isinstance(candidate, Candidate):
-        candidate = Candidate(candidate)
     message: dict = {"role": "assistant"}
     if candidate.tool_calls:
         # OpenAI sends content: null alongside tool_calls unless the model

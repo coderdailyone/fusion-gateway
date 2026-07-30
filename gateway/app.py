@@ -430,10 +430,11 @@ def create_app(
     async def _finish_fusion(panel, body, fcfg, common, request_id):
         """Run the fuser. Returns (text, source) with source in
         {"fuser", "candidate"}, or (None, "none") when nothing survived.
-        `text` is a bare str on the "fuser" source (call_model's fuser path
-        still returns prose via _extract_text) and a Candidate on the
-        "candidate" source (best_candidate's fallback) -- openai_response
-        accepts either."""
+        `text` is always a `Candidate` -- both the "fuser" source
+        (call_model's fuser path returns `_extract_message`, so a fuser that
+        answers with a tool call is not silently coerced into empty prose)
+        and the "candidate" source (best_candidate's fallback) agree on that
+        shape, which is what lets `openai_response` require a `Candidate`."""
         if len(panel.candidates) < 2:
             fallback = best_candidate(fcfg, panel)
             if fallback is None:
