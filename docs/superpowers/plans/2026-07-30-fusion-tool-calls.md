@@ -770,7 +770,12 @@ Rules carried over verbatim from the prose path, not reinvented: a reviewer obje
 
 - [ ] **Step 1: Write the failing tests**
 
-Reuse `tests/test_fusion.py`'s existing fixtures (`FCFG`, `FakeCfg`, `FakeAdapter`, `make_env`, `BODY`, the `anyio_backend` fixture) by importing them, or mirror them. `FCFG` needs `readonly_tools=frozenset({"read"})`.
+Reuse `tests/test_fusion.py`'s existing fixtures by importing them — `FCFG`
+(line 22), `FakeCfg`, `FakeAdapter`, `make_env` (line 57) and `BODY` (line 70).
+**`make_env(tmp_path, adapter, fcfg=FCFG)` already takes an `fcfg` override**, so
+a test needing a different `readonly_tools` builds one with
+`dataclasses.replace(FCFG, readonly_tools=frozenset({"read"}))` and passes it in
+rather than rebuilding the environment. Do not duplicate the fixtures.
 
 ```python
 # append to tests/test_fusion_tools.py
