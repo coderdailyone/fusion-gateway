@@ -722,3 +722,91 @@ def test_streaming_budget_trip_at_the_fuser_emits_an_error_not_a_crash(tmp_path,
     rows = conn.execute("SELECT model, state FROM ledger").fetchall()
     assert len(rows) == 4
     assert all(state == "settled" for _, state in rows), rows
+
+
+# -- Task 5 fix round 1, finding 4: every tool-decided path returns a
+# 1-candidate PanelResult, which used to trip _finish_fusion's
+# `len(panel.candidates) < 2` guard unconditionally -- source="candidate",
+# meta["degraded"] = True, and a `fusion.degraded {"rung":"single_candidate"}`
+# event, on what is actually a HEALTHY fast path. Production metrics would
+# have counted every successful tool_fast/tool_reviewed/tool_plurality
+# request as a degradation. `panel.path in TOOL_DECIDED_PATHS` is what lets
+# `_finish_fusion` (and the meta built around it) tell "decided structurally,
+# fuser deliberately skipped" apart from "we lost candidates".
+#
+# Both tests below send a request whose BODY carries no `tools`/`tool_choice`
+# (so app.py's pre-Task-6 bypass gate -- which only inspects the CLIENT's own
+# request, never the mocked upstream's response shape -- does not intercept
+# it) while the mocked upstream answers candidate calls with a real
+# `tool_calls` shape anyway. This is the only way to drive gather_panel's
+# tool decision tree through the real HTTP path today; Task 6 removes the
+# bypass gate and can simplify this once it does.
+
+def _tool_read_response(model):
+    return httpx.Response(200, json={
+        "choices": [{"message": {"content": None, "tool_calls": [
+            {"id": "call_1", "type": "function",
+             "function": {"name": "read", "arguments": "{}"}}]}}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+
+
+def _event_kinds(tmp_path, request_id):
+    import sqlite3
+    conn = sqlite3.connect(tmp_path / "g.sqlite")
+    return [row[0] for row in conn.execute(
+        "SELECT kind FROM events WHERE request_id=?", (request_id,)).fetchall()]
+
+
+def test_a_healthy_tool_fast_path_is_not_reported_degraded(tmp_path, monkeypatch):
+    def h(req):
+        body = json.loads(req.content)
+        prompt = body["messages"][-1]["content"]
+        if "VERDICT" in prompt:
+            # Never reached on tool_fast (no review is dispatched), but kept
+            # honest in case a regression elsewhere sends a and b to review.
+            return httpx.Response(200, json={
+                "choices": [{"message": {"content":
+                    "VERDICT a correct ok\nVERDICT b correct ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+        return _tool_read_response(body.get("model"))
+    c = make_client(tmp_path, monkeypatch, h=h)
+    r = c.post("/v1/chat/completions", json=BODY, headers=H())
+    assert r.status_code == 200
+    body = r.json()
+    assert body["fusion"]["path"] == "tool_fast"
+    assert body["fusion"]["degraded"] is False
+    assert body["fusion"]["answered_by"] == "candidate"
+    msg = body["choices"][0]["message"]
+    assert msg["tool_calls"][0]["function"]["name"] == "read"
+    rid = r.headers["x-fusion-trace-id"]
+    kinds = _event_kinds(tmp_path, rid)
+    assert "fusion.degraded" not in kinds
+
+
+def test_a_genuine_single_candidate_fallback_still_reports_degraded(tmp_path, monkeypatch):
+    # Mirrors the test above but with model "b" genuinely down -- only "a"
+    # survives, decide_tools never even runs the tool decision tree
+    # (`less than 2 candidates` -> "prose" is never reached because there
+    # is only ONE candidate, `is_consensus` needs two), and the panel takes
+    # the pre-existing "full" path with a single degraded candidate. This
+    # is NOT a TOOL_DECIDED_PATH, so the fix must not have silenced it.
+    def h(req):
+        body = json.loads(req.content)
+        if body.get("model") == "b":
+            return httpx.Response(500, json={})
+        prompt = body["messages"][-1]["content"]
+        if "VERDICT" in prompt:
+            return httpx.Response(200, json={
+                "choices": [{"message": {"content": "VERDICT a correct ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+        return _tool_read_response(body.get("model"))
+    c = make_client(tmp_path, monkeypatch, h=h)
+    r = c.post("/v1/chat/completions", json=BODY, headers=H())
+    assert r.status_code == 200
+    body = r.json()
+    assert body["fusion"]["path"] not in ("tool_fast", "tool_reviewed", "tool_plurality")
+    assert body["fusion"]["degraded"] is True
+    assert body["fusion"]["answered_by"] == "candidate"
+    rid = r.headers["x-fusion-trace-id"]
+    kinds = _event_kinds(tmp_path, rid)
+    assert "fusion.degraded" in kinds

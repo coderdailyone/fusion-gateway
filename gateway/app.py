@@ -19,7 +19,8 @@ from gateway.config import load_config
 from gateway.db import Store, connect
 from gateway.events import EventLog
 from gateway.fusion import (
-    best_candidate, call_model, fuser_body, gather_panel, openai_response,
+    TOOL_DECIDED_PATHS, best_candidate, call_model, fuser_body, gather_panel,
+    openai_response,
 )
 from gateway.ledger import BudgetTripped, Ledger, estimate_tokens
 from gateway.policy import UnknownModel, plan_route
@@ -246,8 +247,19 @@ def create_app(
                 chain_plan = plan_route(cfg, fcfg.panel[0])
                 return await _run_chain_once(request_id, body, chain_plan.chain)
             _finish_request(store, request_id, "succeeded", clock)
+            # Fix round 1, finding 4: `source != "fuser"` used to be treated
+            # as degraded unconditionally -- correct for the prose path
+            # (where skipping the fuser only ever means a fallback), but
+            # wrong for the tool decision tree's three deliberate paths,
+            # which return a 1-candidate panel and skip the fuser ON
+            # PURPOSE (that's the whole latency/cost saving this milestone
+            # exists for). `panel.path in TOOL_DECIDED_PATHS` is what tells
+            # "decided structurally" apart from "lost candidates and fell
+            # back" -- only the latter is degraded on account of its source.
+            degraded = panel.degraded or (
+                source != "fuser" and panel.path not in TOOL_DECIDED_PATHS)
             meta = {"path": panel.path, "panel": sorted(panel.candidates),
-                    "fuser": fcfg.fuser, "degraded": panel.degraded or source != "fuser",
+                    "fuser": fcfg.fuser, "degraded": degraded,
                     "answered_by": source}
             events.append(request_id, "fusion.fused",
                           {"fuser": fcfg.fuser, "path": panel.path, "source": source})
@@ -441,8 +453,17 @@ def create_app(
                 events.append(request_id, "fusion.degraded",
                               {"rung": "no_candidates"})
                 return None, "none"
-            events.append(request_id, "fusion.degraded",
-                          {"rung": "single_candidate", "model": fallback[0]})
+            # Fix round 1, finding 4: `tool_fast`/`tool_reviewed`/
+            # `tool_plurality` ALWAYS return exactly one candidate -- that
+            # is how they buy the "no fuser" saving, not a sign anything was
+            # lost. Emitting `fusion.degraded` here on those paths would
+            # make every successful, healthy tool fast path indistinguishable
+            # in production metrics from a REAL single-candidate fallback
+            # (e.g. one quorum member down). Only emit it when `panel.path`
+            # is NOT one of the three deliberate tool verdicts.
+            if panel.path not in TOOL_DECIDED_PATHS:
+                events.append(request_id, "fusion.degraded",
+                              {"rung": "single_candidate", "model": fallback[0]})
             return fallback[1], "candidate"
 
         try:

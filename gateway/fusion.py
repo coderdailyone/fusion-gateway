@@ -90,6 +90,15 @@ class PanelResult:
     degraded: bool
 
 
+# The three paths where gather_panel deliberately returns a single-candidate
+# panel because it structurally DECIDED, not because it lost candidates.
+# app.py's _finish_fusion uses this to skip the fuser without misreporting a
+# healthy fast path as a degradation (Task 5 fix round 1, finding 4): every
+# one of these paths trips `len(panel.candidates) < 2`, which is otherwise
+# the signal for "we lost candidates and are falling back."
+TOOL_DECIDED_PATHS = frozenset({"tool_fast", "tool_reviewed", "tool_plurality"})
+
+
 def _extract_text(resp) -> str:
     """Pull the assistant text out of an upstream response, defensively.
 
@@ -194,6 +203,27 @@ async def call_model(*, model_name, body, cfg, adapters, ledger, events, clock,
     if kind in ("candidate", "fuser"):
         return _extract_message(resp)
     return _extract_text(resp)
+
+
+def _merge_reviews(base: dict[str, dict[str, Verdict]],
+                   extra: dict[str, dict[str, Verdict]]
+                   ) -> dict[str, dict[str, Verdict]]:
+    """Merge a newer review round (`extra`) into an older one (`base`).
+
+    A reviewer present in `extra` supersedes its own verdicts from `base`
+    (it re-judged with more, or different, evidence); a reviewer ABSENT
+    from `extra` keeps its `base` verdicts rather than losing them. This is
+    the exact merge rule the prose path's own "round 2" fix already
+    established (a bare `reviews = round2` used to discard already-paid
+    round-1 verdicts whenever round 2 failed wholly or partly) -- extracted
+    here so the tool decision tree's own fall-through into the full path
+    (Task 5 fix round 1, finding 1) can reuse it instead of a second,
+    subtly different inline copy.
+    """
+    merged = {r: dict(v) for r, v in base.items()}
+    for reviewer, verdicts in extra.items():
+        merged.setdefault(reviewer, {}).update(verdicts)
+    return merged
 
 
 def is_consensus(candidates: dict[str, Candidate],
@@ -351,10 +381,21 @@ def decide_tools(candidates: dict[str, Candidate], readonly: frozenset[str]):
     Pure and read-only: never touches the ledger or events. `winner` is the
     alphabetically-first model among the (structurally identical) agreeing
     set -- deterministic, so it does not depend on dict iteration order.
+
+    "prose" means no candidate proposed a call AT ALL -- `tool_calls ==
+    ()`. A candidate that proposed a call with unparseable arguments is
+    NOT prose (`tool_calls` is non-empty; `canonical_calls` just can't
+    canonicalise it) -- `tool_vote`'s own docstring is explicit that an
+    unparseable call is unusable, not absent, so it must fall through to
+    "disagree" like any other non-comparable pair. Using `by_model`'s
+    None-ness for this (as an earlier version of this function did) would
+    conflate the two: an all-unparseable panel would read as "prose" and
+    skip the tool decision tree entirely instead of correctly disagreeing.
     """
-    by_model = {m: canonical_calls(c.tool_calls) for m, c in candidates.items()}
-    if all(v is None for v in by_model.values()):
+    has_any_call = any(getattr(c, "tool_calls", ()) for c in candidates.values())
+    if not has_any_call:
         return "prose", None
+    by_model = {m: canonical_calls(c.tool_calls) for m, c in candidates.items()}
     if len(candidates) < 2:
         return "disagree", None
     values = list(by_model.values())
@@ -451,20 +492,34 @@ async def gather_panel(*, fcfg, cfg, adapters, ledger, events, clock,
                 pass
 
     async def cancel(names):
-        """Cancel and await a SPECIFIC subset of panel tasks -- the tool fast
-        path's "the winner is decided, the slow leg is no longer needed"
-        signal, as opposed to `cancel_remaining`'s unconditional end-of-
-        function sweep. Deliberately reuses the exact same pattern (task.
-        cancel(), then await, re-raising only a CancelledError that ISN'T
-        this cleanup's own doing) rather than settling the ledger by hand:
-        `call_model`'s CancelledError handler is what already settles a
-        cancelled leg at its preflight estimate instead of leaving the row
-        in 'preflight' or `fail`ing it, and that must stay the ONLY place
-        that happens. A task already done here (e.g. it raced to completion
-        before the cancel arrived) is left alone -- `task.cancel()` on a
-        finished task is a documented no-op, and `cancel_remaining` in the
-        `finally` below will not touch it either since `task.done()` is
-        already true.
+        """Cancel and await a SPECIFIC subset of panel tasks.
+
+        Every current call site returns immediately afterward with no other
+        `await` in between, which makes this PROVABLY REDUNDANT with
+        `cancel_remaining`'s unconditional `finally`-block cleanup below --
+        confirmed in Task 5's fix round 1 review by deleting these calls
+        entirely (both call sites, and even turning the whole helper into a
+        no-op): the full 469-test suite stayed green, and a direct
+        ledger/timing check showed identical settlement ("estimated" vs
+        "reported") with and without them across several slow-leg delays.
+        `cancel_remaining` fires at the exact same point in the coroutine's
+        execution either way, because nothing here does real async work
+        between the decision and the `return`.
+
+        Kept anyway, deliberately, for two reasons: it documents AT THE
+        DECISION POINT that the slow leg is no longer needed, which a
+        reader would otherwise only discover by tracing all the way to the
+        bottom of `gather_panel`; and it is a hedge against a future change
+        to either call site that inserts real work between the decision and
+        its `return` -- which WOULD reopen a real gap this doesn't
+        currently have. Reuses the exact same pattern `cancel_remaining`
+        does (task.cancel(), then await, re-raising only a CancelledError
+        that ISN'T this cleanup's own doing) rather than settling the
+        ledger by hand, so if it ever does start mattering again, it stays
+        correct for the same reason `cancel_remaining` is: `call_model`'s
+        CancelledError handler is the ONLY place that settles a cancelled
+        leg, at its preflight estimate, rather than leaving the row in
+        'preflight' or `fail`ing it.
         """
         for m in names:
             if not tasks[m].done():
@@ -480,10 +535,25 @@ async def gather_panel(*, fcfg, cfg, adapters, ledger, events, clock,
 
     try:
         candidates = await collect(fcfg.quorum)
+        reviews: dict[str, dict[str, Verdict]] = {}
+        # Set once the tool decision tree below has already awaited the
+        # slow leg, so the pre-existing full-path code at the bottom of
+        # this function does not do it AGAIN (fix round 1, finding 3): the
+        # tasks are already done by then, so a second `collect(slow)` just
+        # re-awaits them and `new_from_slow` comes back non-empty, which
+        # used to trigger a full, byte-identical SECOND review round over
+        # the same three candidates -- doubling both the bill and, on a
+        # hanging slow leg, the latency budget.
+        slow_collected = False
 
         verdict, winner = decide_tools(candidates, fcfg.readonly_tools)
-        events.append(request_id, "fusion.tool_verdict",
-                      {"verdict": verdict, "winner": winner})
+        if verdict != "prose":
+            # Gated: this fires on every request once tool support ships,
+            # including the (common) prose ones, where the verdict never
+            # influences anything downstream -- no reason to double the
+            # event volume for a verdict nobody will ever read back.
+            events.append(request_id, "fusion.tool_verdict",
+                          {"verdict": verdict, "winner": winner})
 
         if verdict == "agree_readonly":
             # Structural agreement is an exact agreement signal, unlike mutual
@@ -509,23 +579,79 @@ async def gather_panel(*, fcfg, cfg, adapters, ledger, events, clock,
                 return PanelResult(conversation, {winner: candidates[winner]},
                                    reviews, "tool_reviewed",
                                    degraded=len(candidates) < len(fcfg.quorum))
-            verdict = "disagree"
+            # Spec correction, fix round 1 finding 1 (CRITICAL): an
+            # objection, or a wholly-failed review stage (`reviews == {}`,
+            # caught by the `reviews and` guard above), on a write-class
+            # agreement must not silently re-serve the rejected call. `a`
+            # and `b` (the quorum) already match by construction of
+            # reaching `agree_review` at all, so `plurality`, run against
+            # {a, b, <slow>}, ALWAYS finds {a, b} as its first >=2 group --
+            # regardless of what the slow leg proposes -- and the original
+            # bug emitted that pair directly with reviews={} and no fuser:
+            # not a cancelled copy, a RELABELLED one, silently re-serving
+            # the exact call a reviewer just rejected (or serving it on no
+            # evidence at all, if review failed outright).
+            #
+            # This routes to its own verdict, `disagree_no_plurality`,
+            # rather than falling into the `disagree` branch below and
+            # relying solely on that branch's own `all_readonly` gate
+            # (finding 2) to block emission -- even though, checked directly
+            # (see task-5-report.md, Fix round 1): given that `agree_review`
+            # is ONLY ever reached for a write-class call in the first
+            # place (agree_readonly already siphons off every read-only
+            # agreement), `disagree`'s plurality winner in THIS scenario is
+            # PROVABLY always that same write-class {a, b} call, which
+            # `all_readonly` always correctly rejects anyway -- reverting
+            # this verdict assignment to plain "disagree" leaves the whole
+            # 479-test suite green. Kept as its own explicit verdict anyway,
+            # for the same reason `cancel`'s redundant-but-kept helper is
+            # (see its docstring): it documents, AT THE DECISION POINT, that
+            # this case must not be resolved by majority vote, rather than
+            # depending on a reader to trace into `disagree` and rediscover
+            # why its gate happens to always fire here. It is also a hedge
+            # against `disagree`'s gate ever changing (e.g. if `plurality`
+            # or `all_readonly`'s semantics shift) in a way that would
+            # silently reopen this exact hole.
+            verdict = "disagree_no_plurality"
 
         if verdict == "disagree":
             candidates.update(await collect(slow))
+            slow_collected = True
             plur = plurality({m: canonical_calls(c.tool_calls)
                               for m, c in candidates.items()})
             if plur is not None:
-                return PanelResult(conversation, {plur: candidates[plur]}, {},
-                                   "tool_plurality",
-                                   degraded=len(candidates) < len(fcfg.panel))
-            # Three-way split: fall through to the existing full path, which
-            # cross-reviews everything and lets the fuser decide.
+                winner_canon = canonical_calls(candidates[plur].tool_calls)
+                # Spec correction, fix round 1 finding 2: the all_readonly
+                # gate applies to ANY call about to be emitted without a
+                # review, not only a quorum agreement -- a read-only
+                # plurality is exact for the same reason agree_readonly is
+                # (structural agreement, no judgement involved), but a
+                # write-class plurality carries no more of a correctness
+                # check than a write-class STRUCTURAL agreement does, which
+                # is the milestone's own stated reason agree_review keeps
+                # the review in the first place.
+                if all_readonly(winner_canon, fcfg.readonly_tools):
+                    return PanelResult(conversation, {plur: candidates[plur]},
+                                       {}, "tool_plurality",
+                                       degraded=len(candidates) < len(fcfg.panel))
+                # Write-class plurality: do not emit. Fall through to the
+                # full path below, which cross-reviews everyone (including
+                # the slow leg, already collected) and lets the fuser
+                # decide instead.
+            # Three-way split, or a write-class plurality that must not be
+            # emitted directly: fall through to the full path.
 
-        reviews = await _cross_review(
+        if verdict == "disagree_no_plurality":
+            candidates.update(await collect(slow))
+            slow_collected = True
+            # Deliberately does NOT attempt `plurality` -- see the comment
+            # in the `agree_review` branch above for why that would just
+            # re-elect the rejected call.
+
+        reviews = _merge_reviews(reviews, await _cross_review(
             candidates=candidates, fcfg=fcfg, cfg=cfg, adapters=adapters,
             ledger=ledger, events=events, clock=clock, request_id=request_id,
-            conversation=conversation)
+            conversation=conversation))
         agreed = is_consensus(candidates, reviews)
         events.append(request_id, "fusion.consensus",
                       {"agreed": agreed, "candidates": sorted(candidates)})
@@ -534,8 +660,16 @@ async def gather_panel(*, fcfg, cfg, adapters, ledger, events, clock,
             return PanelResult(conversation, candidates, reviews, "quorum",
                                degraded=len(candidates) < len(fcfg.quorum))
 
-        new_from_slow = await collect(slow)
-        candidates.update(new_from_slow)
+        if slow_collected:
+            # Fix round 1, finding 3: already awaited (and already reviewed,
+            # just above) by the tool decision tree -- collecting it again
+            # here would just re-await already-done tasks and (since they
+            # come back non-empty) trigger the SECOND, byte-identical review
+            # round this exact guard exists to prevent.
+            new_from_slow = {}
+        else:
+            new_from_slow = await collect(slow)
+            candidates.update(new_from_slow)
         # Fix (finding 3): only re-review when the slow leg actually added a
         # candidate. Without this gate, a slow leg that failed or timed out
         # (kimi-k3 is 403ing in production right now) still triggered a
@@ -548,18 +682,8 @@ async def gather_panel(*, fcfg, cfg, adapters, ledger, events, clock,
                 ledger=ledger, events=events, clock=clock,
                 request_id=request_id, conversation=conversation)
             # Fix (finding 4): merge round 2 into round 1 instead of
-            # replacing it. A bare `reviews = round2` discarded already-paid
-            # round-1 verdicts whenever round 2 failed wholly or partly (a
-            # reviewer timing out or erroring on the second call), leaving
-            # the fuser prompt saying "(no reviews available)" even though
-            # round 1 succeeded. A reviewer present in round 2 supersedes its
-            # own round-1 verdicts (it re-judged with the full candidate set,
-            # which is strictly more evidence); a reviewer ABSENT from round
-            # 2 keeps its round-1 verdicts rather than losing them.
-            merged = {r: dict(v) for r, v in reviews.items()}
-            for reviewer, verdicts in round2.items():
-                merged.setdefault(reviewer, {}).update(verdicts)
-            reviews = merged
+            # replacing it -- see `_merge_reviews`'s docstring.
+            reviews = _merge_reviews(reviews, round2)
         return PanelResult(conversation, candidates, reviews, "full",
                            degraded=len(candidates) < len(fcfg.panel))
     finally:
