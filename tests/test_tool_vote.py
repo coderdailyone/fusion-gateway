@@ -1,0 +1,100 @@
+import pytest
+from gateway.tool_vote import canonical_calls, plurality, all_readonly
+
+READONLY = frozenset({"read", "ls", "grep", "find"})
+
+
+def call(name, args):
+    return {"id": "x", "type": "function",
+            "function": {"name": name, "arguments": args}}
+
+
+def test_key_order_and_whitespace_do_not_matter():
+    a = canonical_calls([call("read", '{"path":"a.py","limit":10}')])
+    b = canonical_calls([call("read", '{ "limit": 10 , "path" : "a.py" }')])
+    assert a == b is not None
+
+
+def test_comparison_is_exact_not_semantic():
+    # "a.py" and "./a.py" name the same file to a human. Treating them as
+    # equal would need an LLM, which is the cost this module exists to avoid.
+    a = canonical_calls([call("read", '{"path":"a.py"}')])
+    b = canonical_calls([call("read", '{"path":"./a.py"}')])
+    assert a != b
+
+
+def test_a_different_tool_name_never_matches():
+    assert canonical_calls([call("read", "{}")]) != canonical_calls([call("write", "{}")])
+
+
+def test_unparseable_arguments_are_unusable():
+    # Unusable must be None, not some sentinel that could match another
+    # unusable call -- two models failing differently is not agreement.
+    assert canonical_calls([call("read", "{not json")]) is None
+    assert canonical_calls([call("read", None)]) is None
+    assert plurality({"a": None, "b": None, "c": None}) is None
+
+
+def test_an_empty_call_list_is_unusable():
+    # THE load-bearing case: a text-only candidate has tool_calls == [].
+    # If that canonicalised to (), two prose candidates would "agree" and
+    # prose would be routed through the tool path.
+    assert canonical_calls([]) is None
+    assert canonical_calls(None) is None
+    assert plurality({"a": canonical_calls([]), "b": canonical_calls([])}) is None
+
+
+def test_malformed_shapes_never_raise():
+    for bad in ("notalist", [None], [{}], [{"function": None}],
+                [{"function": {"name": 5, "arguments": "{}"}}],
+                [{"function": {"arguments": "{}"}}]):
+        assert canonical_calls(bad) is None
+
+
+def test_parallel_calls_ignore_order_but_not_duplication():
+    one = canonical_calls([call("read", '{"path":"a"}'), call("read", '{"path":"b"}')])
+    two = canonical_calls([call("read", '{"path":"b"}'), call("read", '{"path":"a"}')])
+    assert one == two is not None
+    dup = canonical_calls([call("read", '{"path":"a"}'), call("read", '{"path":"a"}')])
+    single = canonical_calls([call("read", '{"path":"a"}')])
+    assert dup != single
+
+
+def test_plurality_returns_a_two_of_three_winner():
+    same = canonical_calls([call("read", '{"path":"a"}')])
+    other = canonical_calls([call("write", '{"path":"a"}')])
+    winner = plurality({"m1": same, "m2": other, "m3": same})
+    assert winner in ("m1", "m3")
+
+
+def test_plurality_is_none_on_a_three_way_split():
+    got = plurality({"m1": canonical_calls([call("read", '{"path":"a"}')]),
+                     "m2": canonical_calls([call("read", '{"path":"b"}')]),
+                     "m3": canonical_calls([call("read", '{"path":"c"}')])})
+    assert got is None
+
+
+def test_plurality_is_deterministic():
+    # Two models tie; the winner must not depend on dict iteration order.
+    same = canonical_calls([call("read", '{"path":"a"}')])
+    first = plurality({"b": same, "a": same})
+    second = plurality({"a": same, "b": same})
+    assert first == second
+
+
+def test_all_readonly_is_exact_and_default_deny():
+    assert all_readonly(canonical_calls([call("read", "{}")]), READONLY)
+    assert not all_readonly(canonical_calls([call("write", "{}")]), READONLY)
+    # An unlisted tool -- a new Pi tool, or another client's -- is write-class.
+    assert not all_readonly(canonical_calls([call("brand_new_tool", "{}")]), READONLY)
+    # No prefix matching: "read" being listed must not admit "readwrite".
+    assert not all_readonly(canonical_calls([call("readwrite", "{}")]), READONLY)
+    # Case-sensitive.
+    assert not all_readonly(canonical_calls([call("Read", "{}")]), READONLY)
+    # A mixed batch is write-class: one unsafe call taints the whole step.
+    mixed = canonical_calls([call("read", "{}"), call("write", "{}")])
+    assert not all_readonly(mixed, READONLY)
+
+
+def test_all_readonly_rejects_an_unusable_batch():
+    assert not all_readonly(None, READONLY)
