@@ -1,4 +1,3 @@
-import pytest
 from gateway.tool_vote import canonical_calls, plurality, all_readonly
 
 READONLY = frozenset({"read", "ls", "grep", "find"})
@@ -47,7 +46,14 @@ def test_an_empty_call_list_is_unusable():
 def test_malformed_shapes_never_raise():
     for bad in ("notalist", [None], [{}], [{"function": None}],
                 [{"function": {"name": 5, "arguments": "{}"}}],
-                [{"function": {"arguments": "{}"}}]):
+                [{"function": {"arguments": "{}"}}],
+                # Non-string arguments must not raise
+                [call("read", 42)],
+                [call("read", {"a": 1})],
+                [call("read", [1, 2])],
+                [call("read", True)],
+                # Empty string tool name must be rejected
+                [call("", "{}")]):
         assert canonical_calls(bad) is None
 
 
@@ -81,6 +87,17 @@ def test_plurality_is_deterministic():
     second = plurality({"a": same, "b": same})
     assert first == second
 
+    # Hard case: 4 models with two pairs each holding 2 votes (a tie).
+    # Deterministic: models are sorted, first tie group wins.
+    call_a = canonical_calls([call("read", '{"x":"1"}')])
+    call_b = canonical_calls([call("read", '{"x":"2"}')])
+    # m1, m2 vote call_a; m3, m4 vote call_b. Across different insertion orders,
+    # the same pair should win (m1 and m2 are alphabetically first).
+    panel1 = plurality({"m4": call_b, "m3": call_b, "m2": call_a, "m1": call_a})
+    panel2 = plurality({"m1": call_a, "m2": call_a, "m3": call_b, "m4": call_b})
+    panel3 = plurality({"m3": call_b, "m1": call_a, "m4": call_b, "m2": call_a})
+    assert panel1 == panel2 == panel3 == "m1"
+
 
 def test_all_readonly_is_exact_and_default_deny():
     assert all_readonly(canonical_calls([call("read", "{}")]), READONLY)
@@ -98,3 +115,12 @@ def test_all_readonly_is_exact_and_default_deny():
 
 def test_all_readonly_rejects_an_unusable_batch():
     assert not all_readonly(None, READONLY)
+
+
+def test_missing_arguments_key_defaults_to_empty_json():
+    # When "arguments" key is entirely absent, it defaults to "{}".
+    call_no_args = {"id": "x", "type": "function",
+                    "function": {"name": "read"}}
+    result = canonical_calls([call_no_args])
+    assert result == (("read", "{}"),)
+    assert result is not None
