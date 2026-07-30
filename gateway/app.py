@@ -116,6 +116,32 @@ def _as_chunks(text: str, model: str) -> list[bytes]:
             b"data: [DONE]\n\n"]
 
 
+def _as_tool_chunks(candidate, model: str) -> list[bytes]:
+    """Render a candidate's tool calls as a minimal OpenAI chunk stream.
+
+    Candidates are non-streaming calls, so the complete call is already in hand
+    and `arguments` needs no fragmenting -- one chunk carries the whole array.
+    `finish_reason: "tool_calls"` is what makes a client execute it.
+    """
+    base = {"id": f"chatcmpl-{uuid.uuid4().hex}", "object": "chat.completion.chunk",
+            "created": int(time.time()), "model": model}
+    calls = [{"index": i, "id": c.get("id") or f"call_{i}", "type": "function",
+              "function": {"name": c.get("function", {}).get("name", ""),
+                           "arguments": c.get("function", {}).get("arguments", "")}}
+             for i, c in enumerate(candidate.tool_calls)]
+    out = [dict(base, choices=[{"index": 0, "delta": {"role": "assistant"},
+                                "finish_reason": None}])]
+    if candidate.text:
+        out.append(dict(base, choices=[{"index": 0,
+                                        "delta": {"content": candidate.text},
+                                        "finish_reason": None}]))
+    out.append(dict(base, choices=[{"index": 0, "delta": {"tool_calls": calls},
+                                    "finish_reason": None}]))
+    out.append(dict(base, choices=[{"index": 0, "delta": {},
+                                    "finish_reason": "tool_calls"}]))
+    return [f"data: {json.dumps(o)}\n\n".encode() for o in out] + [b"data: [DONE]\n\n"]
+
+
 def create_app_from_env() -> FastAPI:
     """uvicorn --factory entrypoint: gateway.app:create_app_from_env.
 
@@ -287,6 +313,26 @@ def create_app(
                 return
             yield b": fusion fusing\n\n"
 
+            # The tool decision tree already decided structurally -- the
+            # panel is a single candidate and calling the fuser would just
+            # spend a call (now with `tools` forwarded to it) to reach the
+            # exact same answer. Without this, the streaming generator would
+            # be the only path paying for a fuser call on a TOOL_DECIDED_PATH
+            # panel: `_finish_fusion`'s own `len(panel.candidates) < 2` guard
+            # already skips it on the non-streaming side, but that guard
+            # lives in a function this generator never calls.
+            decided = panel.path in TOOL_DECIDED_PATHS
+            if decided:
+                model_name, cand = next(iter(panel.candidates.items()))
+                events.append(request_id, "fusion.fused",
+                              {"path": panel.path, "source": "candidate",
+                               "model": model_name})
+                _finish_request(store, request_id, "succeeded", clock)
+                for piece in (_as_tool_chunks(cand, fcfg.model) if cand.tool_calls
+                              else _as_chunks(cand.text, fcfg.model)):
+                    yield piece
+                return
+
             fbody = dict(fuser_body(fcfg, panel, body), stream=True)
             model_cfg = cfg.models[fcfg.fuser]
             adapter = adapters[model_cfg.provider]
@@ -323,24 +369,26 @@ def create_app(
                               {"model": fcfg.fuser, "stage": "fuser",
                                "kind": kind})
                 fallback = best_candidate(fcfg, panel)
-                # A tool-calls-only Candidate has empty .text and, until
-                # Task 6 builds a real tool-call chunk synthesiser, no usable
-                # _as_chunks() representation either. Treat it as no usable
-                # fallback rather than serving it: _as_chunks("", ...) would
-                # be a silent HTTP 200 with an empty content delta, worse
-                # than the 502 this milestone exists to fix -- the panel is
-                # fully billed and the client is told it succeeded (M9 Task
-                # 3 review, finding 1).
-                if fallback is None or not fallback[1].text:
+                # `Candidate.__bool__` is true for text OR tool calls, so a
+                # tool-calls-only Candidate (empty .text) still counts as a
+                # usable fallback -- Task 6's `_as_tool_chunks` gives it a
+                # real chunk-stream representation. `fallback is None or not
+                # fallback[1]` is "no usable fallback at all"; before Task 6
+                # this used `not fallback[1].text`, which also rejected a
+                # perfectly usable tool-calls-only candidate and 502'd a
+                # request the gateway could have answered (M9 Task 3 review,
+                # finding 1, now fixed rather than merely fenced off).
+                if fallback is None or not fallback[1]:
                     _finish_request(store, request_id, "failed", clock)
                     yield b'\n\ndata: {"error": {"type": "upstream_exhausted"}}\n\n'
                     return
                 events.append(request_id, "fusion.degraded",
                               {"rung": "fuser_failed", "model": fallback[0]})
                 _finish_request(store, request_id, "succeeded", clock)
-                # fallback[1] is a Candidate now; .text for now -- the
-                # tool-call stream is Task 6.
-                for piece in _as_chunks(fallback[1].text, fcfg.model):
+                pieces = (_as_tool_chunks(fallback[1], fcfg.model)
+                          if fallback[1].tool_calls
+                          else _as_chunks(fallback[1].text, fcfg.model))
+                for piece in pieces:
                     yield piece
 
             try:
@@ -591,33 +639,15 @@ def create_app(
         resolved = (cfg.default_model
                     if requested_model in ("", "auto") else requested_model)
         if fcfg is not None and resolved == fcfg.model:
-            # Re-review residual 1: `functions`/`function_call` is the
-            # deprecated OpenAI shape `tools`/`tool_choice` replaced, but
-            # real clients still send it. It carries the exact same
-            # semantics-loss `tools`/`tool_choice` does (a fuser writing
-            # prose over what should be a function call), so it gets the
-            # same over-conservative-in-the-safe-direction treatment.
-            wants_tools = (bool(body.get("tools")) or body.get("tool_choice") is not None
-                          or bool(body.get("functions")) or body.get("function_call") is not None)
-            if not wants_tools:
-                return await _fusion_request(
-                    request_id=request_id, body=body, streaming=streaming,
-                    fcfg=fcfg,
-                )
-            # Final review, finding 1a (CRITICAL): fusing a tool call is not
-            # meaningful -- the fuser writes prose, and there is no sound way
-            # to merge divergent tool invocations. The standard OpenAI
-            # function-call shape (`message.content: null`, `tool_calls:
-            # [...]`) makes `_extract_text` return "" for every candidate, so
-            # the panel ended up with zero usable candidates, was billed in
-            # full, and then handed back a 502 -- while naming the same
-            # model explicitly worked fine (see the corrected "Conversation
-            # rendering" section of the M8 spec). Route to the single-model
-            # chain instead, starting from the panel's preferred member, the
-            # same as if the client had named it explicitly.
-            events.append(request_id, "fusion.bypassed",
-                          {"reason": "tools", "model": fcfg.panel[0]})
-            requested_model = fcfg.panel[0]
+            # Tool calls used to be routed away from the panel because
+            # `_extract_text` dropped them and a fully-billed panel then
+            # returned 502 (M8 final review, finding 1a). `Candidate` +
+            # `gateway/tool_vote.py` fixed the root cause, so tool calls now
+            # go through the panel like anything else.
+            return await _fusion_request(
+                request_id=request_id, body=body, streaming=streaming,
+                fcfg=fcfg,
+            )
 
         try:
             plan = plan_route(cfg, requested_model)

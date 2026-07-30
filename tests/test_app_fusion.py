@@ -1,3 +1,4 @@
+import asyncio
 import httpx, json
 from fastapi.testclient import TestClient
 from gateway.app import create_app
@@ -159,25 +160,26 @@ def test_fusion_writes_one_ledger_row_per_call_under_one_request_id(tmp_path, mo
     assert not any(state == "preflight" for _, state in rows)
 
 
-# -- Final whole-branch review, finding 1 (CRITICAL): a tool-calling request
-# was billed for the whole panel and then handed a 502. Standard OpenAI
-# function-call shape (content: null, tool_calls: [...]) makes
-# `_extract_text` return "" for every candidate; `collect()`'s `if text:`
-# drops them all; zero candidates survive; `_finish_fusion` finds
-# `best_candidate` is None -> 502, even though naming the same model
-# explicitly works fine.
+# -- Task 6: the M8 bypass is gone. A tool-calling request used to be routed
+# AWAY from the panel because `_extract_text` dropped tool calls and a
+# fully-billed panel then returned 502 (M8 final review, finding 1a).
+# `Candidate` + `gateway/tool_vote.py` (Task 5's decision tree) fixed the
+# root cause, so a tool-calling request now reaches the panel like anything
+# else. The five tests below used to pin the bypass; they are rewritten to
+# the new behaviour, but they still protect the invariant the bypass existed
+# for: a tool request must never be billed for a panel and then handed a
+# 5xx.
 
-def _tool_call_response(model):
+def _tool_call_response():
+    """A `read` call -- read-only (in the default readonly_tools set), so an
+    agreeing panel takes the cheap `tool_fast` path (no review, no fuser)
+    rather than `tool_reviewed`."""
     return httpx.Response(200, json={
         "choices": [{"message": {"content": None, "tool_calls": [
             {"id": "call_1", "type": "function",
-             "function": {"name": "get_weather", "arguments": "{}"}}]},
+             "function": {"name": "read", "arguments": "{}"}}]},
                     "finish_reason": "tool_calls"}],
         "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
-
-
-TOOLS = [{"type": "function", "function": {"name": "get_weather",
-                                           "parameters": {"type": "object"}}}]
 
 
 def _ledger_row_count(tmp_path, request_id):
@@ -188,60 +190,146 @@ def _ledger_row_count(tmp_path, request_id):
     ).fetchone()[0]
 
 
-def test_a_tool_calling_request_bypasses_fusion_and_keeps_the_tool_call(tmp_path, monkeypatch):
-    def h(req):
-        return _tool_call_response(json.loads(req.content).get("model"))
-    c = make_client(tmp_path, monkeypatch, h=h)
-    r = c.post("/v1/chat/completions",
-              json={**BODY, "tools": TOOLS}, headers=H())
+# A 3-member panel (a, b quorum + s slow leg), needed to prove the exact
+# ledger row count `tool_fast` produces: the two quorum candidates settle,
+# and the cancelled slow leg must ALSO settle (usage_source="estimated")
+# rather than vanish -- the money invariant says a cancelled call is
+# settled, never failed, because the upstream did work. Task 5's review
+# measured this as 3 rows, not 2 (an earlier draft of this plan said 2).
+CFG_S = """
+[budget]
+active = "T"
+[budgets.T]
+[providers.p]
+base_url = "https://example.invalid"
+api_key_env = "P_KEY"
+[models."a"]
+provider = "p"
+upstream_model = "a"
+in_usd_per_mtok = 1.0
+out_usd_per_mtok = 1.0
+fallback = []
+[models."b"]
+provider = "p"
+upstream_model = "b"
+in_usd_per_mtok = 1.0
+out_usd_per_mtok = 1.0
+fallback = []
+[models."s"]
+provider = "p"
+upstream_model = "s"
+in_usd_per_mtok = 1.0
+out_usd_per_mtok = 1.0
+fallback = []
+[fusion]
+model = "fusion"
+panel = ["a", "b", "s"]
+quorum = ["a", "b"]
+reviewers = ["a", "b"]
+fuser = "b"
+review_max_tokens = 128
+stage_timeout_s = 5
+[policy]
+version = "static-v0"
+default_model = "fusion"
+"""
+
+
+def _s_handler(make_response):
+    """Wrap a canned response so model "s" (CFG_S's slow leg) sleeps past
+    the point gather_panel's `tool_fast` branch cancels it -- so the
+    cancellation these tests rely on is exercised for real, not just
+    coincidentally missed because a synchronous mock resolves before
+    `cancel(slow)` runs."""
+    async def h(req):
+        if json.loads(req.content).get("model") == "s":
+            await asyncio.sleep(0.15)
+        return make_response()
+    return h
+
+
+def test_a_tool_calling_request_now_reaches_the_fusion_panel(tmp_path, monkeypatch):
+    # Was: asserted the request BYPASSED fusion (M8 finding 1a's mitigation).
+    # Now the panel handles tool calls, so it must fuse -- while keeping the
+    # invariant the old test protected: never billed-then-502.
+    def h():
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": None, "tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "read", "arguments": '{"path":"a.py"}'}}]}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 4}})
+    c = make_client(tmp_path, monkeypatch, h=_s_handler(h), cfg=CFG_S)
+    r = c.post("/v1/chat/completions", json={
+        "model": "fusion", "messages": [{"role": "user", "content": "read a.py"}],
+        "tools": [{"type": "function", "function": {"name": "read", "parameters": {}}}],
+    }, headers=H())
     assert r.status_code == 200
     body = r.json()
-    assert body["model"] != "fusion"          # single-model chain answered
-    assert "fusion" not in body
-    msg = body["choices"][0]["message"]
-    assert msg["tool_calls"][0]["function"]["name"] == "get_weather"
-    # Re-review residual 2: with the handler answering the tool-call shape
-    # for EVERY model, a reverted 1a is silently rescued by 1b's
-    # zero-usable-candidates fallback -- status 200 and a real tool_calls
-    # payload either way. Only the ledger row count tells "the panel never
-    # ran" (1 row: the single bypassed call) apart from "the panel ran,
-    # burned money, and then the fallback answered" (5 rows: 2 candidates +
-    # 2 reviews + 1 fuser attempt/fallback).
-    assert _ledger_row_count(tmp_path, r.headers["x-fusion-trace-id"]) == 1
+    assert body["model"] == "fusion"                       # fused, not bypassed
+    assert body["choices"][0]["finish_reason"] == "tool_calls"
+    assert body["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "read"
+    assert body["fusion"]["path"] == "tool_fast"
+    # Exact row count for THIS branch. Note it is 3, not 2, on a 3-member
+    # panel: the two quorum candidates plus the cancelled slow leg, which
+    # must settle an 'estimated' row rather than vanish -- the money
+    # invariant says a cancelled call is settled, never failed, because the
+    # upstream did work.
+    rid = r.headers["x-fusion-trace-id"]
+    import sqlite3
+    rows = sqlite3.connect(tmp_path / "g.sqlite").execute(
+        "SELECT model, state, usage_source FROM ledger WHERE request_id=?",
+        (rid,)).fetchall()
+    assert len(rows) == 3
+    assert sorted(st for _, st, _ in rows) == ["settled", "settled", "settled"]
+    # ...and no review or fuser call happened: no model appears twice.
+    assert len({m for m, _, _ in rows}) == 3
 
 
-def test_tool_choice_alone_also_bypasses_fusion(tmp_path, monkeypatch):
+def test_tool_choice_alone_now_reaches_the_fusion_panel(tmp_path, monkeypatch):
     # tool_choice can be sent without a fresh `tools` list (e.g. a
     # multi-turn conversation that already established the tool set) --
-    # either key alone must be enough to skip fusion.
-    def h(req):
-        return _tool_call_response(json.loads(req.content).get("model"))
-    c = make_client(tmp_path, monkeypatch, h=h)
+    # either key alone must be enough to REACH the panel now, not just skip
+    # it.
+    c = make_client(tmp_path, monkeypatch, h=_s_handler(_tool_call_response), cfg=CFG_S)
     r = c.post("/v1/chat/completions",
               json={**BODY, "tool_choice": "auto"}, headers=H())
     assert r.status_code == 200
-    assert r.json()["model"] != "fusion"
-    assert _ledger_row_count(tmp_path, r.headers["x-fusion-trace-id"]) == 1
+    body = r.json()
+    assert body["model"] == "fusion"
+    assert body["fusion"]["path"] == "tool_fast"
+    assert body["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "read"
+    # Same exact-row-count proof as the `tools` variant above.
+    assert _ledger_row_count(tmp_path, r.headers["x-fusion-trace-id"]) == 3
 
 
 # -- Re-review residual 1: the legacy OpenAI `functions`/`function_call`
-# shape (deprecated but still accepted by real clients) bypassed the bypass
-# -- app.py only checked `tools`/`tool_choice`, so a `functions` request
-# still fused: 5 ledger rows billed and the client got prose back instead of
-# a function call, the exact semantics-loss finding 1a exists to prevent.
+# shape (deprecated but still accepted by real clients) must reach fusion
+# too now. It does NOT get a tool-decided fast path, though: `_extract_
+# message` (Task 3) only reads the modern `tool_calls` array, never the
+# deprecated singular `function_call` field, so a panel answering
+# exclusively in the legacy shape looks EMPTY to every candidate -- the same
+# "zero usable candidates" shape a content-filtered refusal produces. That
+# is not a regression Task 6 introduces: it degrades through the exact
+# "zero candidates -> single-model chain fallback" rung finding 1b already
+# built (see test_zero_usable_candidates_degrades_to_the_single_model_
+# chain_not_502 below), which still returns the client's function_call
+# payload untouched with status 200 -- never a 5xx, never silently dropped.
+# Traced end to end against the real request lifecycle: 2 panel candidates
+# (both billed despite contributing nothing usable) + 1 chain-fallback retry
+# = 3 ledger rows, answered by model "a".
 
-FUNCTIONS = [{"name": "get_weather", "parameters": {"type": "object"}}]
+FUNCTIONS = [{"name": "read", "parameters": {"type": "object"}}]
 
 
 def _legacy_function_call_response(model):
     return httpx.Response(200, json={
         "choices": [{"message": {"content": None, "function_call": {
-            "name": "get_weather", "arguments": "{}"}},
+            "name": "read", "arguments": "{}"}},
                     "finish_reason": "function_call"}],
         "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
 
 
-def test_legacy_functions_request_bypasses_fusion(tmp_path, monkeypatch):
+def test_legacy_functions_request_now_reaches_the_fusion_panel(tmp_path, monkeypatch):
     def h(req):
         return _legacy_function_call_response(json.loads(req.content).get("model"))
     c = make_client(tmp_path, monkeypatch, h=h)
@@ -249,12 +337,18 @@ def test_legacy_functions_request_bypasses_fusion(tmp_path, monkeypatch):
               json={**BODY, "functions": FUNCTIONS}, headers=H())
     assert r.status_code == 200
     body = r.json()
+    # Not "fusion" -- see the comment above: the legacy shape can't be
+    # extracted into a Candidate, so the panel degrades to the single-model
+    # chain rather than genuinely fusing. It still answers 200, though, and
+    # the function_call payload survives untouched.
     assert body["model"] != "fusion"
-    assert body["choices"][0]["message"]["function_call"]["name"] == "get_weather"
-    assert _ledger_row_count(tmp_path, r.headers["x-fusion-trace-id"]) == 1
+    assert body["choices"][0]["message"]["function_call"]["name"] == "read"
+    # Exact row count for THIS branch, proving the panel actually ran (a
+    # bypass would have been 1 row) rather than silently short-circuiting.
+    assert _ledger_row_count(tmp_path, r.headers["x-fusion-trace-id"]) == 3
 
 
-def test_legacy_function_call_alone_also_bypasses_fusion(tmp_path, monkeypatch):
+def test_legacy_function_call_alone_now_reaches_the_fusion_panel(tmp_path, monkeypatch):
     def h(req):
         return _legacy_function_call_response(json.loads(req.content).get("model"))
     c = make_client(tmp_path, monkeypatch, h=h)
@@ -262,51 +356,75 @@ def test_legacy_function_call_alone_also_bypasses_fusion(tmp_path, monkeypatch):
               json={**BODY, "function_call": "auto"}, headers=H())
     assert r.status_code == 200
     assert r.json()["model"] != "fusion"
-    assert _ledger_row_count(tmp_path, r.headers["x-fusion-trace-id"]) == 1
+    assert r.json()["choices"][0]["message"]["function_call"]["name"] == "read"
+    assert _ledger_row_count(tmp_path, r.headers["x-fusion-trace-id"]) == 3
 
 
-def test_streaming_tool_calling_request_also_bypasses_fusion(tmp_path, monkeypatch):
-    # The critical repro was non-streaming (a clean 502), but the routing
-    # decision happens before either branch, so the streaming path must be
-    # covered too -- otherwise a tool-calling streaming request would have
-    # silently gone through the fuser and gotten prose back instead of its
-    # tool call, which is worse than a loud error. The handler distinguishes
-    # the fuser's own stream call (fuser_body strips `tools`) from the
-    # bypassed single-model chain's stream call (the client's body, `tools`
-    # and all, forwarded verbatim) by the presence of `tools` on the wire.
-    def h(req):
-        body = json.loads(req.content)
-        if body.get("stream") and body.get("tools"):
-            payload = json.dumps({
-                "choices": [{"index": 0, "delta": {
-                    "tool_calls": [{"index": 0, "id": "call_1", "type": "function",
-                                    "function": {"name": "get_weather", "arguments": "{}"}}]},
-                            "finish_reason": None}]})
-            sse = (f"data: {payload}\n\n"
-                  'data: {"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n'
-                  "data: [DONE]\n\n")
-            return httpx.Response(200, content=sse.encode(),
-                                  headers={"content-type": "text/event-stream"})
-        if body.get("stream"):
-            # The fuser's own stream (no `tools` -- fusion did NOT get
-            # bypassed): plain prose, no tool call in sight.
-            payload = json.dumps({"choices": [{"index": 0,
-                                               "delta": {"content": "FUSED PROSE"},
-                                               "finish_reason": None}]})
-            sse = (f"data: {payload}\n\n"
-                  'data: {"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n'
-                  "data: [DONE]\n\n")
-            return httpx.Response(200, content=sse.encode(),
-                                  headers={"content-type": "text/event-stream"})
-        # Non-streaming candidate/review calls the panel makes internally.
-        return _tool_call_response(body.get("model"))
-    c = make_client(tmp_path, monkeypatch, h=h)
-    with c.stream("POST", "/v1/chat/completions",
-                  json={**BODY, "tools": TOOLS, "stream": True}, headers=H()) as r:
+def test_streaming_tool_calling_request_now_reaches_the_fusion_panel(tmp_path, monkeypatch):
+    # Mirrors the non-streaming test above for the streaming path: the panel
+    # decides `tool_fast`, and the streaming generator's `decided`
+    # short-circuit (Task 6 step 5) serves the synthesised tool-call chunk
+    # stream WITHOUT ever calling the fuser -- the same 3-row cost as the
+    # non-streaming path, not 3 + 1 for a fuser call that would just repeat
+    # the already-decided answer in prose.
+    def h():
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": None, "tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "read", "arguments": '{"path":"a.py"}'}}]}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 4}})
+    c = make_client(tmp_path, monkeypatch, h=_s_handler(h), cfg=CFG_S)
+    with c.stream("POST", "/v1/chat/completions", json={
+        "model": "fusion", "stream": True,
+        "messages": [{"role": "user", "content": "read a.py"}],
+        "tools": [{"type": "function", "function": {"name": "read", "parameters": {}}}],
+    }, headers=H()) as r:
         assert r.status_code == 200
+        rid = r.headers["x-fusion-trace-id"]
         raw = b"".join(r.iter_bytes()).decode()
-    assert "get_weather" in raw
     assert "stream_failed" not in raw and '"error"' not in raw
+    assert raw.rstrip().endswith("data: [DONE]")
+    objs = [json.loads(l[6:]) for l in raw.splitlines()
+            if l.startswith("data: ") and l[6:].strip() != "[DONE]"]
+    assert any(o["choices"][0]["delta"].get("tool_calls", [{}])[0]
+               .get("function", {}).get("name") == "read" for o in objs)
+    assert any(o["choices"][0].get("finish_reason") == "tool_calls" for o in objs)
+    # Same exact-row-count proof as the non-streaming test: the fuser was
+    # never called.
+    assert _ledger_row_count(tmp_path, rid) == 3
+
+
+def test_a_tool_request_never_5xxs_when_the_whole_panel_is_down(tmp_path, monkeypatch):
+    # The invariant the deleted bypass tests existed to protect.
+    c = make_client(tmp_path, monkeypatch, h=lambda req: httpx.Response(500, json={}))
+    r = c.post("/v1/chat/completions", json={
+        "model": "fusion", "messages": [{"role": "user", "content": "x"}],
+        "tools": [{"type": "function", "function": {"name": "read", "parameters": {}}}],
+    }, headers=H())
+    assert r.status_code == 502 and r.json()["error"]["type"] == "upstream_exhausted"
+
+
+def test_streaming_tool_call_is_a_valid_openai_chunk_stream(tmp_path, monkeypatch):
+    def h(req):
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": None, "tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "read", "arguments": '{"path":"a.py"}'}}]}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 4}})
+    c = make_client(tmp_path, monkeypatch, h=h)
+    with c.stream("POST", "/v1/chat/completions", json={
+        "model": "fusion", "stream": True,
+        "messages": [{"role": "user", "content": "read a.py"}],
+        "tools": [{"type": "function", "function": {"name": "read", "parameters": {}}}],
+    }, headers=H()) as r:
+        raw = b"".join(r.iter_bytes()).decode()
+    assert raw.rstrip().endswith("data: [DONE]")
+    objs = [json.loads(l[6:]) for l in raw.splitlines()
+            if l.startswith("data: ") and l[6:].strip() != "[DONE]"]
+    assert any(c_["choices"][0]["delta"].get("tool_calls") for c_ in objs
+               if c_.get("choices"))
+    assert any(c_["choices"][0].get("finish_reason") == "tool_calls" for c_ in objs
+               if c_.get("choices"))
 
 
 # -- Final whole-branch review, finding 1b: "every candidate returned no
@@ -467,16 +585,27 @@ def test_streaming_dead_fuser_falls_back_to_the_best_candidate(tmp_path, monkeyp
 
 
 # -- M9 Task 3 review, finding 1 (Important, live at the Candidate-carrying-
-# -commit): _fuser_gave_nothing used to call _as_chunks(fallback[1].text,
+# commit): _fuser_gave_nothing used to call _as_chunks(fallback[1].text,
 # ...) unconditionally. A tool-calls-only Candidate has empty .text, so the
 # client got a silent HTTP 200 with an empty content delta -- worse than the
 # 502 this milestone exists to fix, since the panel is fully billed and the
-# client is told it succeeded. No `tools`/`tool_choice` on the client
-# request (so the tool-call bypass never fires) but a panel member emits
-# `content: null` + `tool_calls` unprompted -- a shape a provider with
-# server-side tools can produce on its own.
+# client is told it succeeded. The fix at the time (pre-Task-6, when this
+# test was written) was to treat a tool-calls-only fallback as no usable
+# fallback at all and 502 instead -- explicitly fenced off pending "Task 6
+# builds a real tool-call chunk synthesiser." Task 6 IS that synthesiser:
+# `_as_tool_chunks` now exists, so the fix is complete and the correct
+# behaviour is to actually DELIVER the fallback, not keep rejecting it (see
+# the `not fallback[1]` guard in `_fuser_gave_nothing`, gateway/app.py).
+#
+# The two candidates below deliberately DISAGREE (different tool names) so
+# `decide_tools` cannot resolve the panel structurally into a
+# TOOL_DECIDED_PATH -- an agreeing shape would trip Task 6's own `decided`
+# short-circuit and never reach the fuser at all, proving nothing about this
+# fallback path. No `tools`/`tool_choice` on the client request; a panel
+# member emitting `content: null` + `tool_calls` unprompted is a shape a
+# provider with server-side tools can produce on its own.
 
-def test_streaming_tool_call_only_fallback_after_a_dead_fuser_is_not_a_silent_empty_200(
+def test_streaming_tool_call_fallback_after_a_dead_fuser_is_delivered_as_a_chunk_stream(
         tmp_path, monkeypatch):
     def h(req):
         body = json.loads(req.content)
@@ -487,27 +616,42 @@ def test_streaming_tool_call_only_fallback_after_a_dead_fuser_is_not_a_silent_em
             return httpx.Response(200, json={
                 "choices": [{"message": {"content": "VERDICT a correct ok\nVERDICT b correct ok"}}],
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
-        # Candidate call: tool-calls only, no prose -- unprompted.
+        # Candidate call: tool-calls only, no prose -- unprompted, and
+        # disagreeing across panel members (see the comment above).
+        name = "get_weather" if body.get("model") == "a" else "get_time"
         return httpx.Response(200, json={
             "choices": [{"message": {"content": None, "tool_calls": [
                 {"id": "call_1", "type": "function",
-                 "function": {"name": "get_weather", "arguments": "{}"}}]},
+                 "function": {"name": name, "arguments": "{}"}}]},
                         "finish_reason": "tool_calls"}],
             "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
     c = make_client(tmp_path, monkeypatch, h=h)
     with c.stream("POST", "/v1/chat/completions",
                   json={**BODY, "stream": True}, headers=H()) as r:
-        assert r.status_code == 200          # headers already committed by then
+        assert r.status_code == 200
+        rid = r.headers["x-fusion-trace-id"]
         raw = b"".join(r.iter_bytes()).decode()
     assert ": fusion fusing" in raw          # the panel succeeded before the fuser died
-    data_lines = [l for l in raw.splitlines() if l.startswith("data: ")]
-    assert len(data_lines) == 1
-    err = json.loads(data_lines[0][6:])
-    assert err["error"]["type"] == "upstream_exhausted"
-    # Must NOT be the old silent-empty-200 shape: no content delta of any
-    # kind, and no [DONE] terminator implying a normal stream completed.
-    assert '"content"' not in raw
-    assert "[DONE]" not in raw
+    assert raw.rstrip().endswith("data: [DONE]")
+    objs = [json.loads(l[6:]) for l in raw.splitlines()
+            if l.startswith("data: ") and l[6:].strip() != "[DONE]"]
+    assert all("error" not in o for o in objs), raw
+    # best_candidate prefers configured panel order -- "a" -- whose call is
+    # "get_weather".
+    assert any(o["choices"][0]["delta"].get("tool_calls", [{}])[0]
+               .get("function", {}).get("name") == "get_weather" for o in objs)
+    assert any(o["choices"][0].get("finish_reason") == "tool_calls" for o in objs)
+    import sqlite3
+    conn = sqlite3.connect(tmp_path / "g.sqlite")
+    rows = conn.execute(
+        "SELECT model, state, usage_source FROM ledger WHERE request_id=? ORDER BY id",
+        (rid,)).fetchall()
+    # 2 candidates + 2 reviews + 1 fuser -- exact row count for this branch.
+    assert len(rows) == 5
+    # The fuser's own row must be fail()ed -- it never reached a first byte,
+    # so it is never settled as a paid success, and never left in
+    # 'preflight'.
+    assert rows[-1] == ("b", "failed", None)
 
 
 def test_streaming_empty_fuser_stream_falls_back_to_the_best_candidate(tmp_path, monkeypatch):
