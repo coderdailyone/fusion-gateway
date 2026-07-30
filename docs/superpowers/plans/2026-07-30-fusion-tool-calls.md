@@ -1118,12 +1118,20 @@ def test_a_tool_calling_request_now_reaches_the_fusion_panel(tmp_path, monkeypat
     assert body["choices"][0]["finish_reason"] == "tool_calls"
     assert body["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "read"
     assert body["fusion"]["path"] == "tool_fast"
-    # Two candidates, no review, no fuser -- the branch's exact row count.
+    # Exact row count for THIS branch. Note it is 3, not 2, on a 3-member
+    # panel: the two quorum candidates plus the cancelled slow leg, which must
+    # settle an 'estimated' row rather than vanish -- the money invariant says a
+    # cancelled call is settled, never failed, because the upstream did work.
+    # Task 5's review measured this; an earlier draft of this plan said 2.
     rid = r.headers["x-fusion-trace-id"]
     import sqlite3
     rows = sqlite3.connect(tmp_path / "g.sqlite").execute(
-        "SELECT model FROM ledger WHERE request_id=?", (rid,)).fetchall()
-    assert len(rows) == 2
+        "SELECT model, state, usage_source FROM ledger WHERE request_id=?",
+        (rid,)).fetchall()
+    assert len(rows) == 3
+    assert sorted(st for _, st, _ in rows) == ["settled", "settled", "settled"]
+    # ...and no review or fuser call happened: no model appears twice.
+    assert len({m for m, _, _ in rows}) == 3
 ```
 
 Apply the same rewrite to `tool_choice`-only, `functions`-only and
@@ -1241,6 +1249,13 @@ the fuser block, add:
                     yield piece
                 return
 ```
+
+**Task 5's review flagged one more gap here:** the streaming generator has no
+`len(panel.candidates) < 2` fuser skip of its own, so without the `decided`
+short-circuit above a streaming `tool_fast` request would still pay for a fuser
+call — now with `tools` forwarded to it. The `decided` block is therefore not an
+optimisation, it is what keeps the streaming path's cost equal to the
+non-streaming path's.
 
 and mirror it in the non-streaming path: when `panel.path` is one of the three
 tool verdicts, return `openai_response(cand, fcfg.model, meta)` directly without

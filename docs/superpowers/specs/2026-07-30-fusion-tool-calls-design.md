@@ -98,6 +98,31 @@ a reviewer objection cancels a copy (the prose rule is "majority agree **and** n
 review calls it wrong"), and a **missing** review is not agreement — if the
 review stage produces no verdicts for a write-class call, that escalates too.
 
+### Correction (2026-07-30): the tree above composes into a hole
+
+As first written, the tree said "a reviewer says wrong → treat as disagreement"
+and, two lines later, "2 of 3 identical → EMIT that call". Task 5's review proved
+those two rules compose into a defect: entering the objection case *requires* the
+two quorum members to agree, so the plurality vote re-elects exactly the call the
+reviewers rejected. Measured across all four slow-leg outcomes, the objected-to
+write call was served with `reviews={}`, no fuser, and one wasted billed call.
+The copy was not cancelled — it was relabelled. The same hole swallowed the
+degradation row for a wholly-failed review stage.
+
+The tree is therefore governed by one invariant, which overrides any reading of
+the steps above:
+
+> **No write-class call is ever emitted without either a clean cross-review or
+> the fuser's decision.**
+
+Two consequences. The `all_readonly` gate applies to **any** call about to be
+emitted, not only to a quorum agreement — so a read-only plurality may emit
+directly but a write-class plurality may not. And an objection, or a wholly
+failed review stage, on a write-class agreement goes to the **fuser**, carrying
+whatever reviews exist so the fuser can act on the objection; it must not be
+routed through the plurality vote, which cannot do anything but re-elect the
+rejected call.
+
 ### Why agreement skips the review at all
 
 On the prose path the mutual review *is* the agreement signal; there is nothing
