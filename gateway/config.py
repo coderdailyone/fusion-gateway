@@ -27,6 +27,7 @@ class FusionCfg:
     fuser: str                      # writes the final answer
     review_max_tokens: int
     stage_timeout_s: float
+    readonly_tools: frozenset[str] = frozenset({"read", "ls", "grep", "find"})
 
 @dataclass(frozen=True)
 class Config:
@@ -112,11 +113,31 @@ def load_config(path: Path) -> Config:
         if stage_timeout_s <= 0:
             raise ConfigError(f"fusion.stage_timeout_s must be > 0, got {stage_timeout_s}")
 
+        if "readonly_tools" in f:
+            raw_ro = f["readonly_tools"]
+            if not isinstance(raw_ro, list):
+                raise ConfigError(
+                    f"fusion.readonly_tools must be a list, got "
+                    f"{type(raw_ro).__name__}"
+                )
+            for entry in raw_ro:
+                if not isinstance(entry, str) or not entry:
+                    raise ConfigError(
+                        f"fusion.readonly_tools entries must be non-empty "
+                        f"strings, got {entry!r}"
+                    )
+            if len(set(raw_ro)) != len(raw_ro):
+                raise ConfigError("fusion.readonly_tools has duplicate entries")
+            readonly_tools = frozenset(raw_ro)
+        else:
+            readonly_tools = frozenset({"read", "ls", "grep", "find"})
+
         fusion = FusionCfg(
             model=name, panel=panel, quorum=quorum, reviewers=reviewers,
             fuser=fuser,
             review_max_tokens=review_max_tokens,
             stage_timeout_s=stage_timeout_s,
+            readonly_tools=readonly_tools,
         )
 
     pol = data["policy"]

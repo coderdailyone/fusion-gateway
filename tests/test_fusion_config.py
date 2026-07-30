@@ -201,3 +201,39 @@ def test_panel_must_not_contain_duplicates(tmp_path):
     text = BASE.replace('panel = ["a", "b", "c"]', 'panel = ["a", "b", "a"]')
     with pytest.raises(ConfigError):
         load_config(write(tmp_path, text))
+
+
+def test_readonly_tools_defaults_to_pis_read_only_set(tmp_path):
+    cfg = load_config(write(tmp_path, BASE))
+    assert cfg.fusion.readonly_tools == frozenset({"read", "ls", "grep", "find"})
+
+
+def test_readonly_tools_can_be_overridden(tmp_path):
+    text = BASE.replace("[fusion]", '[fusion]\nreadonly_tools = ["cat", "stat"]')
+    assert load_config(write(tmp_path, text)).fusion.readonly_tools == frozenset({"cat", "stat"})
+
+
+def test_readonly_tools_may_be_empty_meaning_review_everything(tmp_path):
+    # An explicit empty list is a legitimate, maximally-cautious choice:
+    # every tool call gets the cross-review.
+    text = BASE.replace("[fusion]", "[fusion]\nreadonly_tools = []")
+    assert load_config(write(tmp_path, text)).fusion.readonly_tools == frozenset()
+
+
+@pytest.mark.parametrize("value", [
+    '"read"',                    # a bare string would iterate as characters
+    '["read", "read"]',          # duplicates
+    '["read", ""]',              # empty name
+    '["read", 5]',               # non-string entry
+])
+def test_bad_readonly_tools_is_rejected(tmp_path, value):
+    text = BASE.replace("[fusion]", f"[fusion]\nreadonly_tools = {value}")
+    with pytest.raises(ConfigError):
+        load_config(write(tmp_path, text))
+
+
+def test_the_real_config_declares_readonly_tools(tmp_path):
+    cfg = load_config(REAL)
+    assert "read" in cfg.fusion.readonly_tools
+    assert "write" not in cfg.fusion.readonly_tools   # write-class by design
+    assert "bash" not in cfg.fusion.readonly_tools    # can rm -rf; must be reviewed

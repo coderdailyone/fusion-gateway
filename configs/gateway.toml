@@ -95,6 +95,12 @@ reviewers = ["deepseek-chat", "glm-5.2"]
 fuser = "glm-5.2"
 review_max_tokens = 512
 stage_timeout_s = 120
+# Tools whose calls may be emitted on structural agreement alone, with no
+# cross-review. Everything NOT listed is write-class and keeps the review even
+# when the models agree, so a new or unknown tool is reviewed rather than waved
+# through. These four are Pi's read-only tools; `bash` is deliberately absent
+# because it can `ls -la` or `rm -rf` and the name cannot tell you which.
+readonly_tools = ["read", "ls", "grep", "find"]
 
 [policy]
 version = "static-v0"
