@@ -283,3 +283,71 @@ Whether the fusion quality gain transfers from benchmarks to chat. There is no
 grader on production traffic, so this cannot be measured online. M5's +1.1 pt
 was on benchmark tasks at p = 0.176 — not significant. See the spec's "What we
 know, and what we do not".
+
+## M9 tool-call fusion live smoke 2026-07-30
+
+First real tool calls through the fusion panel. `model: "fusion"` is opt-in, so
+this changes nothing for default traffic.
+
+| request | wall clock | path | ledger rows |
+|---|---:|---|---:|
+| read-only (`read`), non-streaming | **22.9 s** | `tool_fast` | 3 |
+| write-class (`write`), non-streaming | **4.6 s** | `tool_reviewed` | 5 |
+| read-only (`read`), streaming | **3.7 s** | `tool_fast` | 3 |
+
+All three returned a genuine OpenAI tool call with `finish_reason: "tool_calls"`
+and `degraded: false`. Streaming emitted 2 SSE keepalive comments, 3 chunks, and
+`data: [DONE]`. Total outlay: **$0.000579**. **Zero rows in `preflight`.**
+
+### The design's core saving is real
+
+Row counts match the design exactly, and **no fuser was called on either path** —
+the whole point of deciding tool calls structurally:
+
+```
+read-only   deepseek-chat  settled  1020 ms   <- candidate
+            glm-5.2        settled  22685 ms  <- candidate
+            kimi-k3        failed   (403)
+            (no review, no fuser)
+
+write-class deepseek-chat  settled  1252 ms   <- candidate
+            glm-5.2        settled  2643 ms   <- candidate
+            kimi-k3        failed   (403)
+            deepseek-chat  settled  1802 ms   <- review
+            glm-5.2        settled  1117 ms   <- review
+            (no fuser)
+```
+
+The write-class path correctly ran the cross-review that the read-only path
+skipped — `write` is absent from `readonly_tools`, so it is write-class by
+default-deny.
+
+### The latency prediction did not hold, and the reason matters
+
+The design predicted ~2 s for the read-only fast path. One run took **22.9 s**
+and another **3.7 s**, for the same tool on the same panel. The ledger says why:
+`glm-5.2` took **22.7 s** on that one call versus 2.6 s on the next.
+
+The fast path is bounded by the **slowest quorum member**, and that member's
+latency variance is roughly 10×. So "~2 s" describes a good run, not the path.
+Nothing is wrong with the mechanism — two candidates, no review, no fuser, as
+designed — but a client should expect the quorum's tail, not its median.
+
+### What this smoke does NOT establish
+
+**kimi-k3 is still 403** (`access_terminated_error`), so it failed fast on every
+request instead of being cancelled. Two consequences, both recorded rather than
+glossed:
+
+1. **The plurality branch was never exercised live.** 2-of-3 arbitration needs a
+   third answering member. Untested against real models.
+2. The cancelled-slow-leg accounting (`usage_source="estimated"`) was not
+   exercised either — kimi's rows are `failed` (a 403 is a provider error, not a
+   cancellation), which is correct but is a different code path.
+
+Re-run this smoke once kimi-k3 has quota to close both gaps.
+
+Also unverified: whether panel agreement on a tool call improves anything. There
+is no grader for production traffic, and nothing in this project has ever
+measured tool-call quality — only prose on benchmarks. See the M9 spec's "What
+we know, and what we do not".
