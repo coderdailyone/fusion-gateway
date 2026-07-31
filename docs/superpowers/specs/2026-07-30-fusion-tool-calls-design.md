@@ -68,6 +68,21 @@ bypass is one upstream call. The fast path here is two. Read-only steps go from
   it carries no independent *correctness* check — two models making the same
   mistake sail through. For irreversible actions the owner chose to keep the
   check.
+
+  **Correction (2026-07-30), after the final review:** that check is **not
+  independent**, and cannot be in this topology. `agree_review` is entered only
+  when every candidate's calls are byte-identical, and the reviewers are drawn
+  from the candidates — so each reviewer is handed its own output under another
+  model's name. The no-self-review rule holds by name and is defeated by
+  content. A single surviving verdict also suffices, so one model's endorsement
+  of its own call can release a write. What the branch actually buys is
+  **self-critique** (evaluating is easier than generating, so some errors are
+  caught) rather than an independent review, and M5's 0.9157 reviewer-agreement
+  figure does not transfer — it was measured on *differing* candidates. The only
+  non-proposer in the deployed panel is kimi-k3, excluded from `reviewers` for
+  its ~34 s latency. The owner reviewed this and chose to keep the current
+  behaviour for now; this paragraph exists so the claim above is not read as
+  stronger than it is.
 - **Classification defaults to reviewing.** `readonly_tools` is a positive list
   of known-safe names; anything absent is treated as write-class. A new tool, or
   a different client's tool, is reviewed rather than silently waved through.
