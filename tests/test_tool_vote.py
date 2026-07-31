@@ -1,4 +1,6 @@
-from gateway.tool_vote import canonical_calls, plurality, all_readonly
+from gateway.tool_vote import (
+    all_declared, all_readonly, canonical_calls, declared_tool_names, plurality,
+)
 
 READONLY = frozenset({"read", "ls", "grep", "find"})
 
@@ -141,6 +143,73 @@ def test_a_custom_type_call_never_classifies_by_its_function_name():
               "function": {"name": "read", "arguments": "{}"}}
     assert canonical_calls([hostile]) is None
     assert not all_readonly(canonical_calls([hostile]), READONLY)
+
+
+def test_declared_tool_names_reads_the_current_tools_shape():
+    body = {"tools": [{"type": "function", "function": {"name": "read", "parameters": {}}},
+                      {"type": "function", "function": {"name": "bash"}}]}
+    assert declared_tool_names(body) == frozenset({"read", "bash"})
+
+
+def test_declared_tool_names_reads_the_deprecated_functions_shape():
+    body = {"functions": [{"name": "read", "parameters": {}}]}
+    assert declared_tool_names(body) == frozenset({"read"})
+
+
+def test_declared_tool_names_unions_both_shapes():
+    body = {"tools": [{"type": "function", "function": {"name": "read"}}],
+           "functions": [{"name": "bash"}]}
+    assert declared_tool_names(body) == frozenset({"read", "bash"})
+
+
+def test_declared_tool_names_is_empty_when_the_client_declared_nothing():
+    # THE load-bearing case for the exemption: a request with no tools/
+    # functions at all must not be mistaken for "declared zero tools, so
+    # every call is undeclared" -- callers treat an empty result as "nothing
+    # to check against", not "block everything".
+    assert declared_tool_names({}) == frozenset()
+    assert declared_tool_names({"messages": []}) == frozenset()
+
+
+def test_declared_tool_names_never_raises_on_hostile_shapes():
+    # `body` is client-controlled JSON reaching this with no validation --
+    # every one of these must return an empty set, never raise.
+    for body in (
+        None, "notadict", [], 5,
+        {"tools": "notalist"},
+        {"tools": [None, 5, "x"]},
+        {"tools": [{"function": None}]},
+        {"tools": [{"function": {"name": 5}}]},
+        {"tools": [{"function": {"name": ""}}]},
+        {"tools": [{}]},
+        {"functions": "notalist"},
+        {"functions": [None, 5]},
+        {"functions": [{"name": None}]},
+        {"functions": [{}]},
+    ):
+        assert declared_tool_names(body) == frozenset(), body
+
+
+def test_all_declared_is_exempt_when_the_client_declared_nothing():
+    # No tools declared at all: nothing to check against, so ANY call --
+    # even an unusable one -- is exempt. A provider with server-side tools
+    # may legitimately return a call the client never listed, and blocking
+    # that would be a regression.
+    assert all_declared(canonical_calls([call("read", "{}")]), frozenset())
+    assert all_declared(None, frozenset())
+
+
+def test_all_declared_is_exact_and_default_deny_when_something_is_declared():
+    declared = frozenset({"bash"})
+    assert not all_declared(canonical_calls([call("read", "{}")]), declared)
+    assert all_declared(canonical_calls([call("bash", "{}")]), declared)
+    # A mixed batch is undeclared: one undeclared call taints the whole step
+    # -- mirrors all_readonly's own "one unsafe call taints the batch" rule.
+    mixed = canonical_calls([call("bash", "{}"), call("read", "{}")])
+    assert not all_declared(mixed, declared)
+    # An unusable canon (None) is not declared either -- it cannot be waved
+    # through just because it could not be checked.
+    assert not all_declared(None, declared)
 
 
 def test_a_function_type_or_an_omitted_type_still_classifies_normally():

@@ -154,6 +154,53 @@ sort_keys=True, separators=(",", ":")))`. Consequences, all deliberate:
   action with different explanations agree, because the action is what gets
   executed. The winning candidate's own text is what ships with it.
 
+## Declared tools (security fix, 2026-07-30)
+
+The gateway does not execute the calls it emits — the client's agent loop
+does. Structural agreement and the fuser's judgement are both signals about
+whether the *panel* trusts a call; neither says anything about whether the
+*client* asked for it. A review of this milestone through the real app found
+two ways that gap was exploitable: a fast-path request that declared only
+`bash` in `tools` got back `read {"path": "/etc/shadow"}`, emitted with
+`path: "tool_fast"` and `degraded: false`, because `read` happens to sit in
+the server's `readonly_tools` list — classification never looked at what the
+client actually declared. And on a genuine three-way split, a fuser given
+`tools` forwarded and free rein over the answer proposed
+`exfiltrate {"url": "...", "data": "/etc/shadow"}`, a tool nobody declared at
+all, emitted with `answered_by: "fuser"` and `degraded: false`. The
+pre-existing `all_readonly` gate governs read-only-vs-write-class review, a
+question about the *server's* policy; it says nothing about whether the
+client asked for the tool at all, and it never applied to the fuser's own
+output regardless.
+
+**The rule:** a call may only be emitted if it names a tool the client
+declared, read from `body["tools"][*]["function"]["name"]` and the
+deprecated `body["functions"][*]["name"]`, unioned. This applies at every
+point a call is about to be served: the structural fast paths
+(`tool_fast`/`tool_reviewed`/`tool_plurality`), a plurality winner, the
+`best_candidate` fallback used when the fuser fails or only one candidate
+survives, and the fuser's own output.
+
+**Exemption:** if the client declared no tools at all in this request
+(`tools` and `functions` both absent or empty), the check does not apply. A
+provider with server-side tools may legitimately return a call the client
+never listed here, and blocking that would be a regression — the rule is
+"did you ask for *this* tool", not "did you ask for tools at all".
+
+**Treatment:** an undeclared call is unusable, the same way unparseable
+`arguments` are unusable (`tool_vote`'s own "None never matches anything") —
+it escalates rather than being emitted, reusing the existing degradation
+ladder rather than a parallel path. The fuser's own undeclared call is
+treated exactly like the pre-existing "fuser returned no tool calls" rung: a
+fuser failure that falls back to `best_candidate`, which itself now only
+serves a candidate whose calls are all declared. Nothing is synthesised or
+rewritten — an undeclared call is discarded whole, never stripped down to
+its declared calls, per this spec's own non-goal against hand-editing a call
+no model proposed. A distinct `fusion.degraded {"rung":
+"undeclared_tool_call"}` event fires wherever this changes what gets served,
+separate from the generic degradation rungs, so an operator can tell it
+apart from an ordinary disagreement.
+
 ## Config
 
 ```toml

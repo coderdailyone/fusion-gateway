@@ -108,3 +108,75 @@ def all_readonly(canon: tuple[CanonCall, ...] | None,
     if not canon:
         return False
     return all(name in readonly for name, _ in canon)
+
+
+# -- Security finding, 2026-07-30: a call may only be emitted if it names a
+# tool the CLIENT declared, not merely one the SERVER happens to know is
+# read-only. Two attacks against the real app proved the gap: a fast-path
+# request declaring only `bash` got back `read {"path": "/etc/shadow"}`
+# because "read" sits in the server's `readonly_tools` list -- classification
+# never looked at what the client actually asked for -- and a fuser given
+# free rein over `tools` proposed `exfiltrate(...)`, a tool nobody declared
+# at all, with `degraded: false`. `all_readonly` answers "is this call safe
+# to skip review", a question about the SERVER's own policy; `all_declared`
+# below answers the orthogonal question "did the client ask for this tool at
+# all", and both must hold before a call ships.
+
+def declared_tool_names(body) -> frozenset[str]:
+    """Tool names the client declared in this request, read defensively.
+
+    `body` is client-controlled and reaches this code with no validation, so
+    every access is guarded rather than assumed: a malformed `tools` or
+    `functions` entry is skipped, never raised on. Reads both shapes OpenAI's
+    wire format has ever used -- `body["tools"][*]["function"]["name"]`
+    (current) and the deprecated `body["functions"][*]["name"]` -- and unions
+    them, since a client may send either (or, in a multi-turn conversation,
+    have established one in an earlier turn now only implied). An empty
+    result means "the client declared no tools at all", which callers treat
+    as an exemption from the declared-tools check (see `all_declared`), not
+    as "zero tools are permitted" -- a provider with server-side tools may
+    legitimately return a call the client never listed, and blocking that
+    would be a regression.
+    """
+    names: set[str] = set()
+    if not isinstance(body, dict):
+        return frozenset()
+    tools = body.get("tools")
+    if isinstance(tools, (list, tuple)):
+        for t in tools:
+            if not isinstance(t, dict):
+                continue
+            fn = t.get("function")
+            if isinstance(fn, dict):
+                name = fn.get("name")
+                if isinstance(name, str) and name:
+                    names.add(name)
+    functions = body.get("functions")
+    if isinstance(functions, (list, tuple)):
+        for f in functions:
+            if not isinstance(f, dict):
+                continue
+            name = f.get("name")
+            if isinstance(name, str) and name:
+                names.add(name)
+    return frozenset(names)
+
+
+def all_declared(canon: tuple[CanonCall, ...] | None,
+                 declared: frozenset[str]) -> bool:
+    """True when every call names a tool in `declared`, or `declared` is
+    empty -- the client declared no tools at all in this request, so there is
+    nothing to check against and a provider free to use server-side tools
+    must not be blocked.
+
+    Mirrors `all_readonly`'s default-deny shape whenever `declared` is
+    non-empty: an unusable canon (None -- an empty call list, or one that
+    failed to canonicalise) is not declared, the same way it is not
+    read-only, so it cannot be silently waved through just because it could
+    not be checked.
+    """
+    if not declared:
+        return True
+    if not canon:
+        return False
+    return all(name in declared for name, _ in canon)

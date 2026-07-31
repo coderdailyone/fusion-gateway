@@ -20,11 +20,13 @@ from gateway.db import Store, connect
 from gateway.events import EventLog
 from gateway.fusion import (
     TOOL_DECIDED_PATHS, best_candidate, call_model, fuser_body, gather_panel,
-    is_write_class, openai_response, panel_has_tool_calls, reviewer_objected,
+    is_undeclared_call, is_write_class, openai_response, panel_has_tool_calls,
+    reviewer_objected, undeclared_call_blocked,
 )
 from gateway.ledger import BudgetTripped, Ledger, estimate_tokens
 from gateway.policy import UnknownModel, plan_route
 from gateway.providers import ProviderAdapter, ProviderError, make_adapter, parse_stream_usage
+from gateway.tool_vote import declared_tool_names
 
 logger = logging.getLogger("gateway.app")
 
@@ -249,6 +251,14 @@ def create_app(
     async def _fusion_request(*, request_id, body, streaming, fcfg):
         common = dict(fcfg=fcfg, cfg=cfg, adapters=adapters, ledger=ledger,
                       events=events, clock=clock, request_id=request_id)
+        # Security finding, 2026-07-30: computed once from the client's OWN
+        # request body (never from what an upstream returns), and threaded
+        # through every emission point below -- the non-streaming branch,
+        # `_finish_fusion` (both the tool-carrying-panel and prose-fallback
+        # callers), and the streaming generator's own duplicated fallback
+        # branches. Empty when the client declared no tools at all, which is
+        # `all_declared`'s explicit exemption, not "block everything".
+        declared = declared_tool_names(body)
 
         if not streaming:
             try:
@@ -261,7 +271,7 @@ def create_app(
 
             try:
                 text, source = await _finish_fusion(panel, body, fcfg, common,
-                                                    request_id)
+                                                    request_id, declared)
             except BudgetTripped:
                 # The fuser's own preflight (inside call_model) tripped the
                 # budget after the panel already spent -- e.g. a killswitch
@@ -357,9 +367,13 @@ def create_app(
             # bypass existed to prevent, now reachable because that bypass
             # is gone.
             if len(panel.candidates) < 2:
-                fallback = best_candidate(fcfg, panel)
+                fallback = best_candidate(fcfg, panel, declared)
                 if fallback is None:
                     events.append(request_id, "fusion.degraded", {"rung": "no_candidates"})
+                    # Security finding, 2026-07-30: additive signal alongside
+                    # whichever rung already fired above -- see
+                    # `_flag_undeclared_call`'s own docstring.
+                    _flag_undeclared_call(fcfg, panel, declared, request_id)
                     # Same "paying for a panel and then hard-failing is the
                     # worst outcome available" rung the non-streaming path
                     # uses (final review, finding 1b) -- fall through to the
@@ -391,6 +405,7 @@ def create_app(
                                        "model": fallback[0],
                                        "objected": reviewer_objected(
                                            panel.reviews, fallback[0])})
+                _flag_undeclared_call(fcfg, panel, declared, request_id)
                 events.append(request_id, "fusion.fused",
                               {"fuser": fcfg.fuser, "path": panel.path, "source": "candidate"})
                 _finish_request(store, request_id, "succeeded", clock)
@@ -422,7 +437,7 @@ def create_app(
                 # diverts a panel that genuinely held a tool call.
                 try:
                     candidate, source = await _finish_fusion(
-                        panel, body, fcfg, common, request_id)
+                        panel, body, fcfg, common, request_id, declared)
                 except BudgetTripped:
                     events.append(request_id, "budget.tripped", {"model": fcfg.fuser})
                     _finish_request(store, request_id, "failed", clock)
@@ -481,7 +496,17 @@ def create_app(
                 events.append(request_id, "call.failed",
                               {"model": fcfg.fuser, "stage": "fuser",
                                "kind": kind})
-                fallback = best_candidate(fcfg, panel)
+                # `declared` filtering is inert on THIS branch in practice --
+                # it is only reached when `panel_has_tool_calls(panel)` is
+                # False (the branch above diverts a tool-carrying panel
+                # through `_finish_fusion` before the prose relay below is
+                # even attempted), so no candidate here ever carries a tool
+                # call to filter. Passed through anyway for the same reason
+                # `cancel`'s provably-redundant call sites are kept in
+                # fusion.py: it documents the invariant at the point a reader
+                # would otherwise have to re-derive it, and it is a hedge
+                # against a future change to this branch's reachability.
+                fallback = best_candidate(fcfg, panel, declared)
                 # `Candidate.__bool__` is true for text OR tool calls, so a
                 # tool-calls-only Candidate (empty .text) still counts as a
                 # usable fallback -- Task 6's `_as_tool_chunks` gives it a
@@ -492,11 +517,13 @@ def create_app(
                 # request the gateway could have answered (M9 Task 3 review,
                 # finding 1, now fixed rather than merely fenced off).
                 if fallback is None or not fallback[1]:
+                    _flag_undeclared_call(fcfg, panel, declared, request_id)
                     _finish_request(store, request_id, "failed", clock)
                     yield b'\n\ndata: {"error": {"type": "upstream_exhausted"}}\n\n'
                     return
                 events.append(request_id, "fusion.degraded",
                               {"rung": "fuser_failed", "model": fallback[0]})
+                _flag_undeclared_call(fcfg, panel, declared, request_id)
                 _finish_request(store, request_id, "succeeded", clock)
                 pieces = (_as_tool_chunks(fallback[1], fcfg.model)
                           if fallback[1].tool_calls
@@ -600,14 +627,37 @@ def create_app(
         return StreamingResponse(gen(), media_type="text/event-stream",
                                  headers={"x-fusion-trace-id": request_id})
 
-    async def _finish_fusion(panel, body, fcfg, common, request_id):
+    def _flag_undeclared_call(fcfg, panel, declared, request_id):
+        """Additive `fusion.degraded` signal (security finding, 2026-07-30),
+        alongside whichever generic rung the caller already fires for the
+        same fallback (`no_candidates` / `single_candidate` / `fuser_failed`)
+        -- `best_candidate`'s own declared-tools filtering already refuses to
+        SERVE a candidate whose only tool calls name something the client
+        never declared, regardless of whether this fires; this just names
+        it, so an operator can tell this degradation apart from an ordinary
+        disagreement or a merely lost candidate. Shared by `_finish_fusion`
+        and the streaming generator's own duplicated fallback branches
+        (`gen`'s `< 2 candidates` branch and `_fuser_gave_nothing`), which do
+        not share a closure with each other.
+        """
+        if not undeclared_call_blocked(fcfg, panel, declared):
+            return
+        blocked = best_candidate(fcfg, panel)     # unfiltered: name who
+        events.append(request_id, "fusion.degraded",
+                      {"rung": "undeclared_tool_call",
+                       "model": blocked[0] if blocked else None})
+
+    async def _finish_fusion(panel, body, fcfg, common, request_id, declared):
         """Run the fuser. Returns (text, source) with source in
         {"fuser", "candidate"}, or (None, "none") when nothing survived.
         `text` is always a `Candidate` -- both the "fuser" source
         (call_model's fuser path returns `_extract_message`, so a fuser that
         answers with a tool call is not silently coerced into empty prose)
         and the "candidate" source (best_candidate's fallback) agree on that
-        shape, which is what lets `openai_response` require a `Candidate`."""
+        shape, which is what lets `openai_response` require a `Candidate`.
+        `declared` is the client's own declared tool names (security
+        finding, 2026-07-30) -- see `_fusion_request`'s own comment on where
+        it comes from."""
         def _flag_unreviewed_write_call(fallback):
             # Final whole-branch review, finding 2 (Important): a write-class
             # call served via `best_candidate` -- no clean cross-review, no
@@ -627,10 +677,16 @@ def create_app(
                            "objected": reviewer_objected(panel.reviews, fallback[0])})
 
         if len(panel.candidates) < 2:
-            fallback = best_candidate(fcfg, panel)
+            fallback = best_candidate(fcfg, panel, declared)
             if fallback is None:
                 events.append(request_id, "fusion.degraded",
                               {"rung": "no_candidates"})
+                # Security finding, 2026-07-30: this is exactly the shape the
+                # fast-path attack degrades to -- a `tool_fast`/`tool_reviewed`/
+                # `tool_plurality` panel whose single winner named a tool the
+                # client never declared, so `best_candidate` had nothing left
+                # to serve. Additive alongside `no_candidates` above.
+                _flag_undeclared_call(fcfg, panel, declared, request_id)
                 return None, "none"
             # Fix round 1, finding 4: `tool_fast`/`tool_reviewed`/
             # `tool_plurality` ALWAYS return exactly one candidate -- that
@@ -644,6 +700,7 @@ def create_app(
                 events.append(request_id, "fusion.degraded",
                               {"rung": "single_candidate", "model": fallback[0]})
             _flag_unreviewed_write_call(fallback)
+            _flag_undeclared_call(fcfg, panel, declared, request_id)
             return fallback[1], "candidate"
 
         try:
@@ -679,14 +736,34 @@ def create_app(
                           {"model": fcfg.fuser, "stage": "fuser",
                            "kind": "no_tool_call"})
             text = None
+        if text and is_undeclared_call(text, declared):
+            # Security finding, 2026-07-30: "the fuser returned an undeclared
+            # call" is a fuser failure, exactly like "the fuser returned no
+            # tool calls" above -- this is the half of the attack the
+            # `all_readonly` gate never covered at all: the fuser is one
+            # unreviewed model with `tools` forwarded and free rein, so its
+            # own output needs the SAME declared-tools check every other
+            # emission point gets. Never rewritten or stripped down to its
+            # declared calls (the spec forbids both synthesising a call no
+            # model proposed and silently editing one) -- discarded whole,
+            # falling through to `best_candidate` below like any other fuser
+            # failure.
+            events.append(request_id, "call.failed",
+                          {"model": fcfg.fuser, "stage": "fuser",
+                           "kind": "undeclared_tool"})
+            events.append(request_id, "fusion.degraded",
+                          {"rung": "undeclared_tool_call", "model": fcfg.fuser})
+            text = None
         if text:
             return text, "fuser"
-        fallback = best_candidate(fcfg, panel)
+        fallback = best_candidate(fcfg, panel, declared)
         if fallback is None:
+            _flag_undeclared_call(fcfg, panel, declared, request_id)
             return None, "none"
         events.append(request_id, "fusion.degraded",
                       {"rung": "fuser_failed", "model": fallback[0]})
         _flag_unreviewed_write_call(fallback)
+        _flag_undeclared_call(fcfg, panel, declared, request_id)
         return fallback[1], "candidate"
 
     async def _run_chain_once(request_id, body, chain):

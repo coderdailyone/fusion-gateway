@@ -1,8 +1,9 @@
 import pytest
 from gateway.fusion import (
     Candidate, PanelResult, _extract_message, best_candidate, call_model,
-    decide_tools, fuser_body, gather_panel, is_write_class, openai_response,
-    panel_has_tool_calls, reviewer_objected,
+    decide_tools, fuser_body, gather_panel, is_undeclared_call, is_write_class,
+    openai_response, panel_has_tool_calls, reviewer_objected,
+    undeclared_call_blocked,
 )
 from gateway.fusion_prompts import Verdict
 from tests.test_fusion import FakeAdapter, make_env, BODY, FCFG  # fixtures
@@ -635,3 +636,80 @@ def test_reviewer_objected_reads_only_wrong_verdicts_for_the_target():
     assert reviewer_objected(reviews, "c") is False
     assert reviewer_objected({}, "b") is False
     assert reviewer_objected(reviews, "nobody") is False
+
+
+# -- Security finding, 2026-07-30: a call may only be emitted if it names a
+# tool the client actually declared. `is_undeclared_call` is the Candidate-
+# aware wrapper around `tool_vote.all_declared` (mirrors `is_write_class`'s
+# own relationship to `all_readonly`); `best_candidate`'s filtering and
+# `undeclared_call_blocked`'s signalling both build on it.
+
+def test_is_undeclared_call_is_exempt_when_the_client_declared_nothing():
+    # The default: nothing to check against, so even a call naming a tool
+    # nobody has ever heard of is not "undeclared" -- it is exempt. A
+    # provider with server-side tools may legitimately return a call the
+    # client never listed.
+    assert is_undeclared_call(Candidate("", CALL), frozenset()) is False
+    assert is_undeclared_call(Candidate("", WRITE_CALL), frozenset()) is False
+
+
+def test_is_undeclared_call_matches_the_declared_set():
+    declared = frozenset({"bash"})
+    assert is_undeclared_call(Candidate("no calls"), declared) is False
+    assert is_undeclared_call(Candidate("", CALL), declared) is True         # "read" undeclared
+    assert is_undeclared_call(Candidate("", WRITE_CALL), declared) is False  # "bash" declared
+    # Unparseable arguments are treated as undeclared -- default-deny, the
+    # same way `all_readonly` (via `is_write_class`) already treats an
+    # unusable canon.
+    assert is_undeclared_call(Candidate("", BAD_CALL), declared) is True
+
+
+def test_is_undeclared_call_tolerates_a_bare_string_candidate():
+    # Several pre-existing tests (`test_best_candidate_prefers_panel_order`
+    # and its sibling in test_fusion.py) build a PanelResult with bare
+    # strings standing in for candidates, predating the Candidate refactor --
+    # the same convention `fuser_body`'s own docstring documents. With the
+    # default empty `declared` this must never even touch `.tool_calls`;
+    # this pins the (defensive, `getattr`-guarded) non-empty-declared case
+    # too, so a caller passing a real `declared` set never crashes on one.
+    assert is_undeclared_call("just a string", frozenset()) is False
+    assert is_undeclared_call("just a string", frozenset({"bash"})) is False
+
+
+def test_best_candidate_skips_a_candidate_holding_only_an_undeclared_call():
+    # "a" (first in FCFG.panel order) proposed only an undeclared call;
+    # "b" proposed a declared one -- best_candidate must skip "a" in favour
+    # of "b", exactly the way it already skips a falsy (failed) candidate.
+    panel = PanelResult("Q", {"a": Candidate("", CALL), "b": Candidate("", WRITE_CALL)},
+                        {}, "full", False)
+    declared = frozenset({"bash"})
+    assert best_candidate(FCFG, panel, declared) == ("b", panel.candidates["b"])
+    # Unfiltered (declared empty, the default): "a" wins on panel order --
+    # proves the filtering above is what moved the pick, not panel order.
+    assert best_candidate(FCFG, panel) == ("a", panel.candidates["a"])
+
+
+def test_best_candidate_returns_none_when_every_candidate_is_undeclared():
+    panel = PanelResult("Q", {"a": Candidate("", CALL)}, {}, "tool_fast", False)
+    assert best_candidate(FCFG, panel, frozenset({"bash"})) is None
+    assert best_candidate(FCFG, panel) == ("a", panel.candidates["a"])
+
+
+def test_best_candidate_still_serves_prose_regardless_of_declared():
+    # A text-only candidate is never "undeclared" -- there is nothing to
+    # check, regardless of what the client declared.
+    panel = PanelResult("Q", {"a": Candidate("hello")}, {}, "full", False)
+    assert best_candidate(FCFG, panel, frozenset({"bash"})) == ("a", panel.candidates["a"])
+
+
+def test_undeclared_call_blocked_fires_only_when_filtering_changes_the_pick():
+    panel = PanelResult("Q", {"a": Candidate("", CALL), "b": Candidate("", WRITE_CALL)},
+                        {}, "full", False)
+    assert undeclared_call_blocked(FCFG, panel, frozenset({"bash"})) is True
+    # "a" (CALL, "read") is itself declared here, so it still wins on panel
+    # order -- "b" being undeclared never mattered to the actual pick, and
+    # this must NOT fire a false signal for a call that was never served.
+    assert undeclared_call_blocked(FCFG, panel, frozenset({"read"})) is False
+    assert undeclared_call_blocked(FCFG, panel, frozenset()) is False
+    assert undeclared_call_blocked(FCFG, PanelResult("Q", {}, {}, "full", True),
+                                   frozenset({"bash"})) is False

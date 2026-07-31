@@ -49,7 +49,7 @@ from gateway.fusion_prompts import (
 )
 from gateway.ledger import BudgetTripped, estimate_tokens
 from gateway.providers import ProviderError
-from gateway.tool_vote import all_readonly, canonical_calls, plurality
+from gateway.tool_vote import all_declared, all_readonly, canonical_calls, plurality
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +127,35 @@ def is_write_class(candidate: Candidate, readonly: frozenset[str]) -> bool:
     if not candidate.tool_calls:
         return False
     return not all_readonly(canonical_calls(candidate.tool_calls), readonly)
+
+
+def is_undeclared_call(candidate: Candidate, declared: frozenset[str]) -> bool:
+    """True when `candidate` carries a tool call naming something the client
+    never declared in `tools`/`functions` -- unusable, the same way an
+    unparseable call is unusable (`tool_vote`'s own "None never matches
+    anything"), so it must escalate rather than be emitted (security
+    finding, 2026-07-30).
+
+    False when the candidate has no tool calls at all (nothing to check),
+    or when `declared` is empty -- the client declared no tools in this
+    request, which is the explicit exemption `all_declared` grants, not "no
+    call may ever be served".
+
+    `declared` is checked BEFORE `.tool_calls` is ever touched: several
+    pre-existing tests (`test_best_candidate_prefers_panel_order` and its
+    sibling) build a `PanelResult` with bare strings standing in for
+    candidates, predating the `Candidate` refactor -- the same convention
+    `fuser_body`'s own docstring documents. `best_candidate`'s default
+    `declared=frozenset()` means those calls never reach `getattr` at all;
+    when `declared` is non-empty, `getattr(candidate, "tool_calls", ())`
+    still tolerates a bare string rather than raising.
+    """
+    if not declared:
+        return False
+    calls = getattr(candidate, "tool_calls", ())
+    if not calls:
+        return False
+    return not all_declared(canonical_calls(calls), declared)
 
 
 def reviewer_objected(reviews: dict[str, dict[str, Verdict]], target: str) -> bool:
@@ -792,18 +821,53 @@ def fuser_body(fcfg, panel: PanelResult, body: dict) -> dict:
     return out
 
 
-def best_candidate(fcfg, panel: PanelResult):
-    """The answer to fall back on when the fuser fails: the first surviving
-    member in configured panel order. Returns (model, Candidate) or None."""
+def best_candidate(fcfg, panel: PanelResult, declared: frozenset[str] = frozenset()):
+    """The answer to fall back on when the fuser fails: the first surviving,
+    USABLE member in configured panel order, then alphabetically.
+
+    Security finding, 2026-07-30: a candidate whose tool calls are entirely
+    undeclared (`is_undeclared_call`) is not usable -- unusable the same way
+    a falsy (empty/failed) candidate already is, so it is skipped in favour
+    of the next survivor rather than served. This is also how the three
+    tool-decided paths (`tool_fast`/`tool_reviewed`/`tool_plurality`) get
+    this protection for free: every one of them hands `_finish_fusion` a
+    single-candidate `PanelResult` and relies on THIS function to extract
+    it, per `TOOL_DECIDED_PATHS`'s own docstring.
+
+    `declared` empty (the default) means "nothing to check" -- every
+    pre-existing call site and test that never passed it keeps behaving
+    exactly as before this check existed. Returns (model, Candidate) or
+    None.
+    """
+    def usable(c):
+        return bool(c) and not is_undeclared_call(c, declared)
     for m in fcfg.panel:
         c = panel.candidates.get(m)
-        if c:
+        if usable(c):
             return m, c
     for m in sorted(panel.candidates):
         c = panel.candidates[m]
-        if c:
+        if usable(c):
             return m, c
     return None
+
+
+def undeclared_call_blocked(fcfg, panel: PanelResult, declared: frozenset[str]) -> bool:
+    """True when `declared`-filtering changed which candidate `best_candidate`
+    would otherwise have picked -- i.e., the panel's normally-preferred
+    candidate held only a tool call the client never declared and had to be
+    skipped in favour of a worse (or no) survivor.
+
+    Purely for the operator-visible `fusion.degraded` signal (security
+    finding, 2026-07-30): `best_candidate` itself already refuses to SERVE
+    such a candidate regardless of whether this fires, so this never gates
+    behaviour -- only whether the distinct rung naming it is worth raising.
+    """
+    unfiltered = best_candidate(fcfg, panel)
+    if unfiltered is None:
+        return False
+    filtered = best_candidate(fcfg, panel, declared)
+    return filtered is None or filtered[0] != unfiltered[0]
 
 
 def openai_response(candidate: Candidate, model: str, meta: dict) -> dict:
