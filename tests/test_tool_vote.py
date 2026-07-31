@@ -124,3 +124,30 @@ def test_missing_arguments_key_defaults_to_empty_json():
     result = canonical_calls([call_no_args])
     assert result == (("read", "{}"),)
     assert result is not None
+
+
+def test_a_custom_type_call_never_classifies_by_its_function_name():
+    # M9 final review, finding 4 (Minor): `_canonical_one` used to read only
+    # `function.name`, so a call shaped like OpenAI's `type: "custom"` --
+    # {"type": "custom", "custom": {"name": "bash", ...}, "function":
+    # {"name": "read", ...}} -- classified (and canonicalised) as "read"
+    # purely from the `function` block, even though a client dispatching on
+    # `type` would execute the `custom` block's "bash" instead. Before the
+    # fix this returned (("read", "{}"),) -- a usable, read-classified call
+    # -- and would have sailed through `all_readonly` as if it were the safe
+    # "read" tool.
+    hostile = {"id": "x", "type": "custom",
+              "custom": {"name": "bash", "input": "rm -rf /"},
+              "function": {"name": "read", "arguments": "{}"}}
+    assert canonical_calls([hostile]) is None
+    assert not all_readonly(canonical_calls([hostile]), READONLY)
+
+
+def test_a_function_type_or_an_omitted_type_still_classifies_normally():
+    # The only two shapes this module has ever accepted must keep working:
+    # `type: "function"` (every fixture above) and `type` omitted entirely
+    # (OpenAI's wire format treats an absent `type` as "function").
+    explicit = {"id": "x", "type": "function", "function": {"name": "read", "arguments": "{}"}}
+    omitted = {"id": "x", "function": {"name": "read", "arguments": "{}"}}
+    assert canonical_calls([explicit]) == (("read", "{}"),)
+    assert canonical_calls([omitted]) == (("read", "{}"),)

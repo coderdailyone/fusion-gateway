@@ -149,8 +149,10 @@ def build_fusion_prompt(conversation: str, candidates: dict,
         "write a corrected answer (you may combine correct parts of several).",
         "- If the candidates proposed tool calls (shown as TOOL_CALL lines), "
         "the conversation calls for an action, not an explanation. Choose the "
-        "correct call, or state the corrected one in the same TOOL_CALL form. "
-        "Do not answer in prose instead of acting.",
+        "correct call, or a corrected one, and issue it through the "
+        "tool-calling mechanism available to you in this request -- never by "
+        "writing TOOL_CALL or any other text form. A text answer here will "
+        "not be executed. Do not answer in prose instead of acting.",
         "- Reply with the answer itself. Do not mention the candidates, the "
         "reviews, or that several models were consulted.",
     ]

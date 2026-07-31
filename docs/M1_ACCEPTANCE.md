@@ -351,3 +351,22 @@ Also unverified: whether panel agreement on a tool call improves anything. There
 is no grader for production traffic, and nothing in this project has ever
 measured tool-call quality — only prose on benchmarks. See the M9 spec's "What
 we know, and what we do not".
+
+### The $0.000579 total is not steady-state
+
+Gap 2 above (the cancelled-slow-leg accounting was never exercised) is not a
+cosmetic omission — it means this smoke's total materially *understates* the
+cost of the read-only fast path, its cheapest and most common branch. kimi-k3
+403ing bills as `failed` at \$0, but a genuinely cancelled leg — the shape a
+topped-up kimi-k3 will produce — settles at its **preflight estimate**, per
+the money invariant in the spec's Billing section. Measured directly on this
+same fast path with a live slow leg (see the M9 spec's second Correction
+block), the cancelled leg alone was **98.7%** of that request's total cost.
+That measurement is not even the worst case: `estimate_tokens` defaults
+`est_out` to 1024 when the client omits `max_tokens` (as this smoke's own
+requests did), so a cancelled leg priced off that default on kimi-k3
+(\$2.50/mtok out) alone comes to ≈1024 × \$2.50 / 1e6 ≈ **\$0.00256** — about
+**4.4×** this smoke's own three-request \$0.000579 total above. Once kimi-k3
+has quota, expect the read-only
+fast path's steady-state cost to be dominated by the leg it cancels, not by
+the two candidates it actually uses.

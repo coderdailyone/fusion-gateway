@@ -259,6 +259,50 @@ Tests assert the count for the specific branch they exercise rather than a
 global range — the M8 spec previously claimed "5–7" and was wrong, and its
 "6 or 8" correction describes the prose path only.
 
+### Correction (2026-07-30), second: the floor is 3 on a 3-member panel, not 2
+
+The "floor is 2" claim above, and acceptance criterion 2 below as first
+written, both describe a 2-member panel (quorum only, no slow leg). The
+milestone's own panel is 3 members (2 quorum + 1 slow leg), and on THAT shape
+the read-only fast path is **3** upstream calls and **3** ledger rows, not 2:
+the two quorum candidates settle normally, and the slow leg — launched at t=0
+alongside them, per the Flow section above — is cancelled once the quorum
+agrees, but a cancelled call still bills. The money invariant stated in
+Billing above is exactly why: a cancelled leg is never left in `preflight`
+and never `fail`ed (that would post \$0 for work the upstream may already be
+billing) — it is settled with `usage_source="estimated"`. That settlement
+*is* the third row. The plan and the tests were corrected to this before this
+spec was: `test_identical_readonly_calls_emit_with_no_review_and_no_slow_leg`
+and the app-level `test_a_tool_calling_request_now_reaches_the_fusion_panel`
+both assert `len(rows) == 3` on the read-only fast path, with an explicit
+comment tracing the discrepancy back to an earlier draft of this plan that
+said 2.
+
+This is not a rounding error in the cost story. Measured on the read-only fast
+path with a live (not 403ing) slow leg:
+
+```
+a  settled  reported   $0.000007
+b  settled  reported   $0.000007
+s  settled  ESTIMATED  $0.001025   <- cancelled leg, preflight estimate
+rows=3  preflight_left=0  upstream dispatched=3
+```
+
+The cancelled leg alone is **98.7%** of that request's total cost — the two
+settled candidates are three orders of magnitude cheaper. And that measured
+figure is not the worst case: `estimate_tokens` defaults `est_out` to 1024
+when the client omits `max_tokens` (the shape of a typical agent tool call,
+and unlike the request above), and the cancelled leg's ledger row is always
+an *estimate*, never a measurement. At kimi-k3's \$2.50/mtok out, a cancelled
+leg priced off that default alone is ≈1024 × \$2.50 / 1e6 ≈ **\$0.00256** —
+about **4.4×** the entire three-request M9 live smoke's \$0.000579 total (see
+`docs/M1_ACCEPTANCE.md`). Both numbers are invisible in that recorded smoke
+only because kimi-k3 was 403ing there: a provider error bills as `fail`
+(\$0), not a cancellation, so the smoke never exercised this leg at all. A
+client that reliably supplies a tight `max_tokens` lowers this; one that
+doesn't should expect the cancelled leg to dominate the recorded cost of the
+cheapest, most common path this milestone has.
+
 ## Testing
 
 - **Pure** (`tool_vote.py`): canonicalisation across key order and whitespace;
@@ -271,11 +315,12 @@ global range — the M8 spec previously claimed "5–7" and was wrong, and its
 - **Prompts**: a tool call renders in both the review and fusion prompts; the
   fusion prompt's action rule is present; the prose path's prompts are
   byte-identical to today for text-only candidates.
-- **Orchestrator**: the read-only fast path emits with 2 ledger rows and cancels
-  the slow leg; a write-class agreement runs the review and emits on no
-  objection; a reviewer objection escalates; a 2-of-3 plurality emits without
-  the fuser; a three-way split reaches the fuser with `tools` forwarded; every
-  degradation rung; no row ever left in `preflight`.
+- **Orchestrator**: the read-only fast path cancels the slow leg but still
+  bills it (3 ledger rows on the milestone's 3-member panel — see the second
+  Billing correction above); a write-class agreement runs the review and
+  emits on no objection; a reviewer objection escalates; a 2-of-3 plurality
+  emits without the fuser; a three-way split reaches the fuser with `tools`
+  forwarded; every degradation rung; no row ever left in `preflight`.
 - **App**: a `tools` request no longer bypasses fusion and no longer 502s; the
   response carries `tool_calls` with `finish_reason: "tool_calls"`; the
   synthesised stream is consumed by the real `openai` SDK's SSE decoder; a
@@ -292,8 +337,11 @@ global range — the M8 spec previously claimed "5–7" and was wrong, and its
 
 1. A request carrying `tools` reaches the fusion panel instead of bypassing it,
    and returns a valid OpenAI tool call.
-2. Two identical read-only calls are emitted after exactly 2 upstream calls with
-   no review and no fuser.
+2. Two identical read-only calls are emitted with no review and no fuser; on
+   the milestone's 3-member panel (2 quorum + 1 slow leg) this is exactly 3
+   upstream calls and 3 ledger rows — the two settled quorum candidates plus
+   the cancelled slow leg, which must still settle at its preflight estimate
+   rather than vanish (see the billing correction above).
 3. Two identical write-class calls are reviewed; an objection escalates.
 4. Differing calls are arbitrated by the third member's vote before the fuser is
    consulted; a three-way split reaches the fuser.

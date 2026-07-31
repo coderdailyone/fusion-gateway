@@ -133,6 +133,24 @@ def test_the_fusion_prompt_tells_the_fuser_to_act_not_narrate():
     assert "do not answer in prose instead of acting" in low
 
 
+def test_the_fusion_prompt_sends_the_fuser_through_the_tool_api_not_text():
+    # Final whole-branch review, finding 1 (CRITICAL): the old rule told the
+    # fuser to "state the corrected one in the same TOOL_CALL form" --
+    # `render_candidate` renders that form for display, but nothing in
+    # gateway/ parses it back into a call. `_extract_message` only ever
+    # reads `message.tool_calls`, so a fuser that obeyed the old wording
+    # returned plain text with `finish_reason: "stop"` -- exactly the
+    # failure this milestone exists to remove. The rule must instead point
+    # the fuser at the real tool-calling API (already forwarded via
+    # `tools`/`tool_choice` in `fuser_body`) and explicitly forbid the
+    # TOOL_CALL text form as an answer.
+    p = build_fusion_prompt("Q", {"m1": Candidate("", TOOL)}, {})
+    low = p.lower()
+    assert "tool-calling" in low
+    assert "never" in low and "writing tool_call" in low
+    assert "state the corrected one in the same tool_call form" not in low
+
+
 def test_prose_prompts_are_byte_identical_to_the_string_era():
     # The prose path must not shift by a single character. These are the exact
     # strings the pre-Candidate implementation produced.

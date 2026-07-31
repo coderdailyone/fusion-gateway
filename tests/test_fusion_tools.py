@@ -1,8 +1,10 @@
 import pytest
 from gateway.fusion import (
     Candidate, PanelResult, _extract_message, best_candidate, call_model,
-    decide_tools, fuser_body, gather_panel, openai_response,
+    decide_tools, fuser_body, gather_panel, is_write_class, openai_response,
+    panel_has_tool_calls, reviewer_objected,
 )
+from gateway.fusion_prompts import Verdict
 from tests.test_fusion import FakeAdapter, make_env, BODY, FCFG  # fixtures
 
 
@@ -590,3 +592,46 @@ async def test_a_three_way_split_lets_the_fuser_answer_with_a_call(tmp_path):
     msg = r["choices"][0]["message"]
     assert msg["tool_calls"][0]["function"]["arguments"] == '{"path":"fused-choice"}'
     assert r["fusion"]["answered_by"] == "fuser"
+
+
+# -- Final whole-branch review, findings 1 & 2: small pure helpers app.py's
+# _finish_fusion uses to (1) tell a fuser that answered without a tool_calls
+# array apart from one that genuinely fused, on a panel that held calls, and
+# (2) tell a write-class call served with no clean review or fuser decision
+# apart from a benign degradation.
+
+READONLY = frozenset({"read", "ls", "grep", "find"})
+CALL = ({"id": "c", "type": "function",
+        "function": {"name": "read", "arguments": "{}"}},)
+WRITE_CALL = ({"id": "c", "type": "function",
+              "function": {"name": "bash", "arguments": '{"cmd":"rm -rf /"}'}},)
+BAD_CALL = ({"id": "c", "type": "function",
+            "function": {"name": "bash", "arguments": "{not json"}},)
+
+
+def test_panel_has_tool_calls_is_true_only_when_some_candidate_carries_one():
+    prose_only = PanelResult("Q", {"a": Candidate("hi")}, {}, "quorum", False)
+    assert panel_has_tool_calls(prose_only) is False
+    holding = PanelResult("Q", {"a": Candidate("hi"), "b": Candidate("", CALL)},
+                          {}, "full", False)
+    assert panel_has_tool_calls(holding) is True
+    empty = PanelResult("Q", {}, {}, "full", True)
+    assert panel_has_tool_calls(empty) is False
+
+
+def test_is_write_class_matches_the_readonly_classifier():
+    assert is_write_class(Candidate("no calls"), READONLY) is False
+    assert is_write_class(Candidate("", CALL), READONLY) is False       # "read"
+    assert is_write_class(Candidate("", WRITE_CALL), READONLY) is True  # "bash"
+    # Unparseable arguments are treated as write-class -- default-deny, the
+    # same way `all_readonly` already treats an unusable canon.
+    assert is_write_class(Candidate("", BAD_CALL), READONLY) is True
+
+
+def test_reviewer_objected_reads_only_wrong_verdicts_for_the_target():
+    reviews = {"a": {"b": Verdict("wrong", "no"), "c": Verdict("correct", "ok")},
+              "d": {"b": Verdict("unsure", "?")}}
+    assert reviewer_objected(reviews, "b") is True
+    assert reviewer_objected(reviews, "c") is False
+    assert reviewer_objected({}, "b") is False
+    assert reviewer_objected(reviews, "nobody") is False

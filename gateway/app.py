@@ -20,7 +20,7 @@ from gateway.db import Store, connect
 from gateway.events import EventLog
 from gateway.fusion import (
     TOOL_DECIDED_PATHS, best_candidate, call_model, fuser_body, gather_panel,
-    openai_response,
+    is_write_class, openai_response, panel_has_tool_calls, reviewer_objected,
 )
 from gateway.ledger import BudgetTripped, Ledger, estimate_tokens
 from gateway.policy import UnknownModel, plan_route
@@ -298,9 +298,20 @@ def create_app(
             # back" -- only the latter is degraded on account of its source.
             degraded = panel.degraded or (
                 source != "fuser" and panel.path not in TOOL_DECIDED_PATHS)
+            # Final whole-branch review, finding 2 (Important): a distinct,
+            # client-visible signal for the exact shape that finding
+            # measured -- a write-class call served via the `best_candidate`
+            # fallback (never a fuser decision, never a clean
+            # `tool_reviewed` emission) -- so a client can tell "this action
+            # is about to execute with no clean review or fuser decision
+            # behind it" apart from a merely degraded-but-reviewed answer.
+            unreviewed_write_call = (
+                source == "candidate" and panel.path not in TOOL_DECIDED_PATHS
+                and is_write_class(text, fcfg.readonly_tools))
             meta = {"path": panel.path, "panel": sorted(panel.candidates),
                     "fuser": fcfg.fuser, "degraded": degraded,
-                    "answered_by": source}
+                    "answered_by": source,
+                    "unreviewed_write_call": unreviewed_write_call}
             events.append(request_id, "fusion.fused",
                           {"fuser": fcfg.fuser, "path": panel.path, "source": source})
             return JSONResponse(content=openai_response(text, fcfg.model, meta),
@@ -365,6 +376,21 @@ def create_app(
                 if panel.path not in TOOL_DECIDED_PATHS:
                     events.append(request_id, "fusion.degraded",
                                   {"rung": "single_candidate", "model": fallback[0]})
+                    # Final whole-branch review, finding 2 (Important): same
+                    # distinct signal the non-streaming path's meta and
+                    # `_finish_fusion` carry -- a write-class call served via
+                    # `best_candidate`, with no clean review or fuser
+                    # decision behind it, told apart from a benign
+                    # degradation. `tool_reviewed` never reaches this
+                    # branch's `panel.path not in TOOL_DECIDED_PATHS` gate at
+                    # all, so a legitimately reviewed write-class emission
+                    # never fires this.
+                    if is_write_class(fallback[1], fcfg.readonly_tools):
+                        events.append(request_id, "fusion.degraded",
+                                      {"rung": "unreviewed_write_call",
+                                       "model": fallback[0],
+                                       "objected": reviewer_objected(
+                                           panel.reviews, fallback[0])})
                 events.append(request_id, "fusion.fused",
                               {"fuser": fcfg.fuser, "path": panel.path, "source": "candidate"})
                 _finish_request(store, request_id, "succeeded", clock)
@@ -376,6 +402,47 @@ def create_app(
                 # single-candidate PROSE fallback.
                 for piece in (_as_tool_chunks(fallback[1], fcfg.model) if fallback[1].tool_calls
                               else _as_chunks(fallback[1].text, fcfg.model)):
+                    yield piece
+                return
+
+            if panel_has_tool_calls(panel):
+                # Final whole-branch review, finding 1 (CRITICAL). The fuser
+                # must be checked for a genuine tool call BEFORE any byte
+                # reaches the client -- unlike the prose relay below, which
+                # forwards live upstream bytes as they arrive, there is no
+                # way to un-send a byte once it is out, so a fuser that
+                # answers in prose here cannot be caught after the fact.
+                # Route this call through the exact same buffered
+                # `_finish_fusion` the non-streaming path uses -- it already
+                # carries this finding's fuser-returned-no-tool_calls
+                # fallback and finding 2's unreviewed-write-call signalling
+                # -- then synthesise the chunk stream from its result, the
+                # same pattern the < 2 candidate branch above already uses.
+                # The prose-only fuser relay below is untouched: this only
+                # diverts a panel that genuinely held a tool call.
+                try:
+                    candidate, source = await _finish_fusion(
+                        panel, body, fcfg, common, request_id)
+                except BudgetTripped:
+                    events.append(request_id, "budget.tripped", {"model": fcfg.fuser})
+                    _finish_request(store, request_id, "failed", clock)
+                    yield b'\n\ndata: {"error": {"type": "budget_exhausted"}}\n\n'
+                    return
+                if candidate is None:
+                    # Unreachable in practice: len(panel.candidates) >= 2
+                    # here (the < 2 branch above already returned), and
+                    # `collect()` only ever stores truthy candidates, so
+                    # `best_candidate` always finds one. Kept as a
+                    # defensive fallback rather than assumed away.
+                    events.append(request_id, "fusion.degraded", {"rung": "no_candidates"})
+                    _finish_request(store, request_id, "failed", clock)
+                    yield b'\n\ndata: {"error": {"type": "upstream_exhausted"}}\n\n'
+                    return
+                events.append(request_id, "fusion.fused",
+                              {"fuser": fcfg.fuser, "path": panel.path, "source": source})
+                _finish_request(store, request_id, "succeeded", clock)
+                for piece in (_as_tool_chunks(candidate, fcfg.model) if candidate.tool_calls
+                              else _as_chunks(candidate.text, fcfg.model)):
                     yield piece
                 return
 
@@ -541,6 +608,24 @@ def create_app(
         answers with a tool call is not silently coerced into empty prose)
         and the "candidate" source (best_candidate's fallback) agree on that
         shape, which is what lets `openai_response` require a `Candidate`."""
+        def _flag_unreviewed_write_call(fallback):
+            # Final whole-branch review, finding 2 (Important): a write-class
+            # call served via `best_candidate` -- no clean cross-review, no
+            # fuser decision -- gets its own distinct signal alongside
+            # whatever rung already fired above, so an operator (and, via
+            # the non-streaming meta, a client) can tell this apart from a
+            # benign degradation. Never fires for a TOOL_DECIDED_PATH:
+            # `tool_reviewed` legitimately reviewed a write-class call and
+            # found no objection, and `tool_fast`/`tool_plurality` are never
+            # write-class by construction (the `all_readonly` gate).
+            if panel.path in TOOL_DECIDED_PATHS:
+                return
+            if not is_write_class(fallback[1], fcfg.readonly_tools):
+                return
+            events.append(request_id, "fusion.degraded",
+                          {"rung": "unreviewed_write_call", "model": fallback[0],
+                           "objected": reviewer_objected(panel.reviews, fallback[0])})
+
         if len(panel.candidates) < 2:
             fallback = best_candidate(fcfg, panel)
             if fallback is None:
@@ -558,6 +643,7 @@ def create_app(
             if panel.path not in TOOL_DECIDED_PATHS:
                 events.append(request_id, "fusion.degraded",
                               {"rung": "single_candidate", "model": fallback[0]})
+            _flag_unreviewed_write_call(fallback)
             return fallback[1], "candidate"
 
         try:
@@ -578,6 +664,21 @@ def create_app(
             events.append(request_id, "call.failed",
                           {"model": fcfg.fuser, "stage": "fuser", "kind": "timeout"})
             text = None
+        if text and panel_has_tool_calls(panel) and not text.tool_calls:
+            # Final whole-branch review, finding 1 (CRITICAL): the fuser
+            # answered, but not through the tool-calling API, even though
+            # the panel it fused held tool calls -- exactly the failure the
+            # deleted M8 bypass existed to prevent, reopened by
+            # fusion_prompts.py once asking the fuser to reproduce TOOL_CALL
+            # text instead. Nothing in gateway/ parses that text back into a
+            # call (the spec's own non-goal), so this is treated exactly
+            # like any other fuser failure: fall through to best_candidate
+            # rather than serve prose with `finish_reason: "stop"` for a
+            # conversation that called for an action.
+            events.append(request_id, "call.failed",
+                          {"model": fcfg.fuser, "stage": "fuser",
+                           "kind": "no_tool_call"})
+            text = None
         if text:
             return text, "fuser"
         fallback = best_candidate(fcfg, panel)
@@ -585,6 +686,7 @@ def create_app(
             return None, "none"
         events.append(request_id, "fusion.degraded",
                       {"rung": "fuser_failed", "model": fallback[0]})
+        _flag_unreviewed_write_call(fallback)
         return fallback[1], "candidate"
 
     async def _run_chain_once(request_id, body, chain):

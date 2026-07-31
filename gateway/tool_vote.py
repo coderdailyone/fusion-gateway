@@ -26,6 +26,19 @@ CanonCall = tuple[str, str]      # (tool name, canonical arguments JSON)
 def _canonical_one(call) -> CanonCall | None:
     if not isinstance(call, dict):
         return None
+    # M9 final review, finding 4 (Minor): only `function.name` was read
+    # below, so a call shaped like OpenAI's `type: "custom"` --
+    # {"type": "custom", "custom": {"name": "bash", ...}, "function":
+    # {"name": "read", ...}} -- classified (and forwarded) as "read" purely
+    # from the `function` block, even though a client dispatching on `type`
+    # would execute the `custom` block's "bash" instead. No current upstream
+    # emits this shape, but nothing enforced `type` before trusting
+    # `function.name`. `type` omitted entirely is still accepted, matching
+    # OpenAI's own wire format (an absent `type` defaults to "function")
+    # rather than tightening this into a stricter gate than the spec's own
+    # one-line fix calls for.
+    if call.get("type") not in (None, "function"):
+        return None
     fn = call.get("function")
     if not isinstance(fn, dict):
         return None

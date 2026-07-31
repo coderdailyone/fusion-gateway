@@ -1178,3 +1178,246 @@ def test_a_genuine_single_candidate_fallback_still_reports_degraded(tmp_path, mo
     rid = r.headers["x-fusion-trace-id"]
     kinds = _event_kinds(tmp_path, rid)
     assert "fusion.degraded" in kinds
+
+
+# -- Final whole-branch review, finding 1 (CRITICAL). The fusion prompt used
+# to tell the fuser to "state the corrected one in the same TOOL_CALL form"
+# -- text `render_candidate` renders for display, but nothing in gateway/
+# parses back into a call (`_extract_message` only ever reads
+# `message.tool_calls`). A fuser that obeyed that wording answered in prose,
+# and the client got `finish_reason: "stop"` for a conversation that called
+# for an action, with no signal -- reachable on every escalation path a
+# disagreeing tool-carrying panel reaches the fuser through. The fix has two
+# halves: the prompt now points the fuser at the real tool-calling API
+# (pinned in test_fusion_prompts.py), and `_finish_fusion` treats a fuser
+# `Candidate` with no `tool_calls`, on a panel that held some, as a fuser
+# failure -> `best_candidate`, exercised end to end here.
+
+def _disagreeing_bash_candidate(body):
+    arg = "a" if body.get("model") == "a" else "b"
+    return httpx.Response(200, json={
+        "choices": [{"message": {"content": None, "tool_calls": [
+            {"id": "c1", "type": "function",
+             "function": {"name": "bash", "arguments": f'{{"cmd":"{arg}"}}'}}]}}],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 4}})
+
+
+def test_a_fuser_that_answers_in_prose_on_a_tool_carrying_panel_falls_back_to_a_real_call(
+        tmp_path, monkeypatch):
+    def h(req):
+        body = json.loads(req.content)
+        prompt = body["messages"][-1]["content"]
+        if "Produce the single best final answer" in prompt:
+            # Reproduces the exact failure the old rule invited: the fuser
+            # answers in the TOOL_CALL text form instead of through the
+            # tool-calling API. `tool_calls` is absent from this response.
+            return httpx.Response(200, json={
+                "choices": [{"message": {
+                    "content": 'TOOL_CALL bash {"cmd":"rm -rf /safe"}'}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+        if "VERDICT" in prompt:
+            return httpx.Response(200, json={
+                "choices": [{"message": {"content":
+                    "VERDICT a correct ok\nVERDICT b correct ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+        # "a" and "b" DISAGREE (different arguments), so decide_tools cannot
+        # resolve the panel structurally and the fuser is genuinely reached.
+        return _disagreeing_bash_candidate(body)
+    c = make_client(tmp_path, monkeypatch, h=h)
+    r = c.post("/v1/chat/completions", json={
+        "model": "fusion", "messages": [{"role": "user", "content": "clean up"}],
+        "tools": [{"type": "function", "function": {"name": "bash", "parameters": {}}}],
+    }, headers=H())
+    assert r.status_code == 200
+    body = r.json()
+    msg = body["choices"][0]["message"]
+    # The bug this finding measured: prose served with finish_reason "stop"
+    # for a conversation that called for an action, with no signal.
+    assert body["choices"][0]["finish_reason"] == "tool_calls"
+    assert msg["tool_calls"], "fuser prose was served instead of a real call"
+    assert msg["tool_calls"][0]["function"]["name"] == "bash"
+    assert "TOOL_CALL" not in (msg.get("content") or "")
+    assert body["fusion"]["answered_by"] == "candidate"   # not "fuser"
+    assert body["fusion"]["degraded"] is True
+
+
+def test_streaming_fuser_that_answers_in_prose_on_a_tool_carrying_panel_falls_back_to_a_real_call(
+        tmp_path, monkeypatch):
+    # Streaming twin. `_finish_fusion`'s fuser call is always a genuine
+    # non-streaming upstream request (fuser_body never sets `stream`), so
+    # the mock's fuser branch below is identical to the non-streaming test's
+    # -- the whole point of routing a tool-carrying panel's fuser call
+    # through the buffered `_finish_fusion` rather than a live byte relay.
+    def h(req):
+        body = json.loads(req.content)
+        prompt = body["messages"][-1]["content"]
+        if "Produce the single best final answer" in prompt:
+            return httpx.Response(200, json={
+                "choices": [{"message": {
+                    "content": 'TOOL_CALL bash {"cmd":"rm -rf /safe"}'}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+        if "VERDICT" in prompt:
+            return httpx.Response(200, json={
+                "choices": [{"message": {"content":
+                    "VERDICT a correct ok\nVERDICT b correct ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+        return _disagreeing_bash_candidate(body)
+    c = make_client(tmp_path, monkeypatch, h=h)
+    with c.stream("POST", "/v1/chat/completions", json={
+        "model": "fusion", "stream": True,
+        "messages": [{"role": "user", "content": "clean up"}],
+        "tools": [{"type": "function", "function": {"name": "bash", "parameters": {}}}],
+    }, headers=H()) as r:
+        assert r.status_code == 200
+        raw = b"".join(r.iter_bytes()).decode()
+    assert "TOOL_CALL" not in raw
+    assert '"error"' not in raw
+    assert raw.rstrip().endswith("data: [DONE]")
+    objs = [json.loads(l[6:]) for l in raw.splitlines()
+            if l.startswith("data: ") and l[6:].strip() != "[DONE]"]
+    assert any(o["choices"][0]["delta"].get("tool_calls", [{}])[0]
+               .get("function", {}).get("name") == "bash" for o in objs)
+    assert any(o["choices"][0].get("finish_reason") == "tool_calls" for o in objs)
+
+
+def test_streaming_tool_carrying_panel_with_a_genuinely_successful_fuser(tmp_path, monkeypatch):
+    # Regression pin for the refactor above: a tool-carrying panel that
+    # reaches a fuser which DOES answer through the tool-calling API must
+    # still stream that real call -- not just the failure branch.
+    def h(req):
+        body = json.loads(req.content)
+        prompt = body["messages"][-1]["content"]
+        if "Produce the single best final answer" in prompt:
+            return httpx.Response(200, json={
+                "choices": [{"message": {"content": None, "tool_calls": [
+                    {"id": "c1", "type": "function",
+                     "function": {"name": "bash", "arguments": '{"cmd":"fused"}'}}]}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+        if "VERDICT" in prompt:
+            return httpx.Response(200, json={
+                "choices": [{"message": {"content":
+                    "VERDICT a wrong no\nVERDICT b wrong no"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+        return _disagreeing_bash_candidate(body)
+    c = make_client(tmp_path, monkeypatch, h=h)
+    with c.stream("POST", "/v1/chat/completions", json={
+        "model": "fusion", "stream": True,
+        "messages": [{"role": "user", "content": "clean up"}],
+        "tools": [{"type": "function", "function": {"name": "bash", "parameters": {}}}],
+    }, headers=H()) as r:
+        assert r.status_code == 200
+        raw = b"".join(r.iter_bytes()).decode()
+    assert raw.rstrip().endswith("data: [DONE]")
+    objs = [json.loads(l[6:]) for l in raw.splitlines()
+            if l.startswith("data: ") and l[6:].strip() != "[DONE]"]
+    assert any(o["choices"][0]["delta"].get("tool_calls", [{}])[0]
+               .get("function", {}).get("arguments") == '{"cmd":"fused"}' for o in objs)
+    assert any(o["choices"][0].get("finish_reason") == "tool_calls" for o in objs)
+
+
+# -- Final whole-branch review, finding 2 (Important). A write-class call
+# could be emitted with no clean review and no fuser decision behind it, and
+# `path` alone did not say so. `unreviewed_write_call` (meta field, plus a
+# distinct `fusion.degraded` rung) names this apart from a benign
+# degradation, and carries whether a reviewer specifically objected to the
+# action about to be executed.
+
+def _write_bash_response():
+    return httpx.Response(200, json={
+        "choices": [{"message": {"content": None, "tool_calls": [
+            {"id": "c1", "type": "function",
+             "function": {"name": "bash", "arguments": '{"cmd":"rm -rf /"}'}}]}}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+
+
+def _degraded_payloads(tmp_path, request_id):
+    import sqlite3
+    conn = sqlite3.connect(tmp_path / "g.sqlite")
+    rows = conn.execute("SELECT kind, payload FROM events WHERE request_id=?",
+                        (request_id,)).fetchall()
+    return [json.loads(p) for k, p in rows if k == "fusion.degraded"]
+
+
+def test_a_lone_survivor_holding_a_write_class_call_is_flagged_unreviewed(tmp_path, monkeypatch):
+    def h(req):
+        body = json.loads(req.content)
+        if body["model"] == "a":
+            return httpx.Response(500, json={})
+        prompt = body["messages"][-1]["content"]
+        if "Produce the single best final answer" in prompt:
+            return httpx.Response(500, json={})     # dead code if reached
+        return _write_bash_response()
+    c = make_client(tmp_path, monkeypatch, h=h)
+    r = c.post("/v1/chat/completions", json={
+        "model": "fusion", "messages": [{"role": "user", "content": "clean up"}],
+        "tools": [{"type": "function", "function": {"name": "bash", "parameters": {}}}],
+    }, headers=H())
+    assert r.status_code == 200
+    body = r.json()
+    assert body["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "bash"
+    assert body["fusion"]["degraded"] is True
+    assert body["fusion"]["unreviewed_write_call"] is True
+    rid = r.headers["x-fusion-trace-id"]
+    matches = [p for p in _degraded_payloads(tmp_path, rid)
+              if p.get("rung") == "unreviewed_write_call"]
+    assert len(matches) == 1
+    # No review ran at all here -- distinct from the objection case below.
+    assert matches[0]["objected"] is False
+
+
+def test_a_fuser_failure_after_a_reviewer_objection_flags_the_objection(tmp_path, monkeypatch):
+    def h(req):
+        body = json.loads(req.content)
+        prompt = body["messages"][-1]["content"]
+        if "Produce the single best final answer" in prompt:
+            return httpx.Response(500, json={})           # fuser also dead
+        if "VERDICT" in prompt:
+            return httpx.Response(200, json={
+                "choices": [{"message": {"content":
+                    "VERDICT a wrong no\nVERDICT b wrong no"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+        return _write_bash_response()   # a and b agree -- reaches agree_review
+    c = make_client(tmp_path, monkeypatch, h=h)
+    r = c.post("/v1/chat/completions", json={
+        "model": "fusion", "messages": [{"role": "user", "content": "clean up"}],
+        "tools": [{"type": "function", "function": {"name": "bash", "parameters": {}}}],
+    }, headers=H())
+    assert r.status_code == 200
+    body = r.json()
+    assert body["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "bash"
+    assert body["fusion"]["unreviewed_write_call"] is True
+    rid = r.headers["x-fusion-trace-id"]
+    matches = [p for p in _degraded_payloads(tmp_path, rid)
+              if p.get("rung") == "unreviewed_write_call"]
+    assert len(matches) == 1
+    # A reviewer DID object to the exact call about to be served -- distinct
+    # from the lone-survivor case above, where nothing ever reviewed it.
+    assert matches[0]["objected"] is True
+
+
+def test_a_clean_tool_reviewed_emission_is_never_flagged_unreviewed(tmp_path, monkeypatch):
+    # Regression guard: `tool_reviewed` legitimately reviewed a write-class
+    # agreement and found no objection -- the new signal must not fire here,
+    # or every healthy reviewed write call would look identical to an
+    # unreviewed one.
+    def h(req):
+        body = json.loads(req.content)
+        prompt = body["messages"][-1]["content"]
+        if "VERDICT" in prompt:
+            return httpx.Response(200, json={
+                "choices": [{"message": {"content":
+                    "VERDICT a correct ok\nVERDICT b correct ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+        return _write_bash_response()
+    c = make_client(tmp_path, monkeypatch, h=h)
+    r = c.post("/v1/chat/completions", json={
+        "model": "fusion", "messages": [{"role": "user", "content": "clean up"}],
+        "tools": [{"type": "function", "function": {"name": "bash", "parameters": {}}}],
+    }, headers=H())
+    assert r.status_code == 200
+    body = r.json()
+    assert body["fusion"]["path"] == "tool_reviewed"
+    assert body["fusion"]["degraded"] is False
+    assert body["fusion"]["unreviewed_write_call"] is False
+    rid = r.headers["x-fusion-trace-id"]
+    assert "fusion.degraded" not in _event_kinds(tmp_path, rid)

@@ -99,6 +99,49 @@ class PanelResult:
 TOOL_DECIDED_PATHS = frozenset({"tool_fast", "tool_reviewed", "tool_plurality"})
 
 
+def panel_has_tool_calls(panel: PanelResult) -> bool:
+    """True when any candidate in `panel` proposed a tool call.
+
+    Final whole-branch review, finding 1 (CRITICAL): once a panel that held
+    tool calls reaches the fuser (a genuine disagreement -- `agree_readonly`/
+    `agree_review`/`tool_plurality` never call the fuser at all), the fuser
+    MUST answer through the tool-calling API, never prose -- app.py's
+    `_finish_fusion` uses this to treat a fuser `Candidate` with no
+    `tool_calls` as a fuser failure whenever it's true, rather than serving
+    prose with `finish_reason: "stop"` for a conversation that called for an
+    action.
+    """
+    return any(c.tool_calls for c in panel.candidates.values())
+
+
+def is_write_class(candidate: Candidate, readonly: frozenset[str]) -> bool:
+    """True when `candidate` carries a tool call that is not all read-only.
+
+    A candidate with no tool calls at all is not write-class -- there is
+    nothing to review. Mirrors `tool_vote.all_readonly`'s own default-deny
+    philosophy for everything else: a candidate whose arguments do not
+    canonicalise (unusable) counts as write-class rather than being silently
+    waved through, which falls out for free since `all_readonly` already
+    returns False for a None canon.
+    """
+    if not candidate.tool_calls:
+        return False
+    return not all_readonly(canonical_calls(candidate.tool_calls), readonly)
+
+
+def reviewer_objected(reviews: dict[str, dict[str, Verdict]], target: str) -> bool:
+    """True when any reviewer's verdict for `target` was 'wrong'.
+
+    Final whole-branch review, finding 2 (Important): used to tell "no
+    review ever ran" apart from "a reviewer specifically objected to the
+    action about to be executed" when a write-class call is served without a
+    clean review or fuser decision behind it -- both currently collapse into
+    the same generic degradation signal.
+    """
+    return any(verds.get(target) is not None and verds[target].verdict == "wrong"
+               for verds in reviews.values())
+
+
 def _extract_text(resp) -> str:
     """Pull the assistant text out of an upstream response, defensively.
 
