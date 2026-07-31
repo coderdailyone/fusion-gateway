@@ -184,6 +184,46 @@ Point any OpenAI SDK at `http://127.0.0.1:8800/v1` with your gateway token.
 > The gateway binds to `127.0.0.1` by default — expose it via your own reverse
 > proxy or an SSH tunnel, never straight to the internet.
 
+## The `fusion` model
+
+Beyond routing to one model, the gateway can answer a request with a **panel**:
+several models answer, cross-review each other, and a fuser writes the final
+answer. It is **opt-in** — name it explicitly:
+
+```bash
+curl http://127.0.0.1:8800/v1/chat/completions \
+  -H "Authorization: Bearer secret-token" -H "Content-Type: application/json" \
+  -d '{"model": "fusion", "messages": [{"role": "user", "content": "..."}]}'
+```
+
+A request that names no model is unaffected and takes the ordinary single-model
+path. The response carries a non-standard `fusion` object (`path`, `panel`,
+`fuser`, `degraded`) that conformant clients ignore.
+
+**Tool calls go through the panel too.** A tool call is structured — `name` plus
+JSON `arguments` — so whether the models agree can be *decided* rather than
+judged, with no extra model in the loop. That is the whole design:
+
+| the panel's two fast members… | what happens | upstream calls |
+|---|---|---|
+| propose the **same read-only** call | emitted immediately, no review, no fuser | 3 |
+| propose the **same write-class** call | cross-reviewed first | 5 |
+| **disagree**, and 2 of 3 agree on a read-only call | that call is emitted | 3 |
+| disagree otherwise | cross-review, then the fuser decides | 6–8 |
+
+`readonly_tools` in the config is a positive list of known-safe tool names;
+**anything absent is write-class**, so a tool the gateway has never seen is
+reviewed rather than waved through. A call naming a tool the client never
+declared in its own `tools` is rejected outright — the gateway does not execute
+these calls, but it vouches for them.
+
+**What is not established:** nothing in this project has measured whether a
+panel picks *better* tool calls than one model. The published fusion numbers
+(`docs/M5_FUSION_REPORT.md`) were prose answers on benchmark tasks, where the
+win was +1.1 points at p = 0.176 — not significant — and there is no grader on
+production traffic. What the panel buys here is structural: a second and third
+opinion on each action, and an agreement test that costs nothing.
+
 ## Configuration
 
 Runtime is driven by environment variables:
@@ -225,9 +265,10 @@ default_model = "deepseek-chat"
 | Method & path | Auth | What it does |
 |---|---|---|
 | `POST /v1/chat/completions` | token | OpenAI-compatible completion; streaming supported; falls back down the chain |
-| `GET /v1/models` | token | configured model names |
+| `GET /v1/models` | token | configured model names, plus the `fusion` pseudo-model when one is configured |
 | `GET /healthz` | none | liveness `{"ok": true}` |
 | `GET /admin/status` | admin | budget/ledger status + request counts |
+| `POST /admin/killswitch/trip` | admin | stop spending now |
 | `POST /admin/killswitch/release` | admin | reset a tripped budget |
 
 Error shapes: `401` bad token · `403` non-admin · `502 upstream_exhausted`

@@ -21,10 +21,19 @@ DEST="/opt/fusion-gateway"
 UNIT="fusion-gateway"
 
 echo "→ syncing source to ${HOST}:${DEST}"
+# .gitignore does not bind rsync: runs/ (~1 GB of frozen evaluation samples)
+# and evaluator/runs/ are git-ignored but were still being shipped, making the
+# payload 1000x larger than the ~1 MB the gateway actually needs. The
+# production host has no use for evaluation artifacts. Note '.env' has no
+# slash, so it matches at any depth -- that is what keeps runs/secrets/.env
+# off the production host.
 rsync -az --delete \
   --exclude '.git' --exclude '.venv' --exclude 'internal' \
   --exclude '__pycache__' --exclude '*.sqlite*' --exclude '.env' \
   --exclude '.superpowers' \
+  --exclude 'runs' --exclude 'evaluator/runs' \
+  --exclude '.pytest_cache' --exclude '*.egg-info' \
+  --exclude 'data' \
   ./ "${HOST}:${DEST}/"
 
 echo "→ building venv + installing on ${HOST}"

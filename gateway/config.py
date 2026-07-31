@@ -10,7 +10,7 @@ class ConfigError(Exception): pass
 
 @dataclass(frozen=True)
 class ProviderCfg:
-    name: str; base_url: str; api_key_env: str
+    name: str; base_url: str; api_key_env: str; wire: str = "openai"
 
 @dataclass(frozen=True)
 class ModelCfg:
@@ -19,15 +19,31 @@ class ModelCfg:
     fallback: tuple[str, ...]
 
 @dataclass(frozen=True)
+class FusionCfg:
+    model: str                      # the pseudo-model clients request
+    panel: tuple[str, ...]          # every candidate, in preference order
+    quorum: tuple[str, ...]         # agreement here short-circuits the slow leg
+    reviewers: tuple[str, ...]      # who cross-reviews (may exclude slow models)
+    fuser: str                      # writes the final answer
+    review_max_tokens: int
+    stage_timeout_s: float
+    readonly_tools: frozenset[str] = frozenset({"read", "ls", "grep", "find"})
+
+@dataclass(frozen=True)
 class Config:
     providers: dict[str, ProviderCfg]; models: dict[str, ModelCfg]
     policy_version: str; default_model: str
-    active_budget: str; budget_caps: dict[str, float]
+    active_budget: str; budget_caps: dict[str, float | None]   # None == no cap
+    fusion: "FusionCfg | None" = None
 
 def load_config(path: Path) -> Config:
     data = tomllib.loads(Path(path).read_text())
-    providers = {n: ProviderCfg(n, p["base_url"], p["api_key_env"])
-                 for n, p in data["providers"].items()}
+    providers = {}
+    for n, p in data["providers"].items():
+        wire = p.get("wire", "openai")
+        if wire not in ("openai", "anthropic"):
+            raise ConfigError(f"provider {n}: unknown wire {wire!r}")
+        providers[n] = ProviderCfg(n, p["base_url"], p["api_key_env"], wire)
     models: dict[str, ModelCfg] = {}
     for n, m in data["models"].items():
         if m["provider"] not in providers:
@@ -39,11 +55,105 @@ def load_config(path: Path) -> Config:
         for f in m.fallback:
             if f not in models:
                 raise ConfigError(f"model {n}: unknown fallback {f}")
+
+    fusion = None
+    if "fusion" in data:
+        f = data["fusion"]
+        name = f["model"]
+        if name in models:
+            raise ConfigError(
+                f"fusion.model {name!r} collides with a real model; the fusion "
+                "pseudo-model must not shadow one"
+            )
+        # Validate that panel, quorum, reviewers are lists before converting
+        if not isinstance(f["panel"], list):
+            raise ConfigError(f"fusion.panel must be a list, got {type(f['panel']).__name__}")
+        if not isinstance(f["quorum"], list):
+            raise ConfigError(f"fusion.quorum must be a list, got {type(f['quorum']).__name__}")
+        if not isinstance(f["reviewers"], list):
+            raise ConfigError(f"fusion.reviewers must be a list, got {type(f['reviewers']).__name__}")
+
+        panel = tuple(f["panel"])
+        quorum = tuple(f["quorum"])
+        reviewers = tuple(f["reviewers"])
+        fuser = f["fuser"]
+        if len(panel) < 2:
+            raise ConfigError("fusion.panel needs at least 2 models")
+        if len(set(panel)) != len(panel):
+            # A duplicate collapses to one task in gather_panel's `{m:
+            # asyncio.create_task(...) for m in fcfg.panel}` dict
+            # comprehension, so `len(candidates) < len(fcfg.panel)` is
+            # permanently true even when every distinct model answered --
+            # `degraded` pins true forever for this panel.
+            raise ConfigError("fusion.panel must not contain duplicates")
+        if len(quorum) == 0:
+            raise ConfigError("fusion.quorum must not be empty")
+        if len(reviewers) == 0:
+            raise ConfigError("fusion.reviewers must not be empty")
+        for field, names in (("panel", panel), ("quorum", quorum),
+                             ("reviewers", reviewers), ("fuser", (fuser,))):
+            for n in names:
+                if n not in models:
+                    raise ConfigError(f"fusion.{field} names unknown model {n!r}")
+        if not set(quorum) <= set(panel):
+            raise ConfigError("fusion.quorum must be a subset of fusion.panel")
+        if not set(reviewers) <= set(panel):
+            raise ConfigError("fusion.reviewers must be a subset of fusion.panel")
+        if not set(quorum) <= set(reviewers):
+            # is_consensus() requires every candidate to also be a reviewer of
+            # the others; a quorum member missing from reviewers can never be
+            # judged, so consensus -- and the whole quorum short-circuit --
+            # would be silently unreachable forever.
+            raise ConfigError("fusion.quorum must be a subset of fusion.reviewers")
+
+        review_max_tokens = int(f.get("review_max_tokens", 512))
+        stage_timeout_s = float(f.get("stage_timeout_s", 120))
+        if review_max_tokens <= 0:
+            raise ConfigError(f"fusion.review_max_tokens must be > 0, got {review_max_tokens}")
+        if stage_timeout_s <= 0:
+            raise ConfigError(f"fusion.stage_timeout_s must be > 0, got {stage_timeout_s}")
+
+        if "readonly_tools" in f:
+            raw_ro = f["readonly_tools"]
+            if not isinstance(raw_ro, list):
+                raise ConfigError(
+                    f"fusion.readonly_tools must be a list, got "
+                    f"{type(raw_ro).__name__}"
+                )
+            for entry in raw_ro:
+                if not isinstance(entry, str) or not entry:
+                    raise ConfigError(
+                        f"fusion.readonly_tools entries must be non-empty "
+                        f"strings, got {entry!r}"
+                    )
+            if len(set(raw_ro)) != len(raw_ro):
+                raise ConfigError("fusion.readonly_tools has duplicate entries")
+            readonly_tools = frozenset(raw_ro)
+        else:
+            readonly_tools = frozenset({"read", "ls", "grep", "find"})
+
+        fusion = FusionCfg(
+            model=name, panel=panel, quorum=quorum, reviewers=reviewers,
+            fuser=fuser,
+            review_max_tokens=review_max_tokens,
+            stage_timeout_s=stage_timeout_s,
+            readonly_tools=readonly_tools,
+        )
+
     pol = data["policy"]
-    if pol["default_model"] not in models:
+    # The fusion pseudo-model is deliberately absent from [models], so it is a
+    # legitimate default even though it resolves to no ModelCfg.
+    if pol["default_model"] not in models and not (
+        fusion is not None and pol["default_model"] == fusion.model
+    ):
         raise ConfigError("policy.default_model not in models")
-    caps = {k: float(v["cap_usd"]) for k, v in data["budgets"].items()}
+    # cap_usd omitted == no ceiling. Kept explicit rather than defaulted to a
+    # number, so "unbounded" is something an operator writes on purpose.
+    caps = {
+        k: (float(v["cap_usd"]) if "cap_usd" in v else None)
+        for k, v in data["budgets"].items()
+    }
     if data["budget"]["active"] not in caps:
-        raise ConfigError("active budget has no cap")
+        raise ConfigError("active budget has no [budgets.<name>] table")
     return Config(providers, models, pol["version"], pol["default_model"],
-                  data["budget"]["active"], caps)
+                  data["budget"]["active"], caps, fusion)

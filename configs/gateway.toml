@@ -2,7 +2,9 @@
 active = "M1"
 
 [budgets.M1]
-cap_usd = 5.0
+# No cap_usd: deliberately unbounded. The automatic trip is off, so the only
+# brake is POST /admin/killswitch/trip (admin token). Watch spend with
+# scripts/rollup.py -- nothing will stop it for you.
 
 [providers.deepseek]
 base_url = "https://api.deepseek.com"
@@ -12,19 +14,93 @@ api_key_env = "DEEPSEEK_API_KEY"
 base_url = "https://open.bigmodel.cn/api/paas/v4"
 api_key_env = "GLM_API_KEY"
 
+# A SECOND GLM provider, not a `wire` flip on [providers.glm]: flipping that one
+# would reroute glm-4.5-flash — deepseek-chat's fallback — onto a wire its
+# endpoint does not speak. No `/v1` in base_url; AnthropicAdapter appends
+# `/v1/messages` itself.
+[providers.glm_anthropic]
+base_url = "https://open.bigmodel.cn/api/anthropic"
+api_key_env = "GLM_API_KEY"
+wire = "anthropic"
+
+[providers.kimi]
+base_url = "https://api.kimi.com/coding/v1"
+api_key_env = "MOONSHOT_API_KEY"
+
 [models."deepseek-chat"]
 provider = "deepseek"
 upstream_model = "deepseek-v4-flash"
 in_usd_per_mtok = 0.14   # verified 2026-07-14 (deepseek-v4-flash non-thinking); deepseek-chat alias deprecates 2026-07-24
 out_usd_per_mtok = 0.28
-fallback = ["glm-4.6"]
+fallback = ["glm-4.5-flash"]
 
-[models."glm-4.6"]
+[models."glm-4.5-flash"]
 provider = "glm"
-upstream_model = "glm-4.6"
-in_usd_per_mtok = 0.60   # glm-4.6 flagship; price approximate, confirm at smoke
-out_usd_per_mtok = 2.20
+upstream_model = "glm-4.5-flash"
+# glm-4.6 on this endpoint returns 1113 "余额不足" (no balance / no resource pack)
+# — verified by the M1 smoke on 2026-07-26, matching the M2c finding. glm-4.5-flash
+# is served on the same endpoint. Free tier: priced at 0 until a paid plan is added.
+in_usd_per_mtok = 0.0
+out_usd_per_mtok = 0.0
 fallback = []
+
+[models."glm-5.2"]
+provider = "glm_anthropic"
+upstream_model = "glm-5.2"
+# GLM's paid balance is reachable ONLY on the Anthropic-compatible endpoint; the
+# same key returns 1113 "余额不足" on /paas/v4 (measured 2026-07-26). Prices
+# mirror configs/pricing.toml and are still unverified against Zhipu's published
+# table — they set billing, so confirm before this model carries real traffic.
+in_usd_per_mtok = 0.60
+out_usd_per_mtok = 2.20
+fallback = ["deepseek-chat"]
+
+[models."kimi-k3"]
+provider = "kimi"
+# The model id on this endpoint is literally "k3", not "kimi-k3".
+upstream_model = "k3"
+# Prices mirror configs/pricing.toml, still unverified against Moonshot's
+# published table. A reasoning model: expect ~30s latency and heavy output.
+in_usd_per_mtok = 0.60
+out_usd_per_mtok = 2.50
+fallback = ["deepseek-chat"]
+
+[fusion]
+# Wired 2026-07-29 (M8), opt-in as of the same day: this is NOT
+# policy.default_model. A client reaches it only by naming it explicitly
+# (model: "fusion") on the public base URL; a request naming no model gets
+# the ordinary single-model path, unchanged. The panel and fuser are exactly
+# what M5 measured at 0.8901 on the 1063-task standard tier -- see
+# docs/M5_FUSION_REPORT.md, and note the win over the best single member was
+# +1.1pt at p = 0.176, i.e. not significant, and was measured on benchmark
+# tasks rather than chat.
+model = "fusion"
+panel = ["deepseek-chat", "glm-5.2", "kimi-k3"]
+# If these two review each other "correct" AND their answers agree in
+# substance, M5's own majority-copy rule means the fuser must copy that
+# answer, which is lossless -- kimi-k3 cannot change the outcome, so it is
+# cancelled. But mutual "correct" verdicts do not require identical text: two
+# DIFFERING answers can each be judged correct by the other, and the
+# majority-copy rule only fires on identical text, so that case instead takes
+# the fuser's "resolve the objections" branch, where the discarded kimi-k3
+# answer genuinely could have changed the result. Cancelling kimi-k3 on the
+# quorum signal alone is therefore a deliberate quality-for-latency trade in
+# the differing-answer case, not a lossless win -- it is what turns ~73s into
+# ~15s on the common path.
+quorum = ["deepseek-chat", "glm-5.2"]
+# kimi-k3 is deliberately NOT a reviewer: it is a ~34s reasoning model and
+# would dominate the review stage. It remains a candidate, so its answer still
+# reaches the fuser on the full path.
+reviewers = ["deepseek-chat", "glm-5.2"]
+fuser = "glm-5.2"
+review_max_tokens = 512
+stage_timeout_s = 120
+# Tools whose calls may be emitted on structural agreement alone, with no
+# cross-review. Everything NOT listed is write-class and keeps the review even
+# when the models agree, so a new or unknown tool is reviewed rather than waved
+# through. These four are Pi's read-only tools; `bash` is deliberately absent
+# because it can `ls -la` or `rm -rf` and the name cannot tell you which.
+readonly_tools = ["read", "ls", "grep", "find"]
 
 [policy]
 version = "static-v0"

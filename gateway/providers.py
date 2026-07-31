@@ -108,3 +108,16 @@ def parse_stream_usage(collected: bytes) -> dict | None:
         if isinstance(obj, dict) and obj.get("usage"):
             usage = obj["usage"]
     return usage
+
+
+def make_adapter(cfg: ProviderCfg, transport: httpx.AsyncBaseTransport | None = None):
+    """Return the adapter that speaks this provider's wire protocol.
+
+    Imported lazily: gateway.providers_anthropic imports ProviderError from
+    this module, so a top-level import here would be circular.
+    """
+    if cfg.wire == "anthropic":
+        from gateway.providers_anthropic import AnthropicAdapter
+
+        return AnthropicAdapter(cfg, transport=transport)
+    return ProviderAdapter(cfg, transport=transport)

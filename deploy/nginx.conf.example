@@ -1,0 +1,61 @@
+# Reverse proxy for the fusion gateway.
+#
+# Copy to /etc/nginx/sites-available/fusion-gateway, replace GATEWAY_DOMAIN,
+# symlink into sites-enabled, then let certbot fill in the TLS block:
+#
+#   certbot --nginx -d GATEWAY_DOMAIN
+#
+# Requires a DNS A record for GATEWAY_DOMAIN pointing at this host FIRST --
+# certbot's nginx authenticator proves control over the name by answering an
+# HTTP challenge on it.
+#
+# Deliberately NO SSO gate in front of this. The gateway authenticates with
+# its own bearer tokens (GATEWAY_TOKENS), which is what an OpenAI-compatible
+# client sends. A browser-redirect SSO layer would bounce every API client to
+# a login page, breaking the thing this vhost exists to expose.
+
+server {
+    server_name GATEWAY_DOMAIN;
+
+    # Prompts get large; the default 1m rejects long conversations.
+    client_max_body_size 32m;
+
+    # A public endpoint holding real provider credit. This bounds how fast a
+    # leaked token can burn money; the gateway's own killswitch is the backstop
+    # (POST /admin/killswitch/trip).
+    limit_req zone=fusion_gw burst=20 nodelay;
+
+    # The admin surface (budget status, killswitch trip/release) has no reason
+    # to be on the public internet -- the operator reaches it over SSH. Drop
+    # this block if you need it remotely; it is protected by the admin bearer
+    # token either way.
+    location /admin/ {
+        deny all;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:8800;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Streaming: without these, nginx buffers the whole SSE response and
+        # the client gets one burst at the end instead of a live stream.
+        proxy_buffering off;
+        proxy_cache off;
+        chunked_transfer_encoding on;
+
+        # Reasoning models are slow -- kimi-k3 runs ~30s/call, and a long
+        # generation can exceed that. The default 60s would cut them off.
+        proxy_read_timeout 900s;
+        proxy_send_timeout 900s;
+    }
+
+    listen 80;
+    listen [::]:80;
+}
+
+# Goes in the http{} block (e.g. /etc/nginx/conf.d/fusion-gateway-limits.conf):
+#   limit_req_zone $binary_remote_addr zone=fusion_gw:10m rate=10r/s;

@@ -8,3 +8,4 @@ dist/
 build/
 internal/
 runs/cache/
+runs/m5_scratch/
