@@ -132,6 +132,16 @@ MODEL_SPECS = {
     "deepseek-chat": lambda: dict(
         litellm_model="deepseek/deepseek-chat",
         api_key=os.environ["DEEPSEEK_API_KEY"]),
+    # deepseek-v4-pro is V4-Pro-PREVIEW, and DeepSeek's own announcement says
+    # the 2026-07-31 v4-flash release beats it on benchmarks -- so it is kept
+    # registered for comparison, NOT as an upgrade path. Probed 2026-07-31:
+    # both live on /models, and `deepseek-chat` still resolves, returning
+    # model="deepseek-v4-flash". Pro spends ~2.5x flash's output tokens on the
+    # same prompt, nearly all of it reasoning, hence the generous cap.
+    "deepseek-v4-pro": lambda: dict(
+        litellm_model="deepseek/deepseek-v4-pro",
+        max_tokens=8192,
+        api_key=os.environ["DEEPSEEK_API_KEY"]),
     "kimi-k3": lambda: dict(  # reasoning model -> generous cap
         # model id on the endpoint is literally "k3" (k2's billing-cycle quota
         # was exhausted; k3 is the current model and has quota).
