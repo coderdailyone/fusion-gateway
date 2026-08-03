@@ -23,10 +23,15 @@ Read the result like this:
     single fast, fusion slow    -> expected; the panel waits on its slowest member
 
 Usage:
-    python3 scripts/diagnose_latency.py <token> [domain]
+    python3 scripts/diagnose_latency.py <token> [domain] [local_base]
 
-    token   a GATEWAY_TOKENS client token
-    domain  public hostname, e.g. fusion.xinshu.ai (optional; skips section 2)
+    token       a GATEWAY_TOKENS client token
+    domain      public hostname, e.g. fusion.xinshu.ai (optional; skips section 2)
+    local_base  loopback base URL if the gateway is not on the default port,
+                e.g. http://127.0.0.1:9000 (default http://127.0.0.1:8800)
+
+If the loopback section shows connection errors, the port is wrong. Find it:
+    ss -ltnp | grep -i uvicorn        # or: systemctl status <your-unit>
 """
 from __future__ import annotations
 
@@ -38,7 +43,7 @@ import time
 import urllib.error
 import urllib.request
 
-LOCAL = "http://127.0.0.1:8800"
+DEFAULT_LOCAL = "http://127.0.0.1:8800"
 
 
 def timed(url: str, token: str, body: dict | None = None, timeout: float = 300):
@@ -107,6 +112,8 @@ def main() -> int:
         return 2
     token = sys.argv[1]
     domain = sys.argv[2] if len(sys.argv) > 2 else None
+    LOCAL = (sys.argv[3] if len(sys.argv) > 3 else DEFAULT_LOCAL).rstrip("/")
+    print(f"loopback base: {LOCAL}\n")
 
     chat = {"max_tokens": 16, "messages": [{"role": "user", "content": "Reply with exactly: ok"}]}
 
