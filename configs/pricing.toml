@@ -1,3 +1,7 @@
+["deepseek-v4-pro"]
+in_usd_per_mtok = 0.28    # VERIFY vs DeepSeek published pricing; assumed 2x flash
+out_usd_per_mtok = 0.56   # VERIFY
+
 ["deepseek-chat"]
 in_usd_per_mtok = 0.14
 out_usd_per_mtok = 0.28
