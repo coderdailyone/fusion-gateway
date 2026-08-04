@@ -5,13 +5,26 @@
 #   - SSH access to the host under the alias set in HOST (default: vps).
 #     Real connection details live in your local ~/.ssh/config, never in this repo.
 # One-time prereqs on the host (NOT done here — see notes):
-#   - /opt/fusion-gateway/.env exists, mode 600, containing:
+#   - /opt/fusion-gateway/.env exists, mode 600, with ONE key per provider in
+#     configs/gateway.toml (check `api_key_env` there -- this list goes stale
+#     whenever a provider is added, and a missing key fails LAZILY: the service
+#     starts, /healthz is green, and only the first request routed to that
+#     provider raises). As of 2026-07-31 the config needs all three:
 #       DEEPSEEK_API_KEY=...
-#       GLM_API_KEY=...
-#       GATEWAY_TOKENS=prism:<tok>,admin:<tok>
+#       GLM_API_KEY=...          # serves both glm-4.5-flash and glm-5.2
+#       MOONSHOT_API_KEY=...     # kimi-k3
+#       GATEWAY_TOKENS=<principal>:<tok>,admin:<tok>
 #       GATEWAY_CONFIG=/opt/fusion-gateway/configs/gateway.toml
 #       GATEWAY_DB=/opt/fusion-gateway/data/gateway.sqlite
 #   - python3 with venv support (apt-get install -y python3-venv if missing).
+#
+# NOT done by this script, and needed for a PUBLIC endpoint:
+#   - a reverse proxy + TLS. See deploy/nginx.conf.example; the DNS A record
+#     must point at this host BEFORE certbot can answer its HTTP challenge.
+#     Without it the gateway is reachable only on 127.0.0.1:8800.
+#
+# Verify after deploying with scripts/smoke.py, not just /healthz -- the lazy
+# key failure above is invisible to a health check.
 #
 # Usage: HOST=vps bash scripts/deploy.sh
 set -euo pipefail
