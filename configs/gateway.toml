@@ -30,6 +30,17 @@ api_key_env = "MOONSHOT_API_KEY"
 [models."deepseek-chat"]
 provider = "deepseek"
 upstream_model = "deepseek-v4-flash"
+# v4-flash answers in thinking mode by default, and a thinking-mode reply must
+# have its `reasoning_content` handed back on the NEXT turn or the upstream
+# rejects the conversation:
+#     400 The `reasoning_content` in the thinking mode must be passed back
+# The gateway cannot satisfy that. The assistant turn a client sends back is
+# the FUSED answer -- it belongs to no single panel member and carries no
+# member's reasoning. So from turn two onward this member 400'd on every
+# request: 840 of 882 on the M4 agentic run. Turning thinking off is what
+# makes deepseek usable as a panel member in multi-turn work at all; verified
+# to return 200 with no reasoning_content.
+param_overrides = { thinking = { type = "disabled" } }
 in_usd_per_mtok = 0.14   # verified 2026-07-14 (deepseek-v4-flash non-thinking); deepseek-chat alias deprecates 2026-07-24
 out_usd_per_mtok = 0.28
 fallback = ["glm-4.5-flash"]
@@ -57,6 +68,13 @@ fallback = ["deepseek-chat"]
 
 [models."kimi-k3"]
 provider = "kimi"
+# k3 accepts exactly one temperature:
+#     400 invalid temperature: only 1 is allowed for this model
+# SWE-agent sends its own (M4's opus arm used 1.0, other clients send 0.0), and
+# the gateway forwarded it verbatim to every panel member -- so kimi 400'd on
+# 877 of 881 candidate calls. Forced rather than dropped because the upstream
+# names the legal value, so there is no need to guess its default.
+param_overrides = { temperature = 1 }
 # The model id on this endpoint is literally "k3", not "kimi-k3".
 upstream_model = "k3"
 # Prices mirror configs/pricing.toml, still unverified against Moonshot's

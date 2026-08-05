@@ -1,5 +1,5 @@
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 try:
     import tomllib
@@ -17,6 +17,38 @@ class ModelCfg:
     name: str; provider: str; upstream_model: str
     in_usd_per_mtok: float; out_usd_per_mtok: float
     fallback: tuple[str, ...]
+    # Request parameters this model constrains, applied to every call routed to
+    # it. A fusion panel is HETEROGENEOUS but the client sends one body, and
+    # forwarding it verbatim to every member assumes they accept the same
+    # parameters. They do not: measured on the M4 agentic run, kimi-k3 rejected
+    # SWE-agent's temperature with
+    #     400 invalid temperature: only 1 is allowed for this model
+    # on 877 of 881 candidate calls, and deepseek-v4-flash rejected the
+    # multi-turn conversation with
+    #     400 The `reasoning_content` in the thinking mode must be passed back
+    # on 840. Two of three members were gone from turn two onward, so what ran
+    # was glm-5.2 alone -- and nothing in the response said so.
+    #
+    # `param_overrides` FORCES a value; `drop_params` REMOVES a key. Overriding
+    # is preferred where the upstream names a legal value (temperature=1),
+    # dropping where the parameter simply must not appear.
+    param_overrides: dict = field(default_factory=dict)
+    drop_params: tuple[str, ...] = ()
+
+    def apply_params(self, body: dict) -> dict:
+        """Return `body` conformed to this model's constraints.
+
+        A copy: the same dict is handed to every panel member in turn, so
+        mutating it would let the first member's constraints leak into the
+        second's request.
+        """
+        if not self.param_overrides and not self.drop_params:
+            return body
+        out = dict(body)
+        for k in self.drop_params:
+            out.pop(k, None)
+        out.update(self.param_overrides)
+        return out
 
 @dataclass(frozen=True)
 class FusionCfg:
@@ -50,7 +82,9 @@ def load_config(path: Path) -> Config:
             raise ConfigError(f"model {n}: unknown provider {m['provider']}")
         models[n] = ModelCfg(n, m["provider"], m["upstream_model"],
                              float(m["in_usd_per_mtok"]), float(m["out_usd_per_mtok"]),
-                             tuple(m.get("fallback", [])))
+                             tuple(m.get("fallback", [])),
+                             dict(m.get("param_overrides", {})),
+                             tuple(m.get("drop_params", [])))
     for n, m in models.items():
         for f in m.fallback:
             if f not in models:

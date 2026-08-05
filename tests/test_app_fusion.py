@@ -1679,3 +1679,83 @@ def test_streaming_fusion_still_delivers_the_answer_through_the_filter(
     text = "".join(f["choices"][0]["delta"].get("content", "")
                    for f in _frames(r.content) if f.get("choices"))
     assert text == "FUSED ANSWER"
+
+
+# -- per-model parameter constraints reach the wire (2026-08-05) ------------
+
+PARAM_CFG = CFG.replace('''[models."b"]
+provider = "p"
+upstream_model = "b"''', '''[models."b"]
+provider = "p"
+upstream_model = "b"
+param_overrides = { temperature = 1 }
+drop_params = ["top_p"]''')
+
+
+def test_each_panel_member_gets_a_body_conformed_to_its_own_constraints(
+        tmp_path, monkeypatch):
+    """Model b forces temperature=1 and forbids top_p; model a constrains
+    neither. One client body, two different upstream bodies -- which is the
+    whole point: forwarding one body verbatim to a heterogeneous panel is what
+    silently reduced the M4 agentic run to a single model."""
+    seen = []
+
+    def h(req):
+        body = json.loads(req.content)
+        # Only the CANDIDATE call forwards the client's body. Review and fuser
+        # calls build their own, so they carry no client temperature to test.
+        prompt = body["messages"][-1]["content"]
+        kind = "review" if "VERDICT" in prompt else (
+            "fuser" if "Produce the single best final answer" in prompt else "candidate")
+        seen.append((body.get("model"), kind, body.get("temperature"), "top_p" in body))
+        return handler(req)
+
+    c = make_client(tmp_path, monkeypatch, h=h, cfg=PARAM_CFG)
+    r = c.post("/v1/chat/completions",
+               json={**BODY, "temperature": 0.0, "top_p": 0.9}, headers=H())
+    assert r.status_code == 200
+
+    a_cand = [x for x in seen if x[0] == "a" and x[1] == "candidate"]
+    b_all = [x for x in seen if x[0] == "b"]
+    assert a_cand and b_all
+    # a declared no constraints: the client's own values reach it untouched.
+    assert all(t == 0.0 and has_top_p for _, _, t, has_top_p in a_cand)
+    # b is constrained on EVERY call it receives -- candidate, review and fuser
+    # alike, because each is a separate request the upstream can reject.
+    assert all(t == 1 and not has_top_p for _, _, t, has_top_p in b_all)
+
+
+def test_the_constraint_applies_to_the_streaming_path_too(tmp_path, monkeypatch):
+    """The fuser's streaming call is a separate call site; a fix that only
+    covered the non-streaming one would leave streaming fusion broken for
+    exactly the members that need the constraint."""
+    seen = []
+
+    def h(req):
+        body = json.loads(req.content)
+        if body.get("model") == "b":
+            seen.append((body.get("temperature"), "top_p" in body))
+        return handler(req)
+
+    c = make_client(tmp_path, monkeypatch, h=h, cfg=PARAM_CFG)
+    c.post("/v1/chat/completions",
+           json={**BODY, "stream": True, "temperature": 0.0, "top_p": 0.9},
+           headers=H())
+    assert seen, "the fuser call never happened"
+    assert all(t == 1 and not has for t, has in seen)
+
+
+def test_a_single_model_request_is_conformed_as_well(tmp_path, monkeypatch):
+    """Not a fusion-only concern: naming b directly must also respect its
+    constraints, or the same 400 comes back on the ordinary path."""
+    seen = []
+
+    def h(req):
+        body = json.loads(req.content)
+        seen.append((body.get("temperature"), "top_p" in body))
+        return handler(req)
+
+    c = make_client(tmp_path, monkeypatch, h=h, cfg=PARAM_CFG)
+    c.post("/v1/chat/completions",
+           json={**BODY, "model": "b", "temperature": 0.0, "top_p": 0.9}, headers=H())
+    assert seen and all(t == 1 and not has for t, has in seen)

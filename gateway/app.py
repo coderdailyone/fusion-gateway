@@ -647,7 +647,8 @@ def create_app(
             try:
                 try:
                     stream_iter = adapter.chat_stream(
-                        model_cfg.upstream_model, fbody).__aiter__()
+                        model_cfg.upstream_model,
+                        model_cfg.apply_params(fbody)).__aiter__()
                     while True:
                         remaining = max(0.0, deadline - time.monotonic())
                         try:
@@ -929,7 +930,8 @@ def create_app(
             events.append(request_id, "call.attempt", {"model": model_name})
             start = clock.now()
             try:
-                upstream_resp = await adapter.chat(model_cfg.upstream_model, body)
+                upstream_resp = await adapter.chat(
+                    model_cfg.upstream_model, model_cfg.apply_params(body))
             except ProviderError as exc:
                 ledger.fail(entry_id)
                 events.append(
@@ -1023,7 +1025,8 @@ def create_app(
             accumulated = bytearray()
             first_byte = False
             try:
-                async for chunk in adapter.chat_stream(model_cfg.upstream_model, body):
+                async for chunk in adapter.chat_stream(
+                        model_cfg.upstream_model, model_cfg.apply_params(body)):
                     first_byte = True
                     accumulated.extend(chunk)
                     yield chunk
