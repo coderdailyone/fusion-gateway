@@ -87,6 +87,36 @@ class Ledger:
         with self.store.lock:
             return self._consumed_locked()
 
+    def usage_for_request(self, request_id: str) -> tuple[int, int]:
+        """(in_tokens, out_tokens) billed to one request, over ALL its calls.
+
+        A fusion request fans out to 3-8 upstream calls -- candidates, reviews,
+        the fuser, and any fallback. None of them individually is "the" usage,
+        and reporting the final leg alone would understate what the request
+        cost by several times. Summing the ledger is the only figure that
+        cannot drift from what was actually spent, because the ledger is the
+        thing that spends it.
+
+        Counts the same states the budget counts (CONSUMING_STATES). That
+        deliberately includes a call cancelled mid-flight, which settles with
+        estimated tokens rather than failing: the upstream did the work and
+        may bill for it, so hiding it from the client would misreport the
+        cost downward. Rows in 'failed' contribute nothing -- that state is
+        for a call that never reached an upstream at all.
+
+        COALESCE, not a bare SUM: a 'preflight' row has NULL token columns
+        until it settles, and one NULL would otherwise poison the whole sum.
+        """
+        placeholders = ", ".join("?" * len(CONSUMING_STATES))
+        with self.store.lock:
+            row = self.store.conn.execute(
+                "SELECT COALESCE(SUM(in_tokens), 0) AS in_tok, "
+                "       COALESCE(SUM(out_tokens), 0) AS out_tok "
+                f"FROM ledger WHERE request_id = ? AND state IN ({placeholders})",
+                (request_id, *CONSUMING_STATES),
+            ).fetchone()
+        return int(row["in_tok"]), int(row["out_tok"])
+
     def status(self) -> dict:
         with self.store.lock:
             row = self._budget_row_locked()

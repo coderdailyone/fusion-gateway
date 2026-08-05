@@ -870,8 +870,18 @@ def undeclared_call_blocked(fcfg, panel: PanelResult, declared: frozenset[str]) 
     return filtered is None or filtered[0] != unfiltered[0]
 
 
-def openai_response(candidate: Candidate, model: str, meta: dict) -> dict:
+def openai_response(candidate: Candidate, model: str, meta: dict,
+                    usage: dict | None = None) -> dict:
     """The client-facing JSON response for a fused (or fallback) answer.
+
+    `usage` is the panel's TOTAL across every upstream call, not the final
+    leg's. It was absent entirely until 2026-08-05, which made a fusion
+    request's cost invisible to the client while the single-model path
+    reported it normally -- and silently zeroed the budget gate of anything
+    that prices a call by reading `resp.usage`, our own evaluator included.
+    Optional rather than required only so the callers that build a response
+    without a ledger (tests, and any future caller with nothing to sum) stay
+    valid; every live path passes it.
 
     `candidate` must be a `Candidate` -- both sources that reach here now
     agree on that shape: `best_candidate`'s fallback always was one, and as
@@ -899,7 +909,7 @@ def openai_response(candidate: Candidate, model: str, meta: dict) -> dict:
     else:
         message["content"] = candidate.text
         finish = "stop"
-    return {
+    resp = {
         "id": f"chatcmpl-{uuid.uuid4().hex}",
         "object": "chat.completion",
         "created": int(time.time()),
@@ -907,3 +917,6 @@ def openai_response(candidate: Candidate, model: str, meta: dict) -> dict:
         "choices": [{"index": 0, "message": message, "finish_reason": finish}],
         "fusion": meta,
     }
+    if usage is not None:
+        resp["usage"] = usage
+    return resp
