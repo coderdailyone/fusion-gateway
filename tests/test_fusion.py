@@ -797,3 +797,89 @@ async def test_a_tool_call_only_candidate_survives_the_panel(tmp_path):
     assert panel.candidates["a"].text == ""
     assert panel.candidates["a"].tool_calls
     assert panel.candidates["a"].tool_calls[0]["function"]["name"] == "read"
+
+
+# -- pricing a cancelled leg (2026-08-05) ----------------------------------
+# The quorum short-circuit kills the slow leg for latency. It used to be
+# BILLED for max_tokens regardless -- measured live, the cancelled kimi leg
+# was 93% of the whole request's cost, and it scaled with the client's
+# max_tokens rather than with anything the model did.
+
+class ClockAdvancingAdapter(FakeAdapter):
+    """Advances the injected clock while a delayed leg 'works'.
+
+    FakeClock is frozen, so without this every cancelled leg has an elapsed
+    time of exactly zero and the throughput estimate is untestable -- it would
+    read 0 tokens no matter what the estimator did.
+    """
+    def __init__(self, script, clock, advance_by, **kw):
+        super().__init__(script, **kw)
+        self._clock, self._advance_by = clock, advance_by
+
+    async def chat(self, upstream_model, payload):
+        if upstream_model in self.delays:
+            self._clock.advance(self._advance_by)
+        return await super().chat(upstream_model, payload)
+
+
+def _seed_reported_history(store, clock, model, out_tokens, latency_ms, n=3):
+    led = Ledger(store, clock, cap_usd=None, budget_name="T")
+    for _ in range(n):
+        eid = led.preflight("r1", "p", model, 10, out_tokens, 1.0, 1.0)
+        led.settle(eid, 10, out_tokens, "reported", latency_ms, 1.0, 1.0)
+
+
+@pytest.mark.anyio
+async def test_a_cancelled_leg_is_priced_from_measured_throughput(tmp_path):
+    """s has emitted 100 tokens in 2s (50 tok/s) on every past call, and this
+    call ran 4s before being cancelled -> ~200 tokens, NOT the 4096 cap."""
+    ad = FakeAdapter(agree_script(), delays={"s": 3})
+    env, store = make_env(tmp_path, ad)
+    _seed_reported_history(store, env["clock"], "s", out_tokens=100, latency_ms=2000)
+    env["adapters"]["p"] = ClockAdvancingAdapter(
+        agree_script(), env["clock"], advance_by=4.0, delays={"s": 3})
+
+    await gather_panel(body=dict(BODY, max_tokens=4096), **env)
+
+    row = store.conn.execute(
+        "SELECT out_tokens, usage_source FROM ledger "
+        "WHERE model='s' AND usage_source='estimated' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert row["out_tokens"] == 200
+    assert row["out_tokens"] < 4096, "the whole point: not the max_tokens cap"
+
+
+@pytest.mark.anyio
+async def test_a_cancelled_leg_is_capped_at_max_tokens(tmp_path):
+    """max_tokens is a ceiling the upstream could not have exceeded, however
+    fast the model's history says it is."""
+    ad = FakeAdapter(agree_script(), delays={"s": 3})
+    env, store = make_env(tmp_path, ad)
+    _seed_reported_history(store, env["clock"], "s", out_tokens=10000, latency_ms=100)
+    env["adapters"]["p"] = ClockAdvancingAdapter(
+        agree_script(), env["clock"], advance_by=60.0, delays={"s": 3})
+
+    await gather_panel(body=dict(BODY, max_tokens=64), **env)
+
+    row = store.conn.execute(
+        "SELECT out_tokens FROM ledger WHERE model='s' AND usage_source='estimated' "
+        "ORDER BY id DESC LIMIT 1").fetchone()
+    assert row["out_tokens"] == 64
+
+
+@pytest.mark.anyio
+async def test_a_cancelled_leg_falls_back_to_max_tokens_with_no_history(tmp_path):
+    """No reported call for this model yet -> no evidence -> keep the old
+    over-estimate. Over-estimating is the safe direction when nothing is
+    known; under-estimating would silently under-report real spend."""
+    ad = ClockAdvancingAdapter(agree_script(), FakeClock(), advance_by=4.0,
+                               delays={"s": 3})
+    env, store = make_env(tmp_path, ad)
+    ad._clock = env["clock"]
+
+    await gather_panel(body=dict(BODY, max_tokens=777), **env)
+
+    row = store.conn.execute(
+        "SELECT out_tokens FROM ledger WHERE model='s' AND usage_source='estimated' "
+        "ORDER BY id DESC LIMIT 1").fetchone()
+    assert row["out_tokens"] == 777

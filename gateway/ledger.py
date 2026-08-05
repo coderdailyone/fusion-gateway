@@ -117,6 +117,40 @@ class Ledger:
             ).fetchone()
         return int(row["in_tok"]), int(row["out_tok"])
 
+    def observed_out_rate(self, model: str, limit: int = 50) -> float | None:
+        """Output tokens per second this model has actually produced, or None.
+
+        Used to price a call that was cancelled in flight. The alternative --
+        charging the preflight estimate, which is `max_tokens` verbatim -- is
+        not a neutral guess but a near-certain over-estimate: it assumes a leg
+        we killed for being slow nonetheless ran all the way to the cap. On a
+        live quorum request that made the cancelled kimi leg 93% of the whole
+        request's cost, and it scaled with the CLIENT's max_tokens rather than
+        with anything the model did.
+
+        Only `reported` rows count. An estimated row is this function's own
+        output, and feeding it back in would let the estimator drift away from
+        the measurements it is supposed to be grounded in -- each cancellation
+        teaching the next one a number no upstream ever confirmed.
+
+        Median, not mean: one pathological call (a reasoning model that
+        thought for 40s and emitted 12 tokens) should not move the estimate
+        for every cancellation after it.
+        """
+        with self.store.lock:
+            rows = self.store.conn.execute(
+                "SELECT out_tokens, latency_ms FROM ledger "
+                "WHERE model = ? AND usage_source = 'reported' "
+                "  AND latency_ms > 0 AND out_tokens IS NOT NULL "
+                "ORDER BY id DESC LIMIT ?",
+                (model, limit),
+            ).fetchall()
+        rates = sorted(r["out_tokens"] / (r["latency_ms"] / 1000.0) for r in rows)
+        if not rates:
+            return None
+        mid = len(rates) // 2
+        return rates[mid] if len(rates) % 2 else (rates[mid - 1] + rates[mid]) / 2
+
     def status(self) -> dict:
         with self.store.lock:
             row = self._budget_row_locked()
