@@ -14,13 +14,26 @@ class ProviderError(Exception):
 
     kind is one of 'timeout', 'network', 'http'. status is set only for
     'http' (the upstream's non-2xx status code).
+
+    `body` carries the upstream's own error text, truncated. Without it a 400
+    is undebuggable: during the M4 fusion arm two of three panel members
+    failed 840 and 877 times with nothing recorded but the number 400, and the
+    run looked like a healthy fusion while it was really one model answering
+    alone. Reproducing the shapes we guessed at (tools, multi-turn tool
+    conversations, 50k-token contexts) took hours and found nothing, because
+    the one thing that would have said why was being thrown away.
     """
 
-    def __init__(self, provider: str, kind: str, status: Optional[int] = None):
+    MAX_BODY = 400
+
+    def __init__(self, provider: str, kind: str, status: Optional[int] = None,
+                 body: str | None = None):
         self.provider = provider
         self.kind = kind
         self.status = status
+        self.body = (body or "")[:self.MAX_BODY]
         detail = f" status={status}" if status is not None else ""
+        detail += f" body={self.body!r}" if self.body else ""
         super().__init__(f"provider={provider} kind={kind}{detail}")
 
 
@@ -59,7 +72,8 @@ class ProviderAdapter:
         except httpx.TransportError as e:
             raise ProviderError(self.cfg.name, "network") from e
         if not (200 <= resp.status_code < 300):
-            raise ProviderError(self.cfg.name, "http", status=resp.status_code)
+            raise ProviderError(self.cfg.name, "http", status=resp.status_code,
+                                body=resp.text)
         return resp.json()
 
     async def chat_stream(self, upstream_model: str, payload: dict) -> AsyncIterator[bytes]:
@@ -75,7 +89,8 @@ class ProviderAdapter:
             ) as resp:
                 if not (200 <= resp.status_code < 300):
                     await resp.aread()
-                    raise ProviderError(self.cfg.name, "http", status=resp.status_code)
+                    raise ProviderError(self.cfg.name, "http", status=resp.status_code,
+                                        body=resp.text)
                 async for chunk in resp.aiter_bytes():
                     yielded = True
                     yield chunk

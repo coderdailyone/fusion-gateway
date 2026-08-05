@@ -237,7 +237,11 @@ async def call_model(*, model_name, body, cfg, adapters, ledger, events, clock,
         return int((clock.now() - start).total_seconds() * 1000)
 
     try:
-        resp = await adapter.chat(model_cfg.upstream_model, body)
+        # Conform the body to THIS member's constraints. The panel is
+        # heterogeneous; one client body forwarded verbatim to every member is
+        # what silently reduced the M4 agentic panel to a single model.
+        resp = await adapter.chat(model_cfg.upstream_model,
+                                  model_cfg.apply_params(body))
     except asyncio.CancelledError:
         # The quorum agreed and this leg is no longer needed (or the request
         # is being torn down for some other reason). The upstream has already
@@ -271,9 +275,14 @@ async def call_model(*, model_name, body, cfg, adapters, ledger, events, clock,
         raise
     except ProviderError as exc:
         ledger.fail(entry_id)
+        # `body` is what makes an upstream rejection actionable. A run where
+        # two panel members 400 on every request looks identical, in the
+        # events, to a healthy one -- until you can read what the upstream
+        # actually objected to.
         events.append(request_id, "call.failed",
                       {"model": model_name, "stage": kind,
-                       "kind": exc.kind, "status": exc.status})
+                       "kind": exc.kind, "status": exc.status,
+                       "body": getattr(exc, "body", "")})
         return None
     except Exception:
         logger.exception("fusion %s call failed model=%s request_id=%s",
