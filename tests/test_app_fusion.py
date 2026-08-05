@@ -1605,3 +1605,77 @@ def test_streaming_an_undeclared_readonly_call_is_not_emitted_via_tool_fast(
     # `"fusion"` key at all, the streaming equivalent of `"fusion" not in
     # body` in the non-streaming twin.
     assert '"fusion"' not in raw
+
+
+# -- usage on the fusion path (2026-08-05) ---------------------------------
+# Until this milestone a fusion response carried NO `usage` at all, while the
+# single-model path reported it normally. Anything that prices a call by
+# reading resp.usage -- our own evaluator's budget gate included -- therefore
+# saw a fusion request cost zero, and no ceiling could ever trip.
+
+def test_non_streaming_fusion_reports_the_panel_total_not_the_fusers_leg(
+        tmp_path, monkeypatch):
+    """Every mock call reports 3 in / 4 out. The quorum path makes five of
+    them (2 candidates + 2 reviews + 1 fuser), so the honest total is 15/20.
+    Asserting the total rather than merely `"usage" in body` is the point:
+    reporting the fuser's own 3/4 would look plausible and be 5x too low."""
+    c = make_client(tmp_path, monkeypatch)
+    body = c.post("/v1/chat/completions", json=BODY, headers=H()).json()
+    assert body["usage"] == {"prompt_tokens": 15, "completion_tokens": 20,
+                             "total_tokens": 35}
+
+
+def test_single_model_usage_still_comes_from_the_upstream_verbatim(
+        tmp_path, monkeypatch):
+    """The ledger sum serves the fusion path only. A single-model response
+    must keep forwarding the upstream's own object, which carries provider
+    extras a sum could not reconstruct."""
+    c = make_client(tmp_path, monkeypatch)
+    body = c.post("/v1/chat/completions", json={**BODY, "model": "a"},
+                  headers=H()).json()
+    assert body["usage"] == {"prompt_tokens": 3, "completion_tokens": 4}
+
+
+def _frames(raw: bytes) -> list[dict]:
+    out = []
+    for line in raw.decode().splitlines():
+        line = line.strip()
+        if line.startswith("data:") and line[5:].strip() not in ("", "[DONE]"):
+            out.append(json.loads(line[5:]))
+    return out
+
+
+def test_streaming_fusion_does_not_relay_the_fusers_own_usage_frame(
+        tmp_path, monkeypatch):
+    """The mock fuser streams `{"choices":[],"usage":{...3/4...}}` because
+    chat_stream asks every upstream for one. Relaying it would tell the client
+    a five-call panel cost one call's worth."""
+    c = make_client(tmp_path, monkeypatch)
+    r = c.post("/v1/chat/completions", json={**BODY, "stream": True}, headers=H())
+    assert not [f for f in _frames(r.content) if f.get("usage")]
+    assert r.content.rstrip().endswith(b"data: [DONE]")
+
+
+def test_streaming_fusion_reports_the_panel_total_when_asked(tmp_path, monkeypatch):
+    c = make_client(tmp_path, monkeypatch)
+    r = c.post("/v1/chat/completions",
+               json={**BODY, "stream": True,
+                     "stream_options": {"include_usage": True}}, headers=H())
+    usage_frames = [f for f in _frames(r.content) if f.get("usage")]
+    assert len(usage_frames) == 1, "exactly one usage frame, and it is ours"
+    assert usage_frames[0]["usage"] == {"prompt_tokens": 15,
+                                        "completion_tokens": 20,
+                                        "total_tokens": 35}
+    assert usage_frames[0]["choices"] == []
+    # The frame must precede the terminator, or a client stops reading first.
+    assert r.content.index(b'"usage"') < r.content.index(b"[DONE]")
+
+
+def test_streaming_fusion_still_delivers_the_answer_through_the_filter(
+        tmp_path, monkeypatch):
+    """The filter rewrites the tail; it must not eat content."""
+    c = make_client(tmp_path, monkeypatch)
+    r = c.post("/v1/chat/completions", json={**BODY, "stream": True}, headers=H())
+    text = "".join(f["choices"][0]["delta"].get("content", "")
+                   for f in _frames(r.content) if f.get("choices"))
+    assert text == "FUSED ANSWER"

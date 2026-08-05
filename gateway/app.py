@@ -102,23 +102,116 @@ def _recover_orphans(store: Store, clock: Clock) -> None:
         store.conn.commit()
 
 
-def _as_chunks(text: str, model: str) -> list[bytes]:
+def _usage_body(ledger, request_id: str) -> dict:
+    """OpenAI-shaped usage for a fusion request: the panel's total.
+
+    The single-model path does NOT use this -- it forwards the upstream's own
+    usage object verbatim, which carries provider extras (cached_tokens,
+    reasoning_tokens) that a sum over our ledger cannot reconstruct. Only the
+    fusion path, which has no single upstream response to forward, is served
+    from the ledger.
+    """
+    in_tok, out_tok = ledger.usage_for_request(request_id)
+    return {"prompt_tokens": in_tok, "completion_tokens": out_tok,
+            "total_tokens": in_tok + out_tok}
+
+
+def _usage_chunk(model: str, usage: dict) -> bytes:
+    """The final SSE chunk carrying usage, per OpenAI's stream_options contract.
+
+    `choices` is empty on this chunk -- that is what marks it as the usage
+    frame rather than another delta, and it is why a client that never asked
+    for usage must not receive it: an empty choices array trips parsers that
+    index choices[0] unconditionally. Hence the include_usage gate at the
+    call site.
+    """
+    return f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4().hex}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model, 'choices': [], 'usage': usage})}\n\n".encode()
+
+
+def _wants_usage(body: dict) -> bool:
+    """Did the client ask for usage on the stream?
+
+    Unlike the non-streaming path -- where OpenAI always returns usage and so
+    do we -- a streaming response only carries it when asked. Mirroring that
+    exactly keeps us safe for clients that would choke on the empty-choices
+    frame, at the cost of a benchmark needing to pass the flag.
+    """
+    opts = body.get("stream_options")
+    return bool(isinstance(opts, dict) and opts.get("include_usage"))
+
+
+def _split_client_frames(buf: bytes, chunk: bytes) -> tuple[bytes, bytes]:
+    """(bytes to forward, leftover partial line) for one raw fuser chunk.
+
+    The fuser's bytes go to the client verbatim EXCEPT two kinds of frame the
+    gateway must own rather than relay:
+
+      * the upstream's own `usage` frame. `chat_stream` asks every upstream
+        for one (`stream_options.include_usage`) so the ledger can settle on
+        reported rather than estimated tokens -- but that frame counts the
+        FUSER ALONE. Relaying it tells the client a whole fusion request cost
+        one leg's worth: authoritative-looking and several times too low. The
+        gateway substitutes the panel total.
+      * `[DONE]`, because the stream must not end before that substitution is
+        written.
+
+    Frames are recognised line-wise and a chunk cut mid-line by the socket
+    leaves its remainder in the returned buffer, so a frame split across two
+    reads is never misparsed as a content frame. A frame carrying BOTH
+    content and usage is forwarded intact: dropping it would lose tokens the
+    client is owed, and the gateway's own later frame still wins under
+    `parse_stream_usage`'s last-one-wins rule.
+    """
+    buf += chunk
+    out = bytearray()
+    while b"\n" in buf:
+        line, buf = buf.split(b"\n", 1)
+        if not _is_gateway_owned(line):
+            out += line + b"\n"
+    return bytes(out), buf
+
+
+def _is_gateway_owned(line: bytes) -> bool:
+    """True for a `[DONE]` or usage-only frame -- the two the gateway rewrites."""
+    s = line.strip()
+    if not s.startswith(b"data:"):
+        return False
+    data = s[len(b"data:"):].strip()
+    if data == b"[DONE]":
+        return True
+    try:
+        obj = json.loads(data)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    # Usage-only: usage present AND no choices. The `choices` test is what
+    # keeps a merged content+usage frame (some providers emit one) forwarded.
+    return isinstance(obj, dict) and bool(obj.get("usage")) and not obj.get("choices")
+
+
+def _as_chunks(text: str, model: str, usage: dict | None = None) -> list[bytes]:
     """Render a plain answer as a minimal OpenAI chunk stream.
 
     Used when the fuser dies before its first byte and a candidate's answer is
     served instead: the client already opened a stream, so it must receive one.
+
+    `usage` is the panel total. A fallback answer still cost a whole panel --
+    the candidates ran, and on some rungs the reviews and a dead fuser's
+    preflight too -- so omitting it here would under-report exactly the
+    requests that spent the most and delivered the least.
     """
     chunk = {"id": f"chatcmpl-{uuid.uuid4().hex}", "object": "chat.completion.chunk",
              "created": int(time.time()), "model": model,
              "choices": [{"index": 0, "delta": {"content": text},
                           "finish_reason": None}]}
     done = dict(chunk, choices=[{"index": 0, "delta": {}, "finish_reason": "stop"}])
-    return [f"data: {json.dumps(chunk)}\n\n".encode(),
-            f"data: {json.dumps(done)}\n\n".encode(),
-            b"data: [DONE]\n\n"]
+    out = [f"data: {json.dumps(chunk)}\n\n".encode(),
+           f"data: {json.dumps(done)}\n\n".encode()]
+    if usage is not None:
+        out.append(_usage_chunk(model, usage))
+    return out + [b"data: [DONE]\n\n"]
 
 
-def _as_tool_chunks(candidate, model: str) -> list[bytes]:
+def _as_tool_chunks(candidate, model: str, usage: dict | None = None) -> list[bytes]:
     """Render a candidate's tool calls as a minimal OpenAI chunk stream.
 
     Candidates are non-streaming calls, so the complete call is already in hand
@@ -155,7 +248,10 @@ def _as_tool_chunks(candidate, model: str) -> list[bytes]:
                                     "finish_reason": None}]))
     out.append(dict(base, choices=[{"index": 0, "delta": {},
                                     "finish_reason": "tool_calls"}]))
-    return [f"data: {json.dumps(o)}\n\n".encode() for o in out] + [b"data: [DONE]\n\n"]
+    frames = [f"data: {json.dumps(o)}\n\n".encode() for o in out]
+    if usage is not None:
+        frames.append(_usage_chunk(model, usage))
+    return frames + [b"data: [DONE]\n\n"]
 
 
 def create_app_from_env() -> FastAPI:
@@ -324,8 +420,14 @@ def create_app(
                     "unreviewed_write_call": unreviewed_write_call}
             events.append(request_id, "fusion.fused",
                           {"fuser": fcfg.fuser, "path": panel.path, "source": source})
-            return JSONResponse(content=openai_response(text, fcfg.model, meta),
-                                headers={"x-fusion-trace-id": request_id})
+            # Summed AFTER every call has settled -- gather_panel's try/finally
+            # guarantees no panel task is still running when it returns, and
+            # the fuser's own call completed inside _finish_fusion above, so
+            # every row this request will ever create already exists.
+            return JSONResponse(
+                content=openai_response(text, fcfg.model, meta,
+                                        _usage_body(ledger, request_id)),
+                headers={"x-fusion-trace-id": request_id})
 
         async def gen():
             # Stages 1-2 produce nothing visible and can take tens of seconds.
@@ -415,8 +517,10 @@ def create_app(
                 # call) -- the `_as_chunks` branch below is unreachable for
                 # those paths and only ever fires for a genuine
                 # single-candidate PROSE fallback.
-                for piece in (_as_tool_chunks(fallback[1], fcfg.model) if fallback[1].tool_calls
-                              else _as_chunks(fallback[1].text, fcfg.model)):
+                _u = _usage_body(ledger, request_id) if _wants_usage(body) else None
+                for piece in (_as_tool_chunks(fallback[1], fcfg.model, _u)
+                              if fallback[1].tool_calls
+                              else _as_chunks(fallback[1].text, fcfg.model, _u)):
                     yield piece
                 return
 
@@ -456,8 +560,10 @@ def create_app(
                 events.append(request_id, "fusion.fused",
                               {"fuser": fcfg.fuser, "path": panel.path, "source": source})
                 _finish_request(store, request_id, "succeeded", clock)
-                for piece in (_as_tool_chunks(candidate, fcfg.model) if candidate.tool_calls
-                              else _as_chunks(candidate.text, fcfg.model)):
+                _u = _usage_body(ledger, request_id) if _wants_usage(body) else None
+                for piece in (_as_tool_chunks(candidate, fcfg.model, _u)
+                              if candidate.tool_calls
+                              else _as_chunks(candidate.text, fcfg.model, _u)):
                     yield piece
                 return
 
@@ -525,11 +631,18 @@ def create_app(
                               {"rung": "fuser_failed", "model": fallback[0]})
                 _flag_undeclared_call(fcfg, panel, declared, request_id)
                 _finish_request(store, request_id, "succeeded", clock)
-                pieces = (_as_tool_chunks(fallback[1], fcfg.model)
+                _u = _usage_body(ledger, request_id) if _wants_usage(body) else None
+                pieces = (_as_tool_chunks(fallback[1], fcfg.model, _u)
                           if fallback[1].tool_calls
-                          else _as_chunks(fallback[1].text, fcfg.model))
+                          else _as_chunks(fallback[1].text, fcfg.model, _u))
                 for piece in pieces:
                     yield piece
+
+            # Holds a line the socket cut in half, so a frame split across two
+            # reads is reassembled before being classified. Never yielded
+            # as-is: an error exit deliberately drops it rather than sending
+            # the client half a frame.
+            frame_buf = b""
 
             try:
                 try:
@@ -555,8 +668,16 @@ def create_app(
                         except StopAsyncIteration:
                             break
                         first_byte = True
+                        # `accumulated` must keep the RAW bytes: parse_stream_usage
+                        # reads it to settle the fuser's own ledger row on
+                        # reported tokens, and that is exactly the frame the
+                        # client-facing filter drops. Filtering before this
+                        # would silently downgrade every fuser row to
+                        # "estimated".
                         accumulated.extend(chunk)
-                        yield chunk
+                        forward, frame_buf = _split_client_frames(frame_buf, chunk)
+                        if forward:
+                            yield forward
                         deadline = time.monotonic() + fcfg.stage_timeout_s
                 except Exception:
                     if not first_byte:
@@ -606,6 +727,18 @@ def create_app(
                 events.append(request_id, "fusion.fused",
                               {"fuser": fcfg.fuser, "path": panel.path, "source": "fuser"})
                 _finish_request(store, request_id, "succeeded", clock)
+                # A frame the upstream left unterminated is real content the
+                # client is owed; only gateway-owned frames may be dropped.
+                if frame_buf.strip() and not _is_gateway_owned(frame_buf):
+                    yield frame_buf if frame_buf.endswith(b"\n") else frame_buf + b"\n\n"
+                # The gateway's own tail. `_split_client_frames` withheld the
+                # upstream's [DONE] precisely so this could be written first,
+                # and it runs only now, after `ledger.settle` above -- summing
+                # any earlier would omit the fuser's own tokens, the leg that
+                # just produced the answer.
+                if _wants_usage(body):
+                    yield _usage_chunk(fcfg.model, _usage_body(ledger, request_id))
+                yield b"data: [DONE]\n\n"
             finally:
                 if not resolved:
                     # Reached only via a client disconnect / server shutdown:

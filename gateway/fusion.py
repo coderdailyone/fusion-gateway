@@ -241,11 +241,30 @@ async def call_model(*, model_name, body, cfg, adapters, ledger, events, clock,
     except asyncio.CancelledError:
         # The quorum agreed and this leg is no longer needed (or the request
         # is being torn down for some other reason). The upstream has already
-        # done work and may bill for it, so settle with the preflight
-        # estimate: fail() would post $0 and under-count real spend, and
-        # leaving the row in 'preflight' would hold a CONSUMING_STATE that
-        # only a restart clears.
-        ledger.settle(entry_id, est_in, est_out, "estimated", _latency(),
+        # done work and may bill for it, so settle rather than fail(): fail()
+        # would post $0 and under-count real spend, and leaving the row in
+        # 'preflight' would hold a CONSUMING_STATE that only a restart clears.
+        #
+        # What it settles FOR used to be `est_out`, i.e. the client's
+        # max_tokens verbatim -- the assumption that a leg we killed for being
+        # slow had nonetheless run all the way to the cap. Measured on a live
+        # quorum request, that made the cancelled kimi leg 93% of the entire
+        # request's cost and scaled with the client's max_tokens rather than
+        # with anything the model did. The panel's own reported history is a
+        # far better prior: how fast this model actually emits, times how long
+        # this call actually ran.
+        #
+        # Capped at est_out because max_tokens is a hard ceiling the upstream
+        # could not have exceeded, and floored at 0 for a clock that jumped
+        # backwards. With no reported history yet the old behaviour stands --
+        # an over-estimate is the safe direction when there is no evidence.
+        rate = ledger.observed_out_rate(model_name)
+        if rate is None:
+            cancelled_out = est_out
+        else:
+            elapsed_s = max((clock.now() - start).total_seconds(), 0.0)
+            cancelled_out = min(est_out, int(rate * elapsed_s))
+        ledger.settle(entry_id, est_in, cancelled_out, "estimated", _latency(),
                       model_cfg.in_usd_per_mtok, model_cfg.out_usd_per_mtok)
         events.append(request_id, "fusion.candidate",
                       {"model": model_name, "status": "cancelled"})
@@ -870,8 +889,18 @@ def undeclared_call_blocked(fcfg, panel: PanelResult, declared: frozenset[str]) 
     return filtered is None or filtered[0] != unfiltered[0]
 
 
-def openai_response(candidate: Candidate, model: str, meta: dict) -> dict:
+def openai_response(candidate: Candidate, model: str, meta: dict,
+                    usage: dict | None = None) -> dict:
     """The client-facing JSON response for a fused (or fallback) answer.
+
+    `usage` is the panel's TOTAL across every upstream call, not the final
+    leg's. It was absent entirely until 2026-08-05, which made a fusion
+    request's cost invisible to the client while the single-model path
+    reported it normally -- and silently zeroed the budget gate of anything
+    that prices a call by reading `resp.usage`, our own evaluator included.
+    Optional rather than required only so the callers that build a response
+    without a ledger (tests, and any future caller with nothing to sum) stay
+    valid; every live path passes it.
 
     `candidate` must be a `Candidate` -- both sources that reach here now
     agree on that shape: `best_candidate`'s fallback always was one, and as
@@ -899,7 +928,7 @@ def openai_response(candidate: Candidate, model: str, meta: dict) -> dict:
     else:
         message["content"] = candidate.text
         finish = "stop"
-    return {
+    resp = {
         "id": f"chatcmpl-{uuid.uuid4().hex}",
         "object": "chat.completion",
         "created": int(time.time()),
@@ -907,3 +936,6 @@ def openai_response(candidate: Candidate, model: str, meta: dict) -> dict:
         "choices": [{"index": 0, "message": message, "finish_reason": finish}],
         "fusion": meta,
     }
+    if usage is not None:
+        resp["usage"] = usage
+    return resp
