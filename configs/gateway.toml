@@ -36,11 +36,14 @@ upstream_model = "deepseek-v4-flash"
 #     400 The `reasoning_content` in the thinking mode must be passed back
 # The gateway cannot satisfy that. The assistant turn a client sends back is
 # the FUSED answer -- it belongs to no single panel member and carries no
-# member's reasoning. So from turn two onward this member 400'd on every
-# request: 840 of 882 on the M4 agentic run. Turning thinking off is what
-# makes deepseek usable as a panel member in multi-turn work at all; verified
-# to return 200 with no reasoning_content.
-param_overrides = { thinking = { type = "disabled" } }
+# member's reasoning.
+#
+# So thinking is switched off ONLY for a conversation that already has an
+# assistant turn. A first turn has no next turn to fail on, and disabling
+# thinking there would weaken this candidate on every single-turn request for
+# nothing -- a quality regression bought with no compatibility in return. The
+# fix is narrowed to exactly the shape that breaks.
+param_overrides_multi_turn = { thinking = { type = "disabled" } }
 in_usd_per_mtok = 0.14   # verified 2026-07-14 (deepseek-v4-flash non-thinking); deepseek-chat alias deprecates 2026-07-24
 out_usd_per_mtok = 0.28
 fallback = ["glm-4.5-flash"]

@@ -108,5 +108,88 @@ def test_the_shipped_config_pins_the_two_measured_constraints():
     of every multi-turn conversation, and the gateway still reports success."""
     cfg = load_config("configs/gateway.toml")
     assert cfg.models["kimi-k3"].param_overrides == {"temperature": 1, "top_p": 0.95}
-    assert cfg.models["deepseek-chat"].param_overrides == {
+    assert cfg.models["deepseek-chat"].param_overrides_multi_turn == {
         "thinking": {"type": "disabled"}}
+
+
+# -- constraints that only apply to a continued conversation ----------------
+# A fix should be as narrow as the problem it solves. deepseek's thinking mode
+# only breaks when the request already carries an assistant turn; disabling it
+# on first turns too weakened the candidate on every single-turn request and
+# bought no compatibility in return.
+
+MT = dict(BASE, param_overrides_multi_turn={"thinking": {"type": "disabled"}})
+FIRST_TURN = {"messages": [{"role": "system", "content": "s"},
+                           {"role": "user", "content": "hi"}]}
+CONTINUED = {"messages": [{"role": "user", "content": "hi"},
+                          {"role": "assistant", "content": "hello"},
+                          {"role": "user", "content": "more"}]}
+
+
+def test_a_first_turn_keeps_the_models_default_behaviour():
+    """system + user is still a first turn. Nothing is overridden."""
+    assert ModelCfg(**MT).apply_params(FIRST_TURN) == FIRST_TURN
+
+
+def test_a_continued_conversation_gets_the_constraint():
+    out = ModelCfg(**MT).apply_params(CONTINUED)
+    assert out["thinking"] == {"type": "disabled"}
+
+
+def test_an_assistant_turn_carrying_only_tool_calls_still_counts():
+    """The agent case: content is null and the turn is a tool call. It is
+    still an assistant turn, and still the thing the provider demands state
+    for -- this is the exact shape that produced the 400s."""
+    body = {"messages": [
+        {"role": "user", "content": "list files"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "1"}]},
+        {"role": "tool", "tool_call_id": "1", "content": "a.py"},
+    ]}
+    assert ModelCfg(**MT).apply_params(body)["thinking"] == {"type": "disabled"}
+
+
+def test_unconditional_overrides_still_apply_on_a_first_turn():
+    cfg = ModelCfg(**dict(BASE, param_overrides={"temperature": 1},
+                          param_overrides_multi_turn={"thinking": {"type": "disabled"}}))
+    out = cfg.apply_params(FIRST_TURN)
+    assert out["temperature"] == 1 and "thinking" not in out
+
+
+def test_a_malformed_body_never_raises_here():
+    """Deciding a request's parameters must not be what raises on a bad body;
+    the request's own validation is where that belongs."""
+    cfg = ModelCfg(**MT)
+    for bad in ({}, {"messages": None}, {"messages": ["nonsense"]}):
+        cfg.apply_params(bad)
+
+
+def test_config_parses_the_multi_turn_table(tmp_path):
+    p = tmp_path / "g.toml"
+    p.write_text('''
+[budget]
+active = "T"
+[budgets.T]
+[providers.p]
+base_url = "https://x.invalid"
+api_key_env = "K"
+[models."a"]
+provider = "p"
+upstream_model = "a"
+in_usd_per_mtok = 1.0
+out_usd_per_mtok = 1.0
+param_overrides_multi_turn = { thinking = { type = "disabled" } }
+[policy]
+version = "v"
+default_model = "a"
+''')
+    m = load_config(p).models["a"]
+    assert m.param_overrides_multi_turn == {"thinking": {"type": "disabled"}}
+    assert "thinking" not in m.apply_params(FIRST_TURN)
+    assert m.apply_params(CONTINUED)["thinking"] == {"type": "disabled"}
+
+
+def test_the_shipped_config_only_disables_thinking_on_continued_turns():
+    cfg = load_config("configs/gateway.toml")
+    ds = cfg.models["deepseek-chat"]
+    assert ds.param_overrides == {}, "nothing should be forced unconditionally"
+    assert ds.param_overrides_multi_turn == {"thinking": {"type": "disabled"}}
