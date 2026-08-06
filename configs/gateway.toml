@@ -74,7 +74,13 @@ provider = "kimi"
 # the gateway forwarded it verbatim to every panel member -- so kimi 400'd on
 # 877 of 881 candidate calls. Forced rather than dropped because the upstream
 # names the legal value, so there is no need to guess its default.
-param_overrides = { temperature = 1 }
+# `top_p` is a second constraint of the same kind, and it only surfaced once
+# the temperature one was fixed -- the first rejection masked it:
+#     400 invalid top_p: only 0.95 is allowed for this model
+# Worth noting for any model added to the panel later: an upstream reports one
+# rejected parameter at a time, so a clean run is the only proof there are no
+# more.
+param_overrides = { temperature = 1, top_p = 0.95 }
 # The model id on this endpoint is literally "k3", not "kimi-k3".
 upstream_model = "k3"
 # Prices mirror configs/pricing.toml, still unverified against Moonshot's

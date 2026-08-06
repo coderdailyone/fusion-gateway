@@ -107,6 +107,6 @@ def test_the_shipped_config_pins_the_two_measured_constraints():
     """These are not cosmetic: without them two of three panel members drop out
     of every multi-turn conversation, and the gateway still reports success."""
     cfg = load_config("configs/gateway.toml")
-    assert cfg.models["kimi-k3"].param_overrides == {"temperature": 1}
+    assert cfg.models["kimi-k3"].param_overrides == {"temperature": 1, "top_p": 0.95}
     assert cfg.models["deepseek-chat"].param_overrides == {
         "thinking": {"type": "disabled"}}
