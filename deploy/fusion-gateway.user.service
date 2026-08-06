@@ -1,0 +1,40 @@
+# User-level unit, for a host where you have no root.
+#
+# The system unit (fusion-gateway.service) needs /etc/systemd/system and a
+# root-owned WorkingDirectory. On a shared box you often have neither -- which
+# is how the gateway ends up started by hand with `nohup ... &`, and that is
+# what makes a stale process possible: nothing owns the service, so nothing
+# stops the old one, `restart` is whatever you type that day, and a pattern
+# kill that misses leaves the port bound with the previous build still serving.
+#
+# Install (as the ordinary user, no sudo):
+#     mkdir -p ~/.config/systemd/user
+#     cp deploy/fusion-gateway.user.service ~/.config/systemd/user/fusion-gateway.service
+#     systemctl --user daemon-reload
+#     systemctl --user enable --now fusion-gateway
+#
+# Then restart is a single unambiguous command that cannot miss the process:
+#     systemctl --user restart fusion-gateway
+#     systemctl --user status  fusion-gateway
+#     journalctl --user -u fusion-gateway -n 50
+#
+# Survive logout (otherwise the unit dies when your last session closes; this
+# needs root ONCE, or ask an admin):
+#     sudo loginctl enable-linger $USER
+#
+# %h is the user's home. Adjust if the checkout lives elsewhere.
+
+[Unit]
+Description=Fusion Gateway (user-level)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/fusion-gateway
+EnvironmentFile=%h/fusion-gateway/.env
+ExecStart=%h/fusion-gateway/.venv/bin/uvicorn --host 127.0.0.1 --port 8800 --factory gateway.app:create_app_from_env
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
