@@ -65,6 +65,37 @@ echo "→ installing systemd unit + restarting"
 scp deploy/fusion-gateway.service "${HOST}:/etc/systemd/system/${UNIT}.service"
 ssh "${HOST}" "systemctl daemon-reload && systemctl enable --now ${UNIT} && systemctl restart ${UNIT}"
 
-echo "→ health check"
-ssh "${HOST}" "sleep 1 && curl -fsS http://127.0.0.1:8800/healthz && echo"
+echo "→ verifying the NEW code is the code answering"
+# A green /healthz proves something is listening, not that it is what you just
+# shipped. A gateway process can outlive a deploy -- if the restart silently
+# fails, the port stays bound and the old process keeps serving, indefinitely,
+# with every health check passing. That is not hypothetical: on 2026-08-05 a
+# process served for hours after the code and config beneath it had been
+# replaced twice, because the restart's pattern kill never matched its cmdline.
+#
+# /healthz reports the sha256 of the config AS LOADED. Comparing it against the
+# file we just shipped is the difference between "a gateway is up" and "MY
+# gateway is up".
+want=$(sha256sum configs/gateway.toml | cut -c1-12)
+got=$(ssh "${HOST}" "sleep 2 && curl -fsS --max-time 10 http://127.0.0.1:8800/healthz" \
+        | sed -n 's/.*"config_sha":"\([^"]*\)".*/\1/p')
+if [ -z "${got}" ]; then
+  echo "✗ /healthz did not answer, or is too old to report config_sha." >&2
+  echo "  An older gateway may still be bound to 8800. On the host:" >&2
+  echo "    ss -ltnp | grep :8800     # take the pid from the SOCKET, not a pattern" >&2
+  exit 1
+fi
+if [ "${want}" != "${got}" ]; then
+  echo "✗ the gateway is serving a DIFFERENT config than the one just deployed." >&2
+  echo "    shipped: ${want}" >&2
+  echo "    serving: ${got}" >&2
+  echo "  The restart did not take. The old process is still bound to 8800." >&2
+  exit 1
+fi
+echo "  config_sha ${got} — matches what was shipped"
+
+echo "→ smoke (a missing provider key fails LAZILY; /healthz cannot see it)"
+echo "  run: GATEWAY_URL=http://127.0.0.1:8800 GATEWAY_TOKEN=<tok> python scripts/smoke.py"
+echo "  and, if a fusion panel is configured:"
+echo "       python scripts/panel_health.py http://127.0.0.1:8800 <admin-tok>"
 echo "✓ deploy complete"
