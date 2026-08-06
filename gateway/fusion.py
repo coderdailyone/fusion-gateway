@@ -344,6 +344,46 @@ def _merge_reviews(base: dict[str, dict[str, Verdict]],
     return merged
 
 
+def substantively_agree(candidates: dict[str, Candidate]) -> bool:
+    """True when every candidate says the SAME THING, not merely an acceptable
+    thing.
+
+    This is the condition under which cancelling the slow leg is provably
+    lossless. M5's fusion prompt tells the fuser to COPY the majority answer,
+    and that rule fires on identical text -- so when the awaited candidates
+    already agree verbatim, no third candidate can change what the fuser
+    would emit, and waiting for one buys nothing.
+
+    Mutual `correct` verdicts do NOT imply this. Two DIFFERING answers can
+    each be judged correct by the other; the majority-copy rule then never
+    fires and the fuser takes its "resolve the objections" branch instead --
+    a branch a third answer genuinely could have swung. Cancelling on the
+    verdicts alone therefore discarded the slow leg in exactly the cases
+    where it was worth having, which is why kimi-k3 never reached the fuser
+    in practice while still being billed for having started.
+
+    Comparison is `.strip()`ed rather than byte-exact: two answers differing
+    only in trailing whitespace are the same answer under any reading of the
+    copy rule, and treating them as different would send the request down the
+    slow path for nothing. Tool calls compare canonically via
+    `canonical_calls`, which already defines equality for them -- and a
+    `None` canon (unparseable arguments) never matches anything, including
+    another None, so an unusable call always falls through to the slow path.
+    """
+    values = list(candidates.values())
+    if len(values) < 2:
+        return False
+    first = values[0]
+    if any(bool(c.tool_calls) != bool(first.tool_calls) for c in values):
+        return False        # prose vs tool call is not agreement
+    if first.tool_calls:
+        canon = canonical_calls(first.tool_calls)
+        if canon is None:
+            return False
+        return all(canonical_calls(c.tool_calls) == canon for c in values[1:])
+    return all(c.text.strip() == first.text.strip() for c in values[1:])
+
+
 def is_consensus(candidates: dict[str, Candidate],
                  reviews: dict[str, dict[str, Verdict]]) -> bool:
     """True only when every candidate was reviewed `correct` by every other.
@@ -788,9 +828,22 @@ async def gather_panel(*, fcfg, cfg, adapters, ledger, events, clock,
                 candidates=candidates, fcfg=fcfg, cfg=cfg, adapters=adapters,
                 ledger=ledger, events=events, clock=clock, request_id=request_id,
                 conversation=conversation))
-        agreed = is_consensus(candidates, reviews)
+        # Two conditions, and the second one is what makes cancelling the slow
+        # leg honest. `is_consensus` reads verdicts; `substantively_agree`
+        # reads the answers. Only when BOTH hold is the slow leg provably
+        # unable to change the outcome -- the fuser's majority-copy rule would
+        # emit this exact text regardless. On verdicts alone the panel
+        # short-circuited through the differing-answers case too, which is
+        # precisely the case a third answer could have swung, so the slow
+        # member was discarded exactly when it was worth having (and billed
+        # for having started).
+        reviewed_ok = is_consensus(candidates, reviews)
+        same_answer = substantively_agree(candidates)
+        agreed = reviewed_ok and same_answer
         events.append(request_id, "fusion.consensus",
-                      {"agreed": agreed, "candidates": sorted(candidates)})
+                      {"agreed": agreed, "reviewed_ok": reviewed_ok,
+                       "same_answer": same_answer,
+                       "candidates": sorted(candidates)})
 
         if agreed:
             return PanelResult(conversation, candidates, reviews, "quorum",
