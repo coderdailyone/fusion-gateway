@@ -9,6 +9,7 @@ from gateway.fusion_prompts import Verdict, build_review_prompt, render_conversa
 from gateway.fusion import (
     Candidate, PanelResult, gather_panel, is_consensus, fuser_body,
     best_candidate, openai_response, call_model, _extract_text,
+    substantively_agree,
 )
 from gateway.providers import ProviderError
 from tests.helpers import FakeClock
@@ -883,3 +884,101 @@ async def test_a_cancelled_leg_falls_back_to_max_tokens_with_no_history(tmp_path
         "SELECT out_tokens FROM ledger WHERE model='s' AND usage_source='estimated' "
         "ORDER BY id DESC LIMIT 1").fetchone()
     assert row["out_tokens"] == 777
+
+
+# -- the slow leg is cancelled only when it provably cannot matter ----------
+# `is_consensus` reads verdicts. Two DIFFERING answers can each be judged
+# correct by the other, and the panel used to short-circuit on that -- throwing
+# away the slow member in exactly the case a third answer could have swung,
+# while still billing for having started it.
+
+def _cand(text):
+    return {"a": Candidate(text), "b": Candidate(text)}
+
+
+def test_substantively_agree_on_identical_prose():
+    assert substantively_agree(_cand("4"))
+
+
+def test_substantively_agree_ignores_surrounding_whitespace():
+    """Two answers differing only in trailing whitespace are the same answer
+    under any reading of the copy rule; treating them as different would take
+    the slow path for nothing."""
+    assert substantively_agree({"a": Candidate("4\n"), "b": Candidate("  4  ")})
+
+
+def test_substantively_agree_is_false_for_different_answers():
+    assert not substantively_agree({"a": Candidate("4"), "b": Candidate("four")})
+
+
+def test_substantively_agree_needs_at_least_two_candidates():
+    assert not substantively_agree({"a": Candidate("4")})
+
+
+def test_prose_and_a_tool_call_are_not_agreement():
+    """The texts must be EQUAL here, or this passes for the wrong reason: with
+    differing text the prose branch rejects it anyway and the shape guard is
+    never exercised. Same prose, one carrying a call, is the case that needs
+    the guard -- serving it as agreement would emit a candidate that answers
+    while another wanted to act."""
+    call = ({"id": "1", "type": "function",
+             "function": {"name": "read", "arguments": '{"p":"x"}'}},)
+    assert not substantively_agree({"a": Candidate("ok"),
+                                    "b": Candidate("ok", call)})
+
+
+def test_substantively_agree_compares_tool_calls_canonically():
+    """Same call, key order differing -- canonical_calls already defines this
+    equality, so the panel must use it rather than comparing raw strings."""
+    a = ({"id": "1", "type": "function",
+          "function": {"name": "read", "arguments": '{"p":"x","n":1}'}},)
+    b = ({"id": "2", "type": "function",
+          "function": {"name": "read", "arguments": '{"n":1,"p":"x"}'}},)
+    assert substantively_agree({"a": Candidate("", a), "b": Candidate("", b)})
+
+
+def test_an_unparseable_tool_call_never_agrees_with_itself():
+    """canonical_calls returns None for unusable arguments, and None matches
+    nothing -- so an unusable call always falls through to the slow path."""
+    bad = ({"id": "1", "type": "function",
+            "function": {"name": "read", "arguments": "{not json"}},)
+    assert not substantively_agree({"a": Candidate("", bad), "b": Candidate("", bad)})
+
+
+@pytest.mark.anyio
+async def test_quorum_members_that_differ_still_wait_for_the_slow_leg(tmp_path):
+    """Both quorum members answer differently, and each reviews the OTHER as
+    correct. The old rule short-circuited here; the slow leg must now be
+    awaited, because the fuser's majority-copy rule cannot fire on differing
+    text and a third answer can genuinely change the outcome."""
+    def script(payload):
+        prompt = payload["messages"][0]["content"]
+        if "VERDICT" in prompt:
+            targets = [n for n in ("a", "b", "s") if f"Candidate {n}" in prompt]
+            return "\n".join(f"VERDICT {t} correct fine" for t in targets)
+        return None       # per-model text supplied below
+
+    ad = FakeAdapter({"a": lambda p: "VERDICT a correct fine\nVERDICT b correct fine\nVERDICT s correct fine"
+                      if "VERDICT" in p["messages"][0]["content"] else "answer from a",
+                      "b": lambda p: "VERDICT a correct fine\nVERDICT b correct fine\nVERDICT s correct fine"
+                      if "VERDICT" in p["messages"][0]["content"] else "answer from b",
+                      "s": lambda p: "VERDICT a correct fine\nVERDICT b correct fine\nVERDICT s correct fine"
+                      if "VERDICT" in p["messages"][0]["content"] else "answer from s"},
+                     delays={"s": 0.05})
+    env, store = make_env(tmp_path, ad)
+    panel = await gather_panel(body=BODY, **env)
+
+    assert panel.path == "full", "differing answers must not short-circuit"
+    assert "s" in panel.candidates, "the slow leg must reach the fuser"
+
+
+@pytest.mark.anyio
+async def test_identical_quorum_answers_still_short_circuit(tmp_path):
+    """The saving is kept where it is provably free: the awaited members agree
+    verbatim, so the fuser would copy this text no matter what the slow leg
+    said."""
+    ad = FakeAdapter(agree_script(), delays={"s": 3})
+    env, store = make_env(tmp_path, ad)
+    panel = await gather_panel(body=BODY, **env)
+    assert panel.path == "quorum"
+    assert set(panel.candidates) == {"a", "b"}
