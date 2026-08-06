@@ -8,6 +8,21 @@ except ModuleNotFoundError:  # py3.10
 
 class ConfigError(Exception): pass
 
+
+def _has_assistant_turn(body: dict) -> bool:
+    """Is this a continuation rather than the start of a conversation?
+
+    The test is the presence of an assistant turn, not a message count: a
+    system + user pair is still a first turn, and it is the assistant turn --
+    the one a provider may demand extra state for -- that makes a request a
+    continuation. Tolerant of a malformed body, because deciding a request's
+    parameters must never be what raises on one.
+    """
+    msgs = body.get("messages")
+    if not isinstance(msgs, list):
+        return False
+    return any(isinstance(m, dict) and m.get("role") == "assistant" for m in msgs)
+
 @dataclass(frozen=True)
 class ProviderCfg:
     name: str; base_url: str; api_key_env: str; wire: str = "openai"
@@ -34,6 +49,20 @@ class ModelCfg:
     # dropping where the parameter simply must not appear.
     param_overrides: dict = field(default_factory=dict)
     drop_params: tuple[str, ...] = ()
+    # Applied ONLY when the request already carries an assistant turn, i.e.
+    # when the model is being asked to continue a conversation rather than
+    # start one. Some constraints exist only in that case, and applying them
+    # to every request pays their cost for nothing.
+    #
+    # deepseek-v4-flash is the motivating example. It answers in thinking mode
+    # by default, and a thinking-mode reply must have its `reasoning_content`
+    # handed back on the NEXT turn -- which a fusion gateway cannot do, since
+    # the assistant turn a client sends back is the FUSED answer and belongs
+    # to no single member. Switching thinking off is the only way to use it in
+    # multi-turn work. But a request with no prior assistant turn has no next
+    # turn to fail on, so switching thinking off there weakens the candidate
+    # for no reason at all.
+    param_overrides_multi_turn: dict = field(default_factory=dict)
 
     def apply_params(self, body: dict) -> dict:
         """Return `body` conformed to this model's constraints.
@@ -42,12 +71,16 @@ class ModelCfg:
         mutating it would let the first member's constraints leak into the
         second's request.
         """
-        if not self.param_overrides and not self.drop_params:
+        extra = (self.param_overrides_multi_turn
+                 if self.param_overrides_multi_turn and _has_assistant_turn(body)
+                 else {})
+        if not self.param_overrides and not self.drop_params and not extra:
             return body
         out = dict(body)
         for k in self.drop_params:
             out.pop(k, None)
         out.update(self.param_overrides)
+        out.update(extra)
         return out
 
 @dataclass(frozen=True)
@@ -84,7 +117,8 @@ def load_config(path: Path) -> Config:
                              float(m["in_usd_per_mtok"]), float(m["out_usd_per_mtok"]),
                              tuple(m.get("fallback", [])),
                              dict(m.get("param_overrides", {})),
-                             tuple(m.get("drop_params", [])))
+                             tuple(m.get("drop_params", [])),
+                             dict(m.get("param_overrides_multi_turn", {})))
     for n, m in models.items():
         for f in m.fallback:
             if f not in models:
