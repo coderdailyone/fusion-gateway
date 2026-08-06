@@ -18,12 +18,27 @@ def build_agent_config(model_name: str, registry: dict) -> dict:
 
 
 def run(instance, model_name: str, registry: dict, work_dir, box):
-    """Run SWE-agent on `instance` with `model_name` inside its container.
+    """Not implemented in-process. The rig in `scripts/agentic/` does this job.
 
-    Implemented in Phase B (Task 9): starts the instance's Docker container on
-    `box`, runs SWE-agent (config from build_agent_config) against the repo at
-    instance.base_commit, captures the final `git diff` patch + trajectory +
-    summed LiteLLM cost + step count, and returns an AgenticAttempt. On any
-    failure returns status="error"/"timeout" with an empty patch.
+    This was specified as "Phase B" and never built, because SWE-agent's own
+    `run-batch` already does all of it -- container lifecycle, the agent loop,
+    trajectory and patch capture, per-instance cost limits and concurrency --
+    and reimplementing that in-process would be a second, worse copy that
+    drifts from the harness the official grader expects.
+
+    What actually runs an arm is `scripts/agentic/run_model.sh` (a model
+    directly) or `run_fusion.sh` (a gateway pseudo-model), each writing
+    per-instance `.pred`/`.traj` files that `build_cascade.py` /
+    `build_fusion_preds.py` turn into prediction files for the official
+    harness. `scripts/agentic/README.md` documents the host requirements and
+    the four environment traps that make an arm fail silently.
+
+    `build_agent_config` above is still the mapping those scripts implement,
+    and stays here because it is pure and worth testing. Anything that calls
+    `run()` expecting an in-process execution is looking in the wrong place --
+    hence a raise rather than a stub that returns something plausible.
     """
-    raise NotImplementedError("run() is wired on the Docker box in Task 9")
+    raise NotImplementedError(
+        "agentic execution lives in scripts/agentic/ (run_model.sh / "
+        "run_fusion.sh), not in-process -- see scripts/agentic/README.md"
+    )

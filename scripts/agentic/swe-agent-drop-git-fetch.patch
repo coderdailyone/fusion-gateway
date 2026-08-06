@@ -1,0 +1,16 @@
+diff --git a/sweagent/environment/repo.py b/sweagent/environment/repo.py
+index 655db8d..9b1e7bd 100644
+--- a/sweagent/environment/repo.py
++++ b/sweagent/environment/repo.py
+@@ -30,7 +30,10 @@ class Repo(Protocol):
+ 
+ def _get_git_reset_commands(base_commit: str) -> list[str]:
+     return [
+-        "git fetch",
++        # "git fetch" removed: the base commit is already present in every
++        # SWE-bench-Live image (verified with --network none), so the fetch
++        # only adds a network dependency -- and on this host that dependency
++        # is intermittent enough to kill most instances before the agent runs.
+         "git status",
+         "git restore .",
+         "git reset --hard",
