@@ -123,4 +123,10 @@ def test_create_app_from_env_reads_overrides(tmp_path, monkeypatch):
     monkeypatch.setenv("GATEWAY_DB", str(tmp_path / "g.sqlite"))
     app = app_module.create_app_from_env()
     client = TestClient(app)
-    assert client.get("/healthz").json() == {"ok": True}
+    # This test is about the env overrides being honoured, not about the shape
+    # of the health body -- /healthz also reports which config is loaded (see
+    # test_admin_panel.py), so pinning the whole dict here would make every
+    # future field an unrelated failure.
+    body = client.get("/healthz").json()
+    assert body["ok"] is True
+    assert body["config_path"] == "configs/gateway.toml"

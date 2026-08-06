@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -273,6 +274,15 @@ def create_app(
 ) -> FastAPI:
     clock = clock or SystemClock()
     cfg = load_config(config_path)
+    # Identity of the code/config actually serving -- see /healthz. Computed
+    # from the bytes that were read, not re-read later, so a file edited after
+    # startup shows up as a mismatch rather than being quietly reported as the
+    # running state.
+    try:
+        config_sha = hashlib.sha256(Path(config_path).read_bytes()).hexdigest()[:12]
+    except OSError:
+        config_sha = "unreadable"
+    started_at = clock.now().isoformat()
     conn = connect(db_path)
     store = Store(conn)
     events = EventLog(store, clock)
@@ -332,7 +342,26 @@ def create_app(
 
     @app.get("/healthz")
     async def healthz():
-        return {"ok": True}
+        """Liveness, plus enough identity to tell WHICH code is answering.
+
+        `{"ok": true}` alone cannot distinguish a freshly deployed gateway from
+        one that has been running since before the deploy. On 2026-08-05 a
+        process started hours earlier served two complete benchmark runs after
+        the code and config beneath it had been replaced twice -- the restarts
+        silently failed (their pattern kill did not match the process's
+        cmdline), the port stayed bound, /healthz stayed green, and both runs
+        measured the old behaviour. One of them cost $11 and had to be thrown
+        away.
+
+        `config_sha` is the digest of the config file AS LOADED, so a config
+        edited on disk but not picked up is visible as a mismatch against
+        `sha256sum` on the file. `started_at` dates the process itself.
+        Deliberately unauthenticated, like the liveness check it extends: it
+        exposes no secret, only which build is live.
+        """
+        return {"ok": True, "config_sha": config_sha,
+                "config_path": str(config_path), "started_at": started_at,
+                "fusion_panel": list(cfg.fusion.panel) if cfg.fusion else None}
 
     @app.get("/v1/models")
     async def list_models(principal: str = Depends(get_principal)):
@@ -1156,6 +1185,66 @@ def create_app(
             ).fetchall()
         counts = {row["status"]: row["c"] for row in rows}
         return {"ledger": ledger.status(), "requests": counts}
+
+    @app.get("/admin/panel")
+    async def admin_panel(principal: str = Depends(require_admin),
+                          limit: int = 500):
+        """Per-member health of the fusion panel, from the event log. $0.
+
+        A panel that has silently lost members is the failure this exists to
+        surface. On 2026-08-05 kimi-k3 rejected 877 of 881 candidate calls and
+        deepseek-chat 840, leaving one model answering alone -- for two full
+        benchmark runs, one of which cost $11 and had to be discarded. Every
+        symptom was already in the event log; nothing put it in front of an
+        operator, and the response still called itself a fusion.
+
+        `last_error` is the decisive field. Before the upstream's error text
+        was recorded (same day) the log held only the bare number 400, which is
+        why the cause took hours of guessing to find rather than one query.
+
+        Reads the last `limit` fusion requests, so it reflects recent health
+        rather than a lifetime average that a long-broken panel would dilute.
+        """
+        if cfg.fusion is None:
+            return {"fusion": None}
+        with store.lock:
+            rows = store.conn.execute(
+                "SELECT kind, payload FROM events "
+                "WHERE kind IN ('fusion.candidate', 'call.failed', 'fusion.fused') "
+                "ORDER BY seq DESC LIMIT ?", (limit * 8,)
+            ).fetchall()
+
+        members = {m: {"ok": 0, "failed": 0, "last_error": None}
+                   for m in cfg.fusion.panel}
+        paths: dict[str, int] = {}
+        for row in rows:
+            try:
+                p = json.loads(row["payload"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            model = p.get("model")
+            if row["kind"] == "fusion.candidate" and model in members:
+                members[model]["ok" if p.get("status") == "ok" else "failed"] += 1
+            elif row["kind"] == "call.failed" and model in members:
+                # Newest first, so the first one seen is the most recent.
+                if members[model]["last_error"] is None:
+                    members[model]["last_error"] = {
+                        "kind": p.get("kind"), "status": p.get("status"),
+                        "body": (p.get("body") or "")[:200]}
+            elif row["kind"] == "fusion.fused":
+                paths[p.get("path")] = paths.get(p.get("path"), 0) + 1
+
+        for m in members.values():
+            total = m["ok"] + m["failed"]
+            m["ok_rate"] = round(m["ok"] / total, 3) if total else None
+        # A member answering less than half the time is not participating in
+        # any meaningful sense, whatever the request count says.
+        unhealthy = sorted(m for m, v in members.items()
+                           if v["ok_rate"] is not None and v["ok_rate"] < 0.5)
+        return {"panel": list(cfg.fusion.panel), "quorum": list(cfg.fusion.quorum),
+                "fuser": cfg.fusion.fuser, "members": members,
+                "paths": paths, "unhealthy": unhealthy,
+                "healthy": not unhealthy}
 
     @app.post("/admin/killswitch/trip")
     async def killswitch_trip(principal: str = Depends(require_admin)):
