@@ -235,6 +235,11 @@ Runtime is driven by environment variables:
 | `GATEWAY_DB` | SQLite truth-store path | `data/gateway.sqlite` |
 | `<PROVIDER>_API_KEY` | one per provider, named by its `api_key_env` | — |
 
+The shipped fusion panel includes `qwen3-8b` through DashScope's
+OpenAI-compatible endpoint. Set `DASHSCOPE_API_KEY` before sending live
+`model="fusion"` traffic; without it the qwen leg will fail and the panel will
+degrade to the remaining members.
+
 Models, providers, prices, budget, and the default route live in
 [`configs/gateway.toml`](configs/gateway.toml):
 
@@ -398,6 +403,13 @@ the live path.
 **Can I use my own models?**  Yes — add a provider + model block to
 `configs/gateway.toml`. The router and benchmark operate over whatever pool you
 configure.
+
+DashScope/Qwen models use the same OpenAI-compatible provider adapter. For
+`qwen3-8b`, the default provider URL is
+`https://dashscope.aliyuncs.com/compatible-mode/v1`; replace it with a
+workspace-specific Model Studio endpoint if your Alibaba Cloud workspace
+requires one. After adding `DASHSCOPE_API_KEY`, run `scripts/smoke.py` once
+and check `/admin/panel` before using `model="fusion"` for SWE eval.
 
 **How is cost computed?**  Per call, from token usage × configured per-token
 prices, into a `preflight → settle` SQLite ledger — the same numbers the budget

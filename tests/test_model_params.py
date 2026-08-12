@@ -110,6 +110,7 @@ def test_the_shipped_config_pins_the_two_measured_constraints():
     assert cfg.models["kimi-k3"].param_overrides == {"temperature": 1, "top_p": 0.95}
     assert cfg.models["deepseek-chat"].param_overrides_multi_turn == {
         "thinking": {"type": "disabled"}}
+    assert cfg.models["qwen3-8b"].param_overrides == {"enable_thinking": False}
 
 
 # -- constraints that only apply to a continued conversation ----------------

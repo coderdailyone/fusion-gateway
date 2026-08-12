@@ -27,6 +27,13 @@ wire = "anthropic"
 base_url = "https://api.kimi.com/coding/v1"
 api_key_env = "MOONSHOT_API_KEY"
 
+[providers.qwen]
+# DashScope / Alibaba Cloud Model Studio OpenAI-compatible endpoint. No key is
+# committed; set DASHSCOPE_API_KEY before routing live traffic here. If a
+# workspace-specific endpoint is used later, replace only this base_url.
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+api_key_env = "DASHSCOPE_API_KEY"
+
 [models."deepseek-chat"]
 provider = "deepseek"
 upstream_model = "deepseek-v4-flash"
@@ -92,6 +99,20 @@ in_usd_per_mtok = 0.60
 out_usd_per_mtok = 2.50
 fallback = ["deepseek-chat"]
 
+[models."qwen3-8b"]
+provider = "qwen"
+upstream_model = "qwen3-8b"
+# Qwen3 supports thinking mode. The online fusion candidate path is currently
+# non-streaming, so keep the new leg in non-thinking mode until a live
+# DashScope smoke proves the streaming/thinking path works end-to-end.
+param_overrides = { enable_thinking = false }
+# DashScope qwen3-8b pricing placeholder. Output is intentionally conservative
+# until DASHSCOPE_API_KEY is available and the first live ledger rows can be
+# reconciled against the Alibaba Cloud bill.
+in_usd_per_mtok = 0.072
+out_usd_per_mtok = 0.717
+fallback = ["deepseek-chat"]
+
 [fusion]
 # Wired 2026-07-29 (M8), opt-in as of the same day: this is NOT
 # policy.default_model. A client reaches it only by naming it explicitly
@@ -102,7 +123,7 @@ fallback = ["deepseek-chat"]
 # +1.1pt at p = 0.176, i.e. not significant, and was measured on benchmark
 # tasks rather than chat.
 model = "fusion"
-panel = ["deepseek-chat", "glm-5.2", "kimi-k3"]
+panel = ["deepseek-chat", "glm-5.2", "kimi-k3", "qwen3-8b"]
 # If these two review each other "correct" AND their answers agree in
 # substance, M5's own majority-copy rule means the fuser must copy that
 # answer, which is lossless -- kimi-k3 cannot change the outcome, so it is
@@ -115,9 +136,9 @@ panel = ["deepseek-chat", "glm-5.2", "kimi-k3"]
 # the differing-answer case, not a lossless win -- it is what turns ~73s into
 # ~15s on the common path.
 quorum = ["deepseek-chat", "glm-5.2"]
-# kimi-k3 is deliberately NOT a reviewer: it is a ~34s reasoning model and
-# would dominate the review stage. It remains a candidate, so its answer still
-# reaches the fuser on the full path.
+# kimi-k3 and qwen3-8b are deliberately NOT reviewers: they are additional
+# candidate legs, while the review stage stays bounded to the two fast quorum
+# members until live latency/cost measurements justify changing it.
 reviewers = ["deepseek-chat", "glm-5.2"]
 fuser = "glm-5.2"
 review_max_tokens = 512
