@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 300" role="img" aria-label="fusion-gateway — Routes each call to the model — or cascade — that maximizes P(correct) − λ·cost.">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#172554"/>
+      <stop offset="1" stop-color="#1e3a8a"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#60a5fa"/>
+      <stop offset="1" stop-color="#a78bfa"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="300" rx="20" fill="url(#bg)"/>
+
+  <g transform="translate(70,60)">
+    <rect width="180" height="180" rx="16" fill="#60a5fa" opacity="0.10"/>
+    <rect width="180" height="180" rx="16" fill="none" stroke="#60a5fa" stroke-width="2"/>
+    <path d="M25 50 C58 50, 55 88, 80 90" fill="none" stroke="#60a5fa" stroke-width="5" opacity="0.85" stroke-linecap="round"/>
+    <line x1="25" y1="90" x2="78" y2="90" stroke="#60a5fa" stroke-width="5" opacity="0.85" stroke-linecap="round"/>
+    <path d="M25 130 C58 130, 55 92, 80 90" fill="none" stroke="#60a5fa" stroke-width="5" opacity="0.85" stroke-linecap="round"/>
+    <path d="M100 66 L124 90 L100 114 L76 90 Z" fill="none" stroke="url(#accent)" stroke-width="6" stroke-linejoin="round"/>
+    <line x1="124" y1="90" x2="144" y2="90" stroke="url(#accent)" stroke-width="8" stroke-linecap="round"/>
+    <path d="M144 78 L162 90 L144 102 Z" fill="#a78bfa"/>
+  </g>
+
+  <g font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace">
+    <text x="310" y="122" font-size="50" font-weight="700" fill="#f8fafc">fusion-gateway</text>
+  </g>
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif">
+    <text x="310" y="166" font-size="23" fill="#cbd5e1">Routes each call to the model — or cascade — that maximizes P(correct) − λ·cost.</text>
+    <text x="310" y="200" font-size="19" fill="#94a3b8">优化的不是每 token 的成本，而是每个任务做对的成本；全程事件溯源可审计。</text>
+  </g>
+
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="16">
+    <rect x="310" y="226" width="276" height="34" rx="17" fill="none" stroke="#1d4ed8" stroke-width="1.5"/>
+    <text x="330" y="248" fill="#34d399">✓</text>
+    <text x="350" y="248" fill="#bfdbfe">cost-quality Pareto routing</text>
+    <rect x="602" y="226" width="219" height="34" rx="17" fill="none" stroke="#1d4ed8" stroke-width="1.5"/>
+    <text x="622" y="248" fill="#34d399">✓</text>
+    <text x="642" y="248" fill="#bfdbfe">event-sourced traces</text>
+    <rect x="837" y="226" width="202" height="34" rx="17" fill="none" stroke="#1d4ed8" stroke-width="1.5"/>
+    <text x="857" y="248" fill="#34d399">✓</text>
+    <text x="877" y="248" fill="#bfdbfe">budget kill-switch</text>
+  </g>
+</svg>

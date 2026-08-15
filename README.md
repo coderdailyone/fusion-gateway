@@ -1,6 +1,6 @@
 <div align="center">
 
-# ⚡ Fusion Gateway
+<img src="docs/assets/banner.svg" alt="fusion-gateway — routes each call to the model or cascade that maximizes P(correct) − λ·cost" width="100%">
 
 **An OpenRouter-style, self-hosted LLM gateway that optimizes _cost per successful task_ — not cost per token.**
 
