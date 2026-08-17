@@ -28,10 +28,10 @@ base_url = "https://api.kimi.com/coding/v1"
 api_key_env = "MOONSHOT_API_KEY"
 
 [providers.qwen]
-# DashScope / Alibaba Cloud Model Studio OpenAI-compatible endpoint. No key is
-# committed; set DASHSCOPE_API_KEY before routing live traffic here. If a
-# workspace-specific endpoint is used later, replace only this base_url.
-base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+# Alibaba Cloud Token Plan OpenAI-compatible endpoint. The Token Plan key used
+# in this workspace is not accepted by the ordinary DashScope endpoint; it was
+# verified live against this endpoint on 2026-08-17.
+base_url = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
 api_key_env = "DASHSCOPE_API_KEY"
 
 [models."deepseek-chat"]
@@ -99,16 +99,15 @@ in_usd_per_mtok = 0.60
 out_usd_per_mtok = 2.50
 fallback = ["deepseek-chat"]
 
-[models."qwen3-8b"]
+[models."qwen3.8-max"]
 provider = "qwen"
-upstream_model = "qwen3-8b"
-# Qwen3 supports thinking mode. The online fusion candidate path is currently
-# non-streaming, so keep the new leg in non-thinking mode until a live
-# DashScope smoke proves the streaming/thinking path works end-to-end.
+upstream_model = "qwen3.8-max"
+# qwen3.8-max supports thinking mode. Keep it disabled for the online fusion
+# candidate path: live Token Plan smoke showed max_tokens=16 uses most output
+# tokens on reasoning unless this flag is off.
 param_overrides = { enable_thinking = false }
-# DashScope qwen3-8b pricing placeholder. Output is intentionally conservative
-# until DASHSCOPE_API_KEY is available and the first live ledger rows can be
-# reconciled against the Alibaba Cloud bill.
+# Token Plan qwen3.8-max pricing placeholder. Reconcile against the Alibaba
+# Cloud bill before using these numbers for production accounting.
 in_usd_per_mtok = 0.072
 out_usd_per_mtok = 0.717
 fallback = ["deepseek-chat"]
@@ -123,7 +122,7 @@ fallback = ["deepseek-chat"]
 # +1.1pt at p = 0.176, i.e. not significant, and was measured on benchmark
 # tasks rather than chat.
 model = "fusion"
-panel = ["deepseek-chat", "glm-5.2", "kimi-k3", "qwen3-8b"]
+panel = ["deepseek-chat", "glm-5.2", "kimi-k3", "qwen3.8-max"]
 # If these two review each other "correct" AND their answers agree in
 # substance, M5's own majority-copy rule means the fuser must copy that
 # answer, which is lossless -- kimi-k3 cannot change the outcome, so it is
@@ -136,7 +135,7 @@ panel = ["deepseek-chat", "glm-5.2", "kimi-k3", "qwen3-8b"]
 # the differing-answer case, not a lossless win -- it is what turns ~73s into
 # ~15s on the common path.
 quorum = ["deepseek-chat", "glm-5.2"]
-# kimi-k3 and qwen3-8b are deliberately NOT reviewers: they are additional
+# kimi-k3 and qwen3.8-max are deliberately NOT reviewers: they are additional
 # candidate legs, while the review stage stays bounded to the two fast quorum
 # members until live latency/cost measurements justify changing it.
 reviewers = ["deepseek-chat", "glm-5.2"]

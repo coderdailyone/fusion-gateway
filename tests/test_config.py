@@ -9,13 +9,14 @@ def test_loads_models_and_providers():
     assert cfg.models["deepseek-chat"].fallback == ("glm-4.5-flash",)
     assert cfg.providers["glm"].api_key_env == "GLM_API_KEY"
     assert cfg.providers["qwen"].api_key_env == "DASHSCOPE_API_KEY"
-    assert cfg.models["qwen3-8b"].provider == "qwen"
+    assert cfg.models["qwen3.8-max"].provider == "qwen"
+    assert cfg.models["qwen3.8-max"].upstream_model == "qwen3.8-max"
     # Fusion is opt-in (selected by name), not the default: default_model
     # names a real [models] entry again, while [fusion] stays configured
     # alongside it so the pseudo-model remains selectable.
     assert cfg.default_model == "deepseek-chat"
     assert cfg.fusion is not None and cfg.fusion.model == "fusion"
-    assert "qwen3-8b" in cfg.fusion.panel
+    assert "qwen3.8-max" in cfg.fusion.panel
     # M1 runs deliberately uncapped: cap_usd is omitted, which loads as None.
     assert cfg.budget_caps[cfg.active_budget] is None
 

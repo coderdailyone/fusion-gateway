@@ -14,8 +14,8 @@ out_usd_per_mtok = 2.50   # VERIFY
 in_usd_per_mtok = 0.60    # VERIFY vs Zhipu published pricing at run time
 out_usd_per_mtok = 2.20   # VERIFY
 
-["qwen3-8b"]
-in_usd_per_mtok = 0.072    # VERIFY vs DashScope bill; placeholder until live smoke
+["qwen3.8-max"]
+in_usd_per_mtok = 0.072    # VERIFY vs Token Plan bill; placeholder until live smoke
 out_usd_per_mtok = 0.717   # VERIFY; conservative placeholder until live smoke
 
 ["gpt-5.5"]
