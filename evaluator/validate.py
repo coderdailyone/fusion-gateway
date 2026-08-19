@@ -159,6 +159,15 @@ MODEL_SPECS = {
         max_tokens=8192,
         api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
         api_key=os.environ["DASHSCOPE_API_KEY"]),
+    "qwen3.8-max": lambda: dict(
+        litellm_model="openai/qwen3.8-max",
+        # Token Plan OpenAI-compatible endpoint. Keep thinking disabled to
+        # match the live gateway panel path and avoid hidden-reasoning-only
+        # responses on non-streaming benchmark calls.
+        extra_body={"enable_thinking": False},
+        max_tokens=8192,
+        api_base="https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        api_key=os.environ["DASHSCOPE_API_KEY"]),
     # glm-5.2 (paid) is reachable on the Anthropic-compatible endpoint; the
     # paid glm-5.2/glm-4.6 on the OpenAI /paas/v4 endpoint return 余额不足,
     # while glm-4.5-flash is free there (a cheaper fallback if needed).
