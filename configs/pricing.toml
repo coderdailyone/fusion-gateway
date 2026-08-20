@@ -14,6 +14,13 @@ out_usd_per_mtok = 2.50   # VERIFY
 in_usd_per_mtok = 0.60    # VERIFY vs Zhipu published pricing at run time
 out_usd_per_mtok = 2.20   # VERIFY
 
+["glm-5.3"]
+# Provisional budget guard only: the official price page currently lists
+# GLM-5.2 but not GLM-5.3, so copy 5.2's historical rates until the account
+# bill confirms GLM-5.3 pricing.
+in_usd_per_mtok = 0.60
+out_usd_per_mtok = 2.20
+
 ["qwen3.8-max"]
 in_usd_per_mtok = 0.072    # VERIFY vs Token Plan bill; placeholder until live smoke
 out_usd_per_mtok = 0.717   # VERIFY; conservative placeholder until live smoke

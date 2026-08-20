@@ -176,6 +176,11 @@ MODEL_SPECS = {
         max_tokens=8192,
         api_base="https://open.bigmodel.cn/api/anthropic",
         api_key=os.environ["GLM_API_KEY"]),
+    "glm-5.3": lambda: dict(
+        litellm_model="anthropic/glm-5.3",
+        max_tokens=8192,
+        api_base="https://open.bigmodel.cn/api/anthropic",
+        api_key=os.environ["GLM_API_KEY"]),
     "glm-4.5-flash": lambda: dict(
         litellm_model="openai/glm-4.5-flash",
         api_base="https://open.bigmodel.cn/api/paas/v4",

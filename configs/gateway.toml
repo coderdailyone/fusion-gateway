@@ -76,6 +76,16 @@ in_usd_per_mtok = 0.60
 out_usd_per_mtok = 2.20
 fallback = ["deepseek-chat"]
 
+[models."glm-5.3"]
+provider = "glm_anthropic"
+upstream_model = "glm-5.3"
+# GLM-5.3 was verified against this Anthropic-compatible provider on
+# 2026-08-19. Its rates remain a provisional copy of GLM-5.2's budget guard
+# until the account bill confirms the published GLM-5.3 price.
+in_usd_per_mtok = 0.60
+out_usd_per_mtok = 2.20
+fallback = ["deepseek-chat"]
+
 [models."kimi-k3"]
 provider = "kimi"
 # k3 accepts exactly one temperature:
