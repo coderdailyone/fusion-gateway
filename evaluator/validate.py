@@ -149,11 +149,35 @@ MODEL_SPECS = {
         max_tokens=8192,
         api_base="https://api.kimi.com/coding/v1",
         api_key=os.environ["MOONSHOT_API_KEY"]),
+    "qwen3-8b": lambda: dict(
+        litellm_model="openai/qwen3-8b",
+        # DashScope OpenAI-compatible endpoint. The gateway pins
+        # enable_thinking=false for qwen3-8b because its fusion candidate path
+        # is non-streaming today; keep evaluator behaviour aligned until a live
+        # smoke proves the thinking/streaming path works end-to-end.
+        extra_body={"enable_thinking": False},
+        max_tokens=8192,
+        api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        api_key=os.environ["DASHSCOPE_API_KEY"]),
+    "qwen3.8-max": lambda: dict(
+        litellm_model="openai/qwen3.8-max",
+        # Token Plan OpenAI-compatible endpoint. Keep thinking disabled to
+        # match the live gateway panel path and avoid hidden-reasoning-only
+        # responses on non-streaming benchmark calls.
+        extra_body={"enable_thinking": False},
+        max_tokens=8192,
+        api_base="https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        api_key=os.environ["DASHSCOPE_API_KEY"]),
     # glm-5.2 (paid) is reachable on the Anthropic-compatible endpoint; the
     # paid glm-5.2/glm-4.6 on the OpenAI /paas/v4 endpoint return 余额不足,
     # while glm-4.5-flash is free there (a cheaper fallback if needed).
     "glm-5.2": lambda: dict(
         litellm_model="anthropic/glm-5.2",
+        max_tokens=8192,
+        api_base="https://open.bigmodel.cn/api/anthropic",
+        api_key=os.environ["GLM_API_KEY"]),
+    "glm-5.3": lambda: dict(
+        litellm_model="anthropic/glm-5.3",
         max_tokens=8192,
         api_base="https://open.bigmodel.cn/api/anthropic",
         api_key=os.environ["GLM_API_KEY"]),

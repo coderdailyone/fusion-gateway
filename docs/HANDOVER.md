@@ -70,6 +70,7 @@
 DEEPSEEK_API_KEY=...
 GLM_API_KEY=...            # 同时服务 glm-4.5-flash 和 glm-5.2
 MOONSHOT_API_KEY=...       # kimi-k3
+DASHSCOPE_API_KEY=...      # qwen3.8-max(Token Plan OpenAI-compatible)
 GATEWAY_TOKENS=<principal>:<tok>,admin:<tok>
 GATEWAY_CONFIG=/opt/fusion-gateway/configs/gateway.toml
 GATEWAY_DB=/opt/fusion-gateway/data/gateway.sqlite
@@ -148,7 +149,8 @@ curl -sS https://<新域名>/v1/chat/completions \
               ├──► api.deepseek.com                  (deepseek-chat → deepseek-v4-flash)
               ├──► open.bigmodel.cn/api/anthropic    (glm-5.2,Anthropic wire)
               ├──► open.bigmodel.cn/api/paas/v4      (glm-4.5-flash,免费)
-              └──► api.kimi.com/coding/v1            (kimi-k3 → 上游 id 是 "k3")
+              ├──► api.kimi.com/coding/v1            (kimi-k3 → 上游 id 是 "k3")
+              └──► token-plan.cn-beijing.maas.aliyuncs.com/.../v1 (qwen3.8-max,OpenAI wire)
 ```
 
 **已知不一致**:线上那台机器的目录布局是 `~/test/deploy/generated`,
@@ -430,6 +432,7 @@ deepseek-chat 1.6s / glm-5.2 2.3s / kimi-k3 2.7s / glm-4.5-flash 1.7s;
 - `DEEPSEEK_API_KEY`
 - `GLM_API_KEY`
 - `MOONSHOT_API_KEY`
+- `DASHSCOPE_API_KEY`
 - `OPENAI_MIRROR_KEY`
 - `CLAUDE_MIRROR_KEY`
 - `ANTHROPIC_API_KEY`

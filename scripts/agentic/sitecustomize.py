@@ -1,4 +1,4 @@
-"""Register the gateway's `fusion` pseudo-model with LiteLLM.
+"""Register locally routed gateway models with LiteLLM.
 
 SWE-agent prices every response with litellm.completion_cost(). For a model
 litellm has never heard of that RAISES, and models.py turns the exception into
@@ -19,6 +19,19 @@ see the run's data/swe.sqlite.
 try:
     import litellm
 
+    glm_53 = {
+        # Provisional GLM-5.3 prices, matching configs/gateway.toml. This entry
+        # makes the SWE-agent limit an active safety brake; reconcile it with
+        # the account bill before treating its local cost as authoritative.
+        "input_cost_per_token": 0.60 / 1e6,
+        "output_cost_per_token": 2.20 / 1e6,
+        "max_tokens": 8192,
+        "max_input_tokens": 128000,
+        "max_output_tokens": 8192,
+        "litellm_provider": "openai",
+        "mode": "chat",
+        "supports_function_calling": True,
+    }
     litellm.register_model({
         "fusion": {
             "input_cost_per_token": 0.60 / 1e6,    # highest input rate in the panel
@@ -29,7 +42,11 @@ try:
             "litellm_provider": "openai",
             "mode": "chat",
             "supports_function_calling": True,
-        }
+        },
+        # LiteLLM normalizes `openai/glm-5.3` to this bare model key during
+        # request routing and cost calculation. SWE-agent's direct config lookup
+        # does not normalize, so its runner explicitly supplies max_input_tokens.
+        "glm-5.3": glm_53,
     })
 except Exception:                      # never break the interpreter over this
     pass
