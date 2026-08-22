@@ -362,7 +362,16 @@ from frozen data:
 # then recompute the official scores + Pareto frontier from the frozen outputs
 .venv/bin/python scripts/resample_official.py            # sample the 1063-task suite
 .venv/bin/python scripts/final_numbers.py <run_dir>      # official scoring + Pareto
+
+# inspect one frozen run without model calls, dataset downloads, or scoring
+PYTHONPATH=. .venv/bin/python scripts/benchmark_summary.py <run_dir>
 ```
+
+`benchmark_summary.py` reads only `<run_dir>/frozen.jsonl` and prints a stable
+Markdown report covering record counts and required fields, statuses, duplicate
+task/model pairs, token and cost totals, latency, and error samples. It is a
+run-health check, not an answer scorer, so it neither needs provider keys nor
+loads the benchmark datasets.
 
 Before any paid run, a **grader self-test** requires every dataset's own gold
 answer to score correct (**1063/1063**) — a grader that can't recognize the

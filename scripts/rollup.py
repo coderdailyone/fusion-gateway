@@ -16,11 +16,18 @@ budgets carry no history, only a current cap/state).
 """
 from __future__ import annotations
 
-import math
 import sqlite3
 import sys
 from collections import defaultdict
 from pathlib import Path
+
+try:
+    from scripts.metrics import linear_percentile
+except ModuleNotFoundError:  # direct ``python scripts/rollup.py``
+    from metrics import linear_percentile
+
+# Keep the old private name available to callers that imported it directly.
+_percentile = linear_percentile
 
 # Ledger states whose (actual or estimated) cost counts as "consumed" budget.
 # Mirrors gateway.ledger.CONSUMING_STATES.
@@ -32,20 +39,6 @@ def _connect_readonly(db_path: str | Path) -> sqlite3.Connection:
     conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
     return conn
-
-
-def _percentile(sorted_values: list[float], pct: float) -> float:
-    """Linear-interpolation percentile (same convention as numpy.percentile)."""
-    if not sorted_values:
-        return 0.0
-    if len(sorted_values) == 1:
-        return sorted_values[0]
-    k = (len(sorted_values) - 1) * pct
-    lo = math.floor(k)
-    hi = math.ceil(k)
-    if lo == hi:
-        return sorted_values[int(k)]
-    return sorted_values[lo] * (hi - k) + sorted_values[hi] * (k - lo)
 
 
 def requests_by_day_status(conn: sqlite3.Connection) -> dict[str, dict[str, int]]:
@@ -84,7 +77,10 @@ def latency_by_day(conn: sqlite3.Connection) -> dict[str, dict[str, float]]:
     out: dict[str, dict[str, float]] = {}
     for day, values in grouped.items():
         values.sort()
-        out[day] = {"p50": _percentile(values, 0.5), "p95": _percentile(values, 0.95)}
+        out[day] = {
+            "p50": linear_percentile(values, 0.5),
+            "p95": linear_percentile(values, 0.95),
+        }
     return out
 
 
